@@ -1,6 +1,8 @@
 # 20 Tools
 
-Tool schemas are stable, traceable, and Windows-aware.
+Tool schemas are stable, traceable, and Windows-aware. Detailed authoring
+guidance for the safety rules below — *why* each token or pattern is rejected —
+lives in `dev_docs/dangerous_cli.md`.
 
 Common result fields:
 
@@ -16,23 +18,66 @@ Windows/Git Bash rules:
 
 - `run_bash` invokes `bash -c`.
 - `run_bash` is deny-by-default for command families that can mutate or
-  destroy the workspace. It accepts only simple read-only inspection commands
-  such as `grep`, `rg`, `find`, `ls`, `pwd`, `cat`, `sed`, `head`, `tail`, and
-  `wc`.
+  destroy the workspace. It accepts only simple read-only inspection commands:
+  `grep`, `rg`, `find`, `ls`, `pwd`, `cat`, `head`, `tail`, and `wc`. `sed` is
+  intentionally excluded because `sed -i` mutates files in place.
 - `run_bash` rejects shell control operators and redirection (`;`, `&&`, `||`,
   pipes, `>`, `<`, backticks, and command substitution) so a safe-looking first
   command cannot hide a destructive second command.
 - `run_bash` rejects destructive tokens anywhere in the parsed command,
   including `rm`, `del`, `erase`, `rmdir`, `Remove-Item`, `mv`, `move`, `cp`,
-  `copy`, `chmod`, `chown`, `mkfs`, `dd`, and package install commands.
+  `copy`, `chmod`, `chown`, `mkfs`, `dd`, package installers (`pip`, `npm`,
+  `pnpm`, `yarn`, `uv`), foreign code runners (`python`, `powershell`, `pwsh`,
+  `cmd`), and any egress utility (`curl`, `wget`, `nc`, `ncat`, `netcat`,
+  `ssh`, `scp`, `sftp`, `rsync`, `ftp`, `telnet`, `socat`, `git`).
+- `run_bash` rejects forbidden argument tokens anywhere in the parsed
+  arguments: `-exec`, `-execdir`, `-delete`, `-ok`, `-okdir`, `-fprint`,
+  `-fprintf`, `-fls`, and any token starting with `--exec`. This blocks
+  `find . -exec rm {} \;`, `find . -delete`, and any future tool that grows a
+  shell-out flag.
 - Rejected commands are returned as `tool_result.status = "error"` with a
   refusal message. They are not passed to `bash -c`.
 - The safety gate is intentionally conservative. If a demo needs a command not
   on the allowlist, add it to the spec first, regenerate code, and add a test
-  proving why it is read-only.
+  proving it cannot mutate the workspace under any flag combination.
 - Normalize Windows and Git Bash paths at tool boundaries.
-- All file tools must resolve requested paths under the workspace root before
+
+Sensitive-path denylist (applies to `read_file`, `read_file_range`,
+`write_file`, `edit_file` *before* path resolution):
+
+- `(^|/)\.env($|\.)` matches `.env` and `.env.local` but **not**
+  `.env.example`, which is allowed so the agent can learn the schema without
+  the secret values.
+- `(^|/)id_rsa(\..*)?$` and `(^|/)id_ed25519(\..*)?$` — SSH private keys.
+- `\.pem$`, `\.key$`, `\.pfx$`, `\.p12$` — TLS / signing keys.
+- `(^|/)\.aws/`, `(^|/)\.ssh/` — credential directories.
+- `(^|/)\.netrc$`, `(^|/)credentials(\.json)?$` — common credential files.
+
+Rejected reads/writes return `tool_result.status = "error"` with reason
+`"sensitive path"` and never touch the filesystem.
+
+Tool-result size cap:
+
+- `MAX_TOOL_RESULT_BYTES = 1_048_576` (1 MiB).
+- Tool results above the cap are truncated in the value returned to the
+  parent model and appended with a marker that points to the full content in
+  the JSONL trace (`run_id`, `event_idx`). Truncation is recorded as a
+  `tool_result` field (`truncated: true`) so replays show what the model saw.
+
+Path-resolution rules:
+
+- All file tools resolve requested paths under the workspace root before
   reading or writing. Absolute paths and `..` traversal outside the root are
   refused as traceable tool errors.
 - Write text files with `\n`.
 - Use `read_file_range` for targeted follow-up after compaction.
+
+Approval policy (see `specs/10_main_agent.md` and `specs/30_runtime_governance.md`):
+
+- Tools are grouped into approval categories: `reads` (`read_file`,
+  `read_file_range`, `run_bash`) and `writes` (`write_file`, `edit_file`,
+  `run_bash` when it would mutate — not currently reachable, but
+  `spawn_subagent` is also gated because it consumes budget).
+- The runtime exposes `--require-approval [off|writes|all]` and `--yes`.
+  Default is `off` so the deterministic demo and tests stay reproducible;
+  `writes` is the recommended live setting.

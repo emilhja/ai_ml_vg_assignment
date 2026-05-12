@@ -22,7 +22,7 @@ disposable fixture copy or regenerated fixture before testing live edits.
 
 ```powershell
 $env:ANTHROPIC_API_KEY="..."
-uv run python -m vg_agent --task "inspect app.py and suggest one small improvement" --live-model --trace --show-context 3
+uv run python -m vg_agent --task "inspect app.py and suggest one small improvement" --live-model --require-approval writes --trace --show-context 3
 ```
 
 Review the resulting JSONL trace for:
@@ -30,36 +30,39 @@ Review the resulting JSONL trace for:
 - model-selected tool calls;
 - refused unsafe commands or path escapes;
 - large-result compaction;
-- Explorer summaries appearing in parent context without child intermediate results.
+- `approval` events for each gated tool call;
+- Explorer summaries appearing in parent context without child intermediate
+  results.
 
-## 3. Harden Live Writes
+## 3. Harden Live Writes — done
 
-Before using live mode on important repositories, add:
+The following items from the earlier list are now implemented and covered by
+tests: approval gating (`--require-approval`, `--yes`), persisted daily-spend
+tracking (`.vg_daily_spend.json`), CLI flags for clearer output. Persistence
+of "yes-folder" grants across sessions (`--save-approvals`,
+`--reset-approvals`) is still future work.
 
-- dry-run support for `write_file` and `edit_file`;
-- approval gating before mutating tools run;
-- clearer CLI output for `tool_error`, budget aborts, and timeout aborts;
-- persisted daily spend tracking instead of only per-run budget state.
+## 4. Extend Presentation Script — done
 
-## 4. Extend Presentation Script
-
-Keep deterministic mode as the default presentation path. Add an optional
-live-mode section to `scripts/run_demo.ps1` that runs only when
-`ANTHROPIC_API_KEY` is present.
-
-The live section should show:
-
-- a small parent read/edit flow;
-- an Explorer delegation flow;
-- trace replay with `--show-context`;
-- budget and tool-safety behavior.
+`scripts/run_demo.ps1` now includes approval, denylist, and chat-mode
+segments alongside the deterministic VG slide. All segments run without
+`ANTHROPIC_API_KEY`.
 
 ## 5. Broaden Regression Coverage
 
-Useful follow-up tests:
+Remaining useful follow-up tests:
 
 - live timeout behavior with a fake slow client;
 - malformed model tool-call payloads;
 - Explorer attempts to call write/edit/spawn tools;
 - CLI behavior when live mode ends with `tool_error`;
-- trace replay from a live run containing compaction and Explorer events.
+- trace replay from a live run containing compaction and Explorer events;
+- HTTPS proxy bridging `--network none` Docker + `--live-model`.
+
+## 6. Future Safety Hardening
+
+- `.vg_approvals.json` persistence with `--save-approvals` / `--reset-approvals`.
+- Outbound HTTPS proxy implementation that lets `--network none` Docker
+  coexist with `--live-model`.
+- On-disk encryption of traces (current redaction handles the realistic
+  threat; full encryption is overkill for the current scope).

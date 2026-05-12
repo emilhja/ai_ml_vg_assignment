@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(sed 's/emit\\(\"//')"
+      "Bash(sed 's/emit\\(\"//')",
+      "Bash(python scripts/generate_project.py --clean)",
+      "Bash(uv run *)"
     ]
   }
 }

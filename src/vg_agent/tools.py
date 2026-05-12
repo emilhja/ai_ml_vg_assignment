@@ -2,20 +2,43 @@
 
 from __future__ import annotations
 
+import re
 import shlex
 import subprocess
 import time
 from pathlib import Path
 
 
-SAFE_COMMANDS = {"grep", "rg", "find", "ls", "pwd", "cat", "sed", "head", "tail", "wc"}
+SAFE_COMMANDS = {"grep", "rg", "find", "ls", "pwd", "cat", "head", "tail", "wc"}
 DESTRUCTIVE_TOKENS = {
     "rm", "del", "erase", "rmdir", "remove-item", "ri", "rd",
     "mv", "move", "cp", "copy", "chmod", "chown", "mkfs", "dd",
     "curl", "wget", "pip", "npm", "pnpm", "yarn", "uv", "python",
     "powershell", "pwsh", "cmd",
+    "nc", "ncat", "netcat", "ssh", "scp", "rsync", "ftp", "git",
+    "sftp", "telnet", "socat",
+}
+FORBIDDEN_ARG_TOKENS = {
+    "-exec", "-execdir", "-delete", "-ok", "-okdir",
+    "-fprint", "-fprintf", "-fls",
 }
 SHELL_CONTROL_MARKERS = [";", "&&", "||", "|", ">", "<", "`", "$("]
+
+SENSITIVE_PATH_PATTERNS = [
+    re.compile(r"(?:^|/)\.env(?:$|\.(?!example))"),
+    re.compile(r"(?:^|/)id_rsa(?:\..*)?$"),
+    re.compile(r"(?:^|/)id_ed25519(?:\..*)?$"),
+    re.compile(r"\.pem$"),
+    re.compile(r"\.key$"),
+    re.compile(r"\.pfx$"),
+    re.compile(r"\.p12$"),
+    re.compile(r"(?:^|/)\.aws/"),
+    re.compile(r"(?:^|/)\.ssh/"),
+    re.compile(r"(?:^|/)\.netrc$"),
+    re.compile(r"(?:^|/)credentials(?:\.json)?$"),
+    re.compile(r"(?:^|/)\.vg_daily_spend\.json$"),
+    re.compile(r"(?:^|/)\.vg_approvals\.json$"),
+]
 
 
 def estimate_tokens(text: str) -> int:
@@ -31,6 +54,16 @@ def resolve_workspace_path(root: Path, rel_path: str) -> Path:
     if resolved != root_resolved and root_resolved not in resolved.parents:
         raise ValueError(f"path {rel_path!r} escapes the workspace root")
     return resolved
+
+
+def validate_sensitive_path(rel_path: str) -> str | None:
+    normalized = rel_path.replace("\\", "/")
+    if normalized.endswith(".env.example") or normalized == ".env.example":
+        return None
+    for pattern in SENSITIVE_PATH_PATTERNS:
+        if pattern.search(normalized):
+            return f"sensitive path {rel_path!r} is on the read/write denylist"
+    return None
 
 
 def _path_token_error(token: str) -> str | None:
@@ -72,6 +105,10 @@ def validate_shell_command(command: str) -> str | None:
         if token in DESTRUCTIVE_TOKENS:
             return f"destructive token {token!r} is not allowed"
     for token in tokens[1:]:
+        lower_token = token.lower()
+        if lower_token in FORBIDDEN_ARG_TOKENS or lower_token.startswith("--exec"):
+            return f"forbidden argument token {token!r} is not allowed"
+    for token in tokens[1:]:
         path_error = _path_token_error(token)
         if path_error:
             return path_error
@@ -92,6 +129,9 @@ def _result(tool_use_id: str, tool: str, content: str, status: str, started: flo
 
 def read_file(root: Path, rel_path: str, tool_use_id: str) -> dict[str, object]:
     started = time.perf_counter()
+    refusal = validate_sensitive_path(rel_path)
+    if refusal:
+        return _result(tool_use_id, "read_file", refusal, "error", started)
     try:
         path = resolve_workspace_path(root, rel_path)
         content = path.read_text(encoding="utf-8")
@@ -102,6 +142,9 @@ def read_file(root: Path, rel_path: str, tool_use_id: str) -> dict[str, object]:
 
 def read_file_range(root: Path, rel_path: str, start_line: int, end_line: int, tool_use_id: str) -> dict[str, object]:
     started = time.perf_counter()
+    refusal = validate_sensitive_path(rel_path)
+    if refusal:
+        return _result(tool_use_id, "read_file_range", refusal, "error", started)
     try:
         path = resolve_workspace_path(root, rel_path)
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -113,6 +156,9 @@ def read_file_range(root: Path, rel_path: str, start_line: int, end_line: int, t
 
 def write_file(root: Path, rel_path: str, content: str, tool_use_id: str) -> dict[str, object]:
     started = time.perf_counter()
+    refusal = validate_sensitive_path(rel_path)
+    if refusal:
+        return _result(tool_use_id, "write_file", refusal, "error", started)
     try:
         path = resolve_workspace_path(root, rel_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -124,6 +170,9 @@ def write_file(root: Path, rel_path: str, content: str, tool_use_id: str) -> dic
 
 def edit_file(root: Path, rel_path: str, old: str, new: str, tool_use_id: str) -> dict[str, object]:
     started = time.perf_counter()
+    refusal = validate_sensitive_path(rel_path)
+    if refusal:
+        return _result(tool_use_id, "edit_file", refusal, "error", started)
     try:
         path = resolve_workspace_path(root, rel_path)
         content = path.read_text(encoding="utf-8")

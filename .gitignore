@@ -5,3 +5,24 @@ __pycache__/
 *.egg-info/
 traces/
 fixtures/demo_repo/traces/
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+id_rsa*
+id_ed25519*
+.aws/
+.ssh/
+.netrc
+credentials
+credentials.json
+
+# Agent state
+.vg_daily_spend.json
+.vg_approvals.json
+.vg_history

@@ -90,8 +90,47 @@ Official Anthropic docs checked on 2026-05-10:
 `run_bash` is intentionally not a general shell escape. The generated tool
 accepts only simple read-only inspection commands and rejects shell control
 operators, redirection, command substitution, and destructive command tokens
-such as `rm`, `del`, `rmdir`, `Remove-Item`, `mv`, `cp`, `chmod`, `mkfs`, and
-`dd`. Rejected commands are returned as tool errors and are not executed.
+such as `rm`, `del`, `rmdir`, `Remove-Item`, `mv`, `cp`, `chmod`, `mkfs`,
+`dd`, `git`, `ssh`, `scp`, and any package installer or foreign-language
+runtime. `sed` is excluded from the allowlist because `sed -i` mutates files
+in place. Argument tokens that shell out (`-exec`, `-execdir`, `-delete`,
+`-ok`, `-okdir`, `-fprint`, anything starting with `--exec`) are also
+rejected. Rejected commands are returned as tool errors and are not executed.
+
+File tools (`read_file`, `read_file_range`, `write_file`, `edit_file`) refuse
+any path matching the sensitive-path denylist (`.env`, `id_rsa`, `*.pem`,
+`*.key`, `.aws/`, `.ssh/`, `credentials`, etc.). `.env.example` stays
+readable so the agent can learn the schema.
+
+Approval gate:
+
+- `--require-approval off|writes|all` controls whether mutating tools (and
+  `spawn_subagent`) prompt before execution. Default is `off` so the
+  deterministic demo and tests remain reproducible.
+- `--yes` auto-approves and still records an `approval` event with
+  `decision="auto"` so the audit trail is preserved.
+- Scoped approvals (choice 2) reuse the grant for the same `(tool, folder)`
+  in the rest of the session.
+
+Endpoint pin:
+
+- The Anthropic client refuses any non-`api.anthropic.com` host. A
+  `EndpointPinViolation` is raised before the socket opens.
+
+Daily spend:
+
+- `BudgetGuard` reads and writes `.vg_daily_spend.json` (UTC date-keyed) so
+  the daily cap survives across runs. The file is gitignored and on the
+  sensitive-path denylist.
+
+Trace redaction:
+
+- Tool outputs are scanned for `sk-ant-*`, `AKIA*`, and `Bearer *` tokens
+  before being written to the JSONL trace. Each substitution produces a
+  `redaction` event. `--no-redact` disables this for local debugging only.
+
+See [`dev_docs/dangerous_cli.md`](dev_docs/dangerous_cli.md) for the *why*
+behind every command, argument token, and path on the deny-list.
 
 For a safer live demo, run inside Docker and let the container absorb any file
 changes:

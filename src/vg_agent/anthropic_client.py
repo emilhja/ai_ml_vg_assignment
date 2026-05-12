@@ -5,12 +5,19 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import config
+
 
 class MissingAnthropicKey(RuntimeError):
+    pass
+
+
+class EndpointPinViolation(RuntimeError):
     pass
 
 
@@ -55,6 +62,12 @@ class AnthropicClient:
         tools: list[dict[str, Any]],
         max_tokens: int = 4096,
     ) -> ModelTurn:
+        parsed_url = urllib.parse.urlparse(self.endpoint)
+        if parsed_url.hostname != config.ANTHROPIC_ENDPOINT_HOST:
+            raise EndpointPinViolation(
+                f"refusing to call non-pinned host {parsed_url.hostname!r}; "
+                f"endpoint must use {config.ANTHROPIC_ENDPOINT_HOST!r}"
+            )
         payload = {
             "model": model,
             "system": system_prompt,

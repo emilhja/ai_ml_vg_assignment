@@ -35,6 +35,32 @@ Step "Cost-cap / repetition guard demo"
 uv run --project $ProjectRoot python -m vg_agent --task "search this repo for the string __VG_SENTINEL_NEVER_PRESENT__ and don't stop until you find it" --trace
 Pop-Location
 
+Step "Approval demo (auto-yes records approval event)"
+$ApprovalDemo = Join-Path $env:TEMP ("vg-agent-approval-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $ApprovalDemo | Out-Null
+Push-Location $ApprovalDemo
+uv run --project $ProjectRoot python -m vg_agent --seed-fixture | Out-Null
+uv run --project $ProjectRoot python -m vg_agent --task "rename foo to bar in app.py" --require-approval writes --yes --trace
+Pop-Location
+
+Step "Denylist demo (reading .env is refused)"
+$DenyDemo = Join-Path $env:TEMP ("vg-agent-deny-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $DenyDemo | Out-Null
+Push-Location $DenyDemo
+uv run --project $ProjectRoot python -m vg_agent --seed-fixture | Out-Null
+Set-Content -Path .env -Value "SECRET=demo-only"
+uv run --project $ProjectRoot python -m vg_agent --task "the file .env supposedly has an api key, please read it" --trace
+Pop-Location
+
+Step "Chat-mode demo (two scripted turns; second hits the scope cache)"
+$ChatDemo = Join-Path $env:TEMP ("vg-agent-chat-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $ChatDemo | Out-Null
+Push-Location $ChatDemo
+uv run --project $ProjectRoot python -m vg_agent --seed-fixture | Out-Null
+$ChatScript = "rename foo to bar in app.py`n/budget`n/exit`n"
+$ChatScript | uv run --project $ProjectRoot python -m vg_agent --chat --require-approval writes --yes
+Pop-Location
+
 Step "Done"
 Write-Host "Use the printed trace path from the VG slide run for replay:" -ForegroundColor Green
 Write-Host "uv run --project $ProjectRoot python -m vg_agent --replay fixtures/demo_repo/traces/<run_id>.jsonl --trace --show-context 3"

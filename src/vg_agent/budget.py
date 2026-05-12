@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 
 from . import config
 
@@ -12,6 +15,55 @@ class BudgetDecision:
     allowed: bool
     budget_reason: str | None = None
     details: dict[str, object] = field(default_factory=dict)
+
+
+def _today_utc_key() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+class DailySpendLedger:
+    """UTC date-keyed persistent ledger under workspace root."""
+
+    def __init__(self, root: Path | None) -> None:
+        self.root = root
+        self.path: Path | None = None
+        self.data: dict[str, float] = {}
+        self.fail_closed: bool = False
+        if root is None:
+            return
+        self.path = Path(root) / config.DAILY_SPEND_FILE
+        if not self.path.exists():
+            return
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("ledger payload must be an object")
+            self.data = {str(k): float(v) for k, v in payload.items()}
+        except (OSError, ValueError, json.JSONDecodeError):
+            self.data = {}
+            self.fail_closed = True
+
+    def today_spent(self) -> float:
+        return float(self.data.get(_today_utc_key(), 0.0))
+
+    def remaining_today(self) -> float:
+        if self.fail_closed:
+            return 0.0
+        return max(0.0, config.MAX_USD_PER_DAY - self.today_spent())
+
+    def add(self, cost: float) -> None:
+        if self.path is None or self.fail_closed:
+            return
+        key = _today_utc_key()
+        self.data[key] = self.today_spent() + float(cost)
+        try:
+            self.path.write_text(
+                json.dumps(self.data, sort_keys=True),
+                encoding="utf-8",
+                newline="\n",
+            )
+        except OSError:
+            pass
 
 
 @dataclass
@@ -25,6 +77,14 @@ class BudgetGuard:
     step_count: int = 0
     last_tool_signature: tuple[str, str] | None = None
     repeat_count: int = 0
+    ledger: DailySpendLedger | None = None
+
+    @classmethod
+    def for_workspace(cls, root: Path | None, **kwargs: object) -> "BudgetGuard":
+        ledger = DailySpendLedger(root)
+        kwargs.setdefault("daily_remaining_usd", ledger.remaining_today())
+        kwargs["ledger"] = ledger
+        return cls(**kwargs)  # type: ignore[arg-type]
 
     def estimate_cost(self, model: str, input_tokens: int, output_tokens: int) -> float:
         price = config.PRICING_USD_PER_MTOK[model]
@@ -47,6 +107,8 @@ class BudgetGuard:
         self.running_tokens += input_tokens + output_tokens
         cost = self.estimate_cost(model, input_tokens, output_tokens)
         self.running_usd += cost
+        if self.ledger is not None:
+            self.ledger.add(cost)
         return cost
 
     def record_tool_signature(self, tool: str, args_key: str) -> BudgetDecision:

@@ -15,6 +15,15 @@ EXPLORER_MODEL_ID: claude-haiku-4-5-20251001
 COMPACTOR_MODEL_ID: claude-haiku-4-5-20251001
 ```
 
+## Egress pin
+
+The Anthropic Messages client refuses to open a socket to any other host. The
+endpoint is pinned and validated on every request.
+
+```yaml
+ANTHROPIC_ENDPOINT_HOST: api.anthropic.com
+```
+
 ## Pricing constants
 
 All values are USD per million tokens for first-party Claude API global routing.

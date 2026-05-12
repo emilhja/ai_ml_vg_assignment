@@ -30,6 +30,7 @@ def read_config() -> dict[str, str]:
         "CLAUDE_SONNET_4_6_OUTPUT_PER_MTOK",
         "CLAUDE_HAIKU_4_5_INPUT_PER_MTOK",
         "CLAUDE_HAIKU_4_5_OUTPUT_PER_MTOK",
+        "ANTHROPIC_ENDPOINT_HOST",
     ]
     values: dict[str, str] = {}
     for key in keys:
@@ -38,6 +39,29 @@ def read_config() -> dict[str, str]:
             raise SystemExit(f"missing {key} in MODEL_CONFIG.md")
         values[key] = match.group(1).strip()
     return values
+
+
+def read_prompts() -> dict[str, str]:
+    text = (ROOT / "PROMPTS.md").read_text(encoding="utf-8")
+    sections: dict[str, str] = {}
+    section_titles = {
+        "PARENT_SYSTEM_PROMPT": "## Parent system prompt",
+        "EXPLORER_SYSTEM_PROMPT": "## Explorer system prompt",
+        "COMPACTION_SYSTEM_PROMPT": "## Compaction system prompt",
+    }
+    for key, header in section_titles.items():
+        pattern = re.escape(header) + r"\s*\n(.*?)(?=\n## |\Z)"
+        match = re.search(pattern, text, flags=re.DOTALL)
+        if not match:
+            raise SystemExit(f"missing section {header!r} in PROMPTS.md")
+        body = match.group(1).strip()
+        sections[key] = body
+    return sections
+
+
+def python_str_literal(value: str) -> str:
+    """Render a Python string literal that round-trips through generator output."""
+    return repr(value)
 
 
 def spec_digest() -> str:
@@ -50,9 +74,11 @@ def spec_digest() -> str:
     return h.hexdigest()
 
 
-def render(text: str, digest: str, cfg: dict[str, str]) -> str:
+def render(text: str, digest: str, cfg: dict[str, str], prompts: dict[str, str]) -> str:
     for key, value in cfg.items():
         text = text.replace(f"__{key}__", value)
+    for key, value in prompts.items():
+        text = text.replace(f"__{key}_LITERAL__", python_str_literal(value))
     return text.replace("__SPEC_DIGEST__", digest)
 
 
@@ -87,12 +113,21 @@ MAX_USD_PER_DAY = 5.00
 WALL_CLOCK_TIMEOUT = 120
 TOOL_TIMEOUT = 30
 K_COMPACT = 4000
+
+ANTHROPIC_ENDPOINT_HOST = "__ANTHROPIC_ENDPOINT_HOST__"
+MAX_TOOL_RESULT_BYTES = 1_048_576
+DAILY_SPEND_FILE = ".vg_daily_spend.json"
+APPROVALS_FILE = ".vg_approvals.json"
+REQUIRE_APPROVAL_DEFAULT = "off"
 ''',
     "budget.py": '''"""Generated budget guard."""
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 
 from . import config
 
@@ -102,6 +137,55 @@ class BudgetDecision:
     allowed: bool
     budget_reason: str | None = None
     details: dict[str, object] = field(default_factory=dict)
+
+
+def _today_utc_key() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+class DailySpendLedger:
+    """UTC date-keyed persistent ledger under workspace root."""
+
+    def __init__(self, root: Path | None) -> None:
+        self.root = root
+        self.path: Path | None = None
+        self.data: dict[str, float] = {}
+        self.fail_closed: bool = False
+        if root is None:
+            return
+        self.path = Path(root) / config.DAILY_SPEND_FILE
+        if not self.path.exists():
+            return
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("ledger payload must be an object")
+            self.data = {str(k): float(v) for k, v in payload.items()}
+        except (OSError, ValueError, json.JSONDecodeError):
+            self.data = {}
+            self.fail_closed = True
+
+    def today_spent(self) -> float:
+        return float(self.data.get(_today_utc_key(), 0.0))
+
+    def remaining_today(self) -> float:
+        if self.fail_closed:
+            return 0.0
+        return max(0.0, config.MAX_USD_PER_DAY - self.today_spent())
+
+    def add(self, cost: float) -> None:
+        if self.path is None or self.fail_closed:
+            return
+        key = _today_utc_key()
+        self.data[key] = self.today_spent() + float(cost)
+        try:
+            self.path.write_text(
+                json.dumps(self.data, sort_keys=True),
+                encoding="utf-8",
+                newline="\\n",
+            )
+        except OSError:
+            pass
 
 
 @dataclass
@@ -115,6 +199,14 @@ class BudgetGuard:
     step_count: int = 0
     last_tool_signature: tuple[str, str] | None = None
     repeat_count: int = 0
+    ledger: DailySpendLedger | None = None
+
+    @classmethod
+    def for_workspace(cls, root: Path | None, **kwargs: object) -> "BudgetGuard":
+        ledger = DailySpendLedger(root)
+        kwargs.setdefault("daily_remaining_usd", ledger.remaining_today())
+        kwargs["ledger"] = ledger
+        return cls(**kwargs)  # type: ignore[arg-type]
 
     def estimate_cost(self, model: str, input_tokens: int, output_tokens: int) -> float:
         price = config.PRICING_USD_PER_MTOK[model]
@@ -137,6 +229,8 @@ class BudgetGuard:
         self.running_tokens += input_tokens + output_tokens
         cost = self.estimate_cost(model, input_tokens, output_tokens)
         self.running_usd += cost
+        if self.ledger is not None:
+            self.ledger.add(cost)
         return cost
 
     def record_tool_signature(self, tool: str, args_key: str) -> BudgetDecision:
@@ -157,12 +251,19 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import config
+
 
 class MissingAnthropicKey(RuntimeError):
+    pass
+
+
+class EndpointPinViolation(RuntimeError):
     pass
 
 
@@ -207,6 +308,12 @@ class AnthropicClient:
         tools: list[dict[str, Any]],
         max_tokens: int = 4096,
     ) -> ModelTurn:
+        parsed_url = urllib.parse.urlparse(self.endpoint)
+        if parsed_url.hostname != config.ANTHROPIC_ENDPOINT_HOST:
+            raise EndpointPinViolation(
+                f"refusing to call non-pinned host {parsed_url.hostname!r}; "
+                f"endpoint must use {config.ANTHROPIC_ENDPOINT_HOST!r}"
+            )
         payload = {
             "model": model,
             "system": system_prompt,
@@ -266,20 +373,43 @@ class AnthropicClient:
 
 from __future__ import annotations
 
+import re
 import shlex
 import subprocess
 import time
 from pathlib import Path
 
 
-SAFE_COMMANDS = {"grep", "rg", "find", "ls", "pwd", "cat", "sed", "head", "tail", "wc"}
+SAFE_COMMANDS = {"grep", "rg", "find", "ls", "pwd", "cat", "head", "tail", "wc"}
 DESTRUCTIVE_TOKENS = {
     "rm", "del", "erase", "rmdir", "remove-item", "ri", "rd",
     "mv", "move", "cp", "copy", "chmod", "chown", "mkfs", "dd",
     "curl", "wget", "pip", "npm", "pnpm", "yarn", "uv", "python",
     "powershell", "pwsh", "cmd",
+    "nc", "ncat", "netcat", "ssh", "scp", "rsync", "ftp", "git",
+    "sftp", "telnet", "socat",
+}
+FORBIDDEN_ARG_TOKENS = {
+    "-exec", "-execdir", "-delete", "-ok", "-okdir",
+    "-fprint", "-fprintf", "-fls",
 }
 SHELL_CONTROL_MARKERS = [";", "&&", "||", "|", ">", "<", "`", "$("]
+
+SENSITIVE_PATH_PATTERNS = [
+    re.compile(r"(?:^|/)\\.env(?:$|\\.(?!example))"),
+    re.compile(r"(?:^|/)id_rsa(?:\\..*)?$"),
+    re.compile(r"(?:^|/)id_ed25519(?:\\..*)?$"),
+    re.compile(r"\\.pem$"),
+    re.compile(r"\\.key$"),
+    re.compile(r"\\.pfx$"),
+    re.compile(r"\\.p12$"),
+    re.compile(r"(?:^|/)\\.aws/"),
+    re.compile(r"(?:^|/)\\.ssh/"),
+    re.compile(r"(?:^|/)\\.netrc$"),
+    re.compile(r"(?:^|/)credentials(?:\\.json)?$"),
+    re.compile(r"(?:^|/)\\.vg_daily_spend\\.json$"),
+    re.compile(r"(?:^|/)\\.vg_approvals\\.json$"),
+]
 
 
 def estimate_tokens(text: str) -> int:
@@ -295,6 +425,16 @@ def resolve_workspace_path(root: Path, rel_path: str) -> Path:
     if resolved != root_resolved and root_resolved not in resolved.parents:
         raise ValueError(f"path {rel_path!r} escapes the workspace root")
     return resolved
+
+
+def validate_sensitive_path(rel_path: str) -> str | None:
+    normalized = rel_path.replace("\\\\", "/")
+    if normalized.endswith(".env.example") or normalized == ".env.example":
+        return None
+    for pattern in SENSITIVE_PATH_PATTERNS:
+        if pattern.search(normalized):
+            return f"sensitive path {rel_path!r} is on the read/write denylist"
+    return None
 
 
 def _path_token_error(token: str) -> str | None:
@@ -336,6 +476,10 @@ def validate_shell_command(command: str) -> str | None:
         if token in DESTRUCTIVE_TOKENS:
             return f"destructive token {token!r} is not allowed"
     for token in tokens[1:]:
+        lower_token = token.lower()
+        if lower_token in FORBIDDEN_ARG_TOKENS or lower_token.startswith("--exec"):
+            return f"forbidden argument token {token!r} is not allowed"
+    for token in tokens[1:]:
         path_error = _path_token_error(token)
         if path_error:
             return path_error
@@ -356,6 +500,9 @@ def _result(tool_use_id: str, tool: str, content: str, status: str, started: flo
 
 def read_file(root: Path, rel_path: str, tool_use_id: str) -> dict[str, object]:
     started = time.perf_counter()
+    refusal = validate_sensitive_path(rel_path)
+    if refusal:
+        return _result(tool_use_id, "read_file", refusal, "error", started)
     try:
         path = resolve_workspace_path(root, rel_path)
         content = path.read_text(encoding="utf-8")
@@ -366,6 +513,9 @@ def read_file(root: Path, rel_path: str, tool_use_id: str) -> dict[str, object]:
 
 def read_file_range(root: Path, rel_path: str, start_line: int, end_line: int, tool_use_id: str) -> dict[str, object]:
     started = time.perf_counter()
+    refusal = validate_sensitive_path(rel_path)
+    if refusal:
+        return _result(tool_use_id, "read_file_range", refusal, "error", started)
     try:
         path = resolve_workspace_path(root, rel_path)
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -377,6 +527,9 @@ def read_file_range(root: Path, rel_path: str, start_line: int, end_line: int, t
 
 def write_file(root: Path, rel_path: str, content: str, tool_use_id: str) -> dict[str, object]:
     started = time.perf_counter()
+    refusal = validate_sensitive_path(rel_path)
+    if refusal:
+        return _result(tool_use_id, "write_file", refusal, "error", started)
     try:
         path = resolve_workspace_path(root, rel_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -388,6 +541,9 @@ def write_file(root: Path, rel_path: str, content: str, tool_use_id: str) -> dic
 
 def edit_file(root: Path, rel_path: str, old: str, new: str, tool_use_id: str) -> dict[str, object]:
     started = time.perf_counter()
+    refusal = validate_sensitive_path(rel_path)
+    if refusal:
+        return _result(tool_use_id, "edit_file", refusal, "error", started)
     try:
         path = resolve_workspace_path(root, rel_path)
         content = path.read_text(encoding="utf-8")
@@ -414,30 +570,68 @@ def run_bash(root: Path, command: str, tool_use_id: str) -> dict[str, object]:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
+
+
+REDACTION_PATTERNS = [
+    ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\\-]+")),
+    ("aws_key_id", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("bearer_token", re.compile(r"(?i)bearer\\s+[a-z0-9._\\-]+")),
+]
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _redact(content: str) -> tuple[str, list[tuple[str, int]]]:
+    summary: list[tuple[str, int]] = []
+    redacted = content
+    for name, pattern in REDACTION_PATTERNS:
+        redacted, count = pattern.subn("***REDACTED***", redacted)
+        if count:
+            summary.append((name, count))
+    return redacted, summary
+
+
+def _redact_event_fields(event: dict[str, Any]) -> tuple[dict[str, Any], list[tuple[str, int]]]:
+    summary: list[tuple[str, int]] = []
+    redacted: dict[str, Any] = {}
+    for key, value in event.items():
+        if isinstance(value, str):
+            new_value, hits = _redact(value)
+            if hits:
+                summary.extend(hits)
+            redacted[key] = new_value
+        else:
+            redacted[key] = value
+    return redacted, summary
+
+
 @dataclass
 class TraceRecorder:
     root: Path
     run_id: str = field(default_factory=lambda: uuid4().hex[:12])
+    session_id: str | None = None
     events: list[dict[str, object]] = field(default_factory=list)
+    redact: bool = True
 
     def __post_init__(self) -> None:
         self.trace_dir = self.root / "traces"
         self.trace_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.trace_dir / f"{self.run_id}.jsonl"
+        if self.session_id is None:
+            self.session_id = self.run_id
 
     def emit(self, kind: str, agent_id: str = "parent", parent_id: str | None = None, **fields: object) -> dict[str, object]:
-        event = {
+        event: dict[str, object] = {
             "run_id": self.run_id,
+            "session_id": self.session_id,
             "event_idx": len(self.events),
             "timestamp_iso": now_iso(),
             "agent_id": agent_id,
@@ -445,10 +639,24 @@ class TraceRecorder:
             "kind": kind,
         }
         event.update(fields)
+        redaction_summary: list[tuple[str, int]] = []
+        if self.redact:
+            event, redaction_summary = _redact_event_fields(event)
         self.events.append(event)
         with self.path.open("a", encoding="utf-8", newline="\\n") as fh:
             fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\\n")
+        if redaction_summary and kind != "redaction":
+            self._emit_redaction(int(event["event_idx"]), redaction_summary)
         return event
+
+    def _emit_redaction(self, original_event_idx: int, summary: list[tuple[str, int]]) -> None:
+        for pattern_name, count in summary:
+            self.emit(
+                "redaction",
+                original_event_idx=original_event_idx,
+                pattern=pattern_name,
+                count=count,
+            )
 
 
 def load_trace(path: Path) -> list[dict[str, object]]:
@@ -468,6 +676,14 @@ def render_tree(events: list[dict[str, object]]) -> str:
             lines.append(f"{prefix}{event['event_idx']:03d} compacted {event.get('before_tokens')} -> {event.get('after_tokens')} tokens (tool_use {event.get('tool_use_id')})")
         elif kind == "budget_event":
             lines.append(f"{prefix}{event['event_idx']:03d} budget_event {event.get('budget_reason')}")
+        elif kind == "approval":
+            lines.append(f"{prefix}{event['event_idx']:03d} approval {event.get('tool')} decision={event.get('decision')} scope={event.get('scope_key')}")
+        elif kind == "egress_blocked":
+            lines.append(f"{prefix}{event['event_idx']:03d} egress_blocked host={event.get('host')!r}")
+        elif kind == "redaction":
+            lines.append(f"{prefix}{event['event_idx']:03d} redaction {event.get('pattern')} count={event.get('count')} orig_idx={event.get('original_event_idx')}")
+        elif kind == "session_reset":
+            lines.append(f"{prefix}{event['event_idx']:03d} session_reset")
         elif kind == "run_end":
             lines.append(f"{prefix}{event['event_idx']:03d} run_end {event.get('final_status')} cost={event.get('total_cost_usd')}")
         else:
@@ -516,6 +732,27 @@ def show_context(events: list[dict[str, object]], step_idx: int) -> list[dict[st
             if pos is not None:
                 context[pos]["content"] = compacted_marker(event)
                 context[pos]["compacted"] = True
+        elif kind == "approval":
+            context.append({
+                "role": "meta",
+                "kind": "approval",
+                "tool": event.get("tool"),
+                "decision": event.get("decision"),
+                "scope_key": event.get("scope_key"),
+            })
+        elif kind == "redaction":
+            context.append({
+                "role": "meta",
+                "kind": "redaction",
+                "pattern": event.get("pattern"),
+                "count": event.get("count"),
+            })
+        elif kind == "egress_blocked":
+            context.append({
+                "role": "meta",
+                "kind": "egress_blocked",
+                "host": event.get("host"),
+            })
     return context
 ''',
     "demo_fixture.py": '''"""Generated deterministic fixture repository."""
@@ -614,8 +851,8 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from dataclasses import asdict
-from typing import Any
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable
 from pathlib import Path
 
 from . import config, tools
@@ -624,20 +861,151 @@ from .budget import BudgetGuard
 from .trace import TraceRecorder, compacted_marker
 
 
-PARENT_SYSTEM_PROMPT = (
-    "You are the parent coding agent. Use tools deliberately, keep a concise working "
-    "context, and spawn Explorer only for bounded repository inspection. You may use "
-    "`read_file`, `read_file_range`, `write_file`, `edit_file`, `run_bash`, and "
-    "`spawn_subagent`. Prefer targeted reads before edits, explain final changes "
-    "concisely, and stop when the task is complete."
-)
+PARENT_SYSTEM_PROMPT = __PARENT_SYSTEM_PROMPT_LITERAL__
 
-EXPLORER_SYSTEM_PROMPT = (
-    "You are Explorer, a read-only sub-agent. Inspect only the requested area, keep "
-    "all intermediate tool calls in your private context, and return one summary of "
-    "at most 2 KB. Never spawn another sub-agent, never edit files, and answer only "
-    "the bounded question from the parent."
-)
+EXPLORER_SYSTEM_PROMPT = __EXPLORER_SYSTEM_PROMPT_LITERAL__
+
+GATED_WRITES = {"write_file", "edit_file", "run_bash", "spawn_subagent"}
+GATED_ALL = {"read_file", "read_file_range"} | GATED_WRITES
+
+
+@dataclass
+class ApprovalRequest:
+    tool: str
+    path: str | None
+    args: dict[str, Any]
+    summary: str
+
+
+@dataclass
+class ApprovalOutcome:
+    decision: str
+    scope_key: str | None = None
+    reason: str = ""
+
+
+class ApprovalScopeCache:
+    def __init__(self) -> None:
+        self._grants: set[tuple[str, str]] = set()
+
+    def lookup(self, tool: str, candidates: list[str]) -> str | None:
+        for key in candidates:
+            if (tool, key) in self._grants:
+                return key
+        return None
+
+    def grant(self, tool: str, scope_key: str) -> None:
+        self._grants.add((tool, scope_key))
+
+    def clear(self) -> None:
+        self._grants.clear()
+
+    def listing(self) -> list[tuple[str, str]]:
+        return sorted(self._grants)
+
+
+def _scope_candidates(request: ApprovalRequest) -> list[str]:
+    if request.tool == "run_bash":
+        command = str(request.args.get("command") or "")
+        head = command.strip().split()[0] if command.strip() else ""
+        return [f"cmd:{head}", "*"] if head else ["*"]
+    if request.tool == "spawn_subagent":
+        return ["*"]
+    if request.path is None:
+        return ["*"]
+    normalized = request.path.replace("\\\\", "/")
+    parts = [p for p in normalized.split("/") if p and p != "."]
+    if not parts:
+        return ["", "*"]
+    candidates: list[str] = []
+    parent = "/".join(parts[:-1])
+    while True:
+        candidates.append(parent)
+        if not parent:
+            break
+        parent = "/".join(parent.split("/")[:-1])
+    candidates.append("*")
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for key in candidates:
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(key)
+    return deduped
+
+
+@dataclass
+class ApprovalPolicy:
+    mode: str = "off"
+    auto_yes: bool = False
+    prompt: Callable[[ApprovalRequest], ApprovalOutcome] | None = None
+    cache: ApprovalScopeCache = field(default_factory=ApprovalScopeCache)
+
+    def gated_tools(self) -> set[str]:
+        if self.mode == "off":
+            return set()
+        if self.mode == "writes":
+            return set(GATED_WRITES)
+        if self.mode == "all":
+            return set(GATED_ALL)
+        return set()
+
+    def check(self, request: ApprovalRequest) -> ApprovalOutcome:
+        if request.tool not in self.gated_tools():
+            return ApprovalOutcome(decision="auto", scope_key=None)
+        if self.auto_yes:
+            return ApprovalOutcome(decision="auto", scope_key=None)
+        candidates = _scope_candidates(request)
+        cached = self.cache.lookup(request.tool, candidates)
+        if cached is not None:
+            return ApprovalOutcome(decision="approved_scoped", scope_key=cached, reason="scope cache hit")
+        if self.prompt is None:
+            return ApprovalOutcome(decision="denied", reason="no interactive prompt available")
+        outcome = self.prompt(request)
+        if outcome.decision == "approved_scoped" and outcome.scope_key is not None:
+            self.cache.grant(request.tool, outcome.scope_key)
+        elif outcome.decision == "approved_always":
+            self.cache.grant(request.tool, "*")
+            outcome.scope_key = "*"
+        return outcome
+
+
+def _args_summary(tool: str, args: dict[str, Any]) -> str:
+    if tool in {"read_file", "read_file_range", "write_file", "edit_file"}:
+        path = args.get("path") or args.get("rel_path") or ""
+        if tool == "edit_file":
+            old = str(args.get("old") or "")
+            new = str(args.get("new") or "")
+            return f"{path}  - {old[:40]!r} -> + {new[:40]!r}"
+        return str(path)
+    if tool == "run_bash":
+        return str(args.get("command") or "")
+    if tool == "spawn_subagent":
+        return str(args.get("question") or "")[:120]
+    return json.dumps(args, sort_keys=True, ensure_ascii=False)[:160]
+
+
+def _request_for(call: ToolCall) -> ApprovalRequest:
+    path = call.args.get("path") or call.args.get("rel_path")
+    return ApprovalRequest(
+        tool=call.name,
+        path=str(path) if path else None,
+        args=dict(call.args),
+        summary=_args_summary(call.name, call.args),
+    )
+
+
+def _emit_approval(recorder: TraceRecorder, call: ToolCall, outcome: ApprovalOutcome) -> None:
+    recorder.emit(
+        "approval",
+        tool_use_id=call.tool_use_id,
+        tool=call.name,
+        args_summary=_args_summary(call.name, call.args),
+        decision=outcome.decision,
+        scope_key=outcome.scope_key,
+        reason=outcome.reason,
+    )
 
 PARENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -775,11 +1143,20 @@ def _execute_live_tool(
     read_only: bool,
     allow_spawn: bool,
     started: float,
+    policy: ApprovalPolicy,
 ) -> dict[str, object]:
     tool_name = call.name
     args = call.args
     tool_started = time.perf_counter()
     path = str(args.get("path") or args.get("rel_path") or "")
+
+    if tool_name in policy.gated_tools():
+        outcome = policy.check(_request_for(call))
+        _emit_approval(recorder, call, outcome)
+        if outcome.decision == "denied":
+            return _result(call.tool_use_id, tool_name, f"approval denied: {outcome.reason}", "error", tool_started)
+        if outcome.decision == "aborted":
+            return _result(call.tool_use_id, tool_name, "approval aborted by user", "error", tool_started)
 
     if tool_name == "read_file":
         return tools.read_file(root, path, call.tool_use_id)
@@ -806,7 +1183,7 @@ def _execute_live_tool(
         question = str(args.get("question") or "")
         child_id = f"explorer-{sum(1 for event in recorder.events if event.get('kind') == 'subagent_spawn') + 1}"
         recorder.emit("subagent_spawn", child_agent_id=child_id, question=question, model=config.EXPLORER_MODEL_ID)
-        summary = _run_live_explorer(root, question, recorder, client, guard, child_id, started)
+        summary = _run_live_explorer(root, question, recorder, client, guard, child_id, started, policy)
         return _result(call.tool_use_id, "spawn_subagent", summary, "ok", tool_started)
     return _result(call.tool_use_id, tool_name, f"unknown tool {tool_name!r}", "error", tool_started)
 
@@ -819,6 +1196,7 @@ def _run_live_explorer(
     guard: BudgetGuard,
     child_id: str,
     started: float,
+    policy: ApprovalPolicy,
 ) -> str:
     messages: list[dict[str, Any]] = [{"role": "user", "content": question}]
     child_cost_before = guard.running_usd
@@ -875,6 +1253,7 @@ def _run_live_explorer(
                 read_only=True,
                 allow_spawn=False,
                 started=started,
+                policy=policy,
             )
             recorder.emit("tool_result", agent_id=child_id, parent_id="parent", **result)
             tool_blocks.append({"type": "tool_result", "tool_use_id": call.tool_use_id, "content": str(result["result_full"]), "is_error": result["status"] != "ok"})
@@ -903,10 +1282,12 @@ def run_live_task(
     recorder: TraceRecorder | None = None,
     client: Any | None = None,
     guard: BudgetGuard | None = None,
+    policy: ApprovalPolicy | None = None,
 ) -> TraceRecorder:
     recorder = recorder or TraceRecorder(root)
     client = client or AnthropicClient.from_env()
-    guard = guard or BudgetGuard()
+    guard = guard or BudgetGuard.for_workspace(root)
+    policy = policy or ApprovalPolicy()
     started = time.perf_counter()
     messages: list[dict[str, Any]] = [{"role": "user", "content": task}]
     recorder.emit("user_prompt", prompt=task, live_model=True)
@@ -968,12 +1349,19 @@ def run_live_task(
                 read_only=False,
                 allow_spawn=True,
                 started=started,
+                policy=policy,
             )
             event = recorder.emit("tool_result", **result)
             content = str(result["result_full"])
             compaction = _compact_if_needed(recorder, event, deterministic=False)
             if compaction is not None:
                 content = compacted_marker(compaction)
+            elif len(content.encode("utf-8")) > config.MAX_TOOL_RESULT_BYTES:
+                head = content[: config.MAX_TOOL_RESULT_BYTES // 2]
+                content = (
+                    f"{head}\\n[TRUNCATED at {config.MAX_TOOL_RESULT_BYTES} bytes; full content at "
+                    f"trace pointer {recorder.run_id}:event:{event['event_idx']}]"
+                )
             tool_blocks.append({"type": "tool_result", "tool_use_id": call.tool_use_id, "content": content, "is_error": result["status"] != "ok"})
             if result["status"] != "ok":
                 recorder.emit(
@@ -987,7 +1375,13 @@ def run_live_task(
         messages.append({"role": "user", "content": tool_blocks})
 
 
-def _explore_auth(root: Path, recorder: TraceRecorder) -> str:
+def _explore_auth(root: Path, recorder: TraceRecorder, policy: ApprovalPolicy | None = None) -> str:
+    if policy is not None and "spawn_subagent" in policy.gated_tools():
+        spawn_call = ToolCall("parent-spawn-explorer", "spawn_subagent", {"question": "inspect auth/"})
+        outcome = policy.check(_request_for(spawn_call))
+        _emit_approval(recorder, spawn_call, outcome)
+        if outcome.decision in {"denied", "aborted"}:
+            return f"approval denied: {outcome.reason}"
     child_id = "explorer-1"
     recorder.emit("subagent_spawn", child_agent_id=child_id, question="inspect auth/", model=config.EXPLORER_MODEL_ID)
     recorder.emit(
@@ -1026,9 +1420,15 @@ def _explore_auth(root: Path, recorder: TraceRecorder) -> str:
     return summary
 
 
-def run_task(root: Path, task: str, recorder: TraceRecorder | None = None) -> TraceRecorder:
+def run_task(
+    root: Path,
+    task: str,
+    recorder: TraceRecorder | None = None,
+    policy: ApprovalPolicy | None = None,
+) -> TraceRecorder:
     recorder = recorder or TraceRecorder(root)
     guard = BudgetGuard()
+    policy = policy or ApprovalPolicy()
     task_lower = task.lower()
     recorder.emit("user_prompt", prompt=task)
 
@@ -1045,6 +1445,21 @@ def run_task(root: Path, task: str, recorder: TraceRecorder | None = None) -> Tr
             tool_calls=[{"tool_use_id": "parent-edit-app", "name": "edit_file", "args": {"path": "app.py"}}],
             stop_reason="tool_use",
         )
+        edit_call = ToolCall("parent-edit-app", "edit_file", {"path": "app.py", "old": "foo", "new": "bar"})
+        if edit_call.name in policy.gated_tools():
+            outcome = policy.check(_request_for(edit_call))
+            _emit_approval(recorder, edit_call, outcome)
+            if outcome.decision in {"denied", "aborted"}:
+                deny_result = _result("parent-edit-app", "edit_file", f"approval denied: {outcome.reason}", "error", time.perf_counter())
+                recorder.emit("tool_result", **deny_result)
+                recorder.emit(
+                    "run_end",
+                    final_status="tool_error",
+                    total_cost_usd=round(guard.running_usd, 6),
+                    total_tokens=guard.running_tokens,
+                    duration_s=0.1,
+                )
+                return recorder
         result = tools.edit_file(root, "app.py", "foo", "bar", "parent-edit-app")
         recorder.emit("tool_result", **result)
         cost = guard.record_model_call(config.PARENT_MODEL_ID, 350, 60)
@@ -1120,7 +1535,7 @@ def run_task(root: Path, task: str, recorder: TraceRecorder | None = None) -> Tr
         tool_calls=[{"tool_use_id": "parent-spawn-explorer", "name": "spawn_subagent", "args": {"question": "inspect auth/"}}],
         stop_reason="tool_use",
     )
-    summary = _explore_auth(root, recorder)
+    summary = _explore_auth(root, recorder, policy)
     recorder.emit(
         "tool_result",
         tool_use_id="parent-spawn-explorer",
@@ -1153,12 +1568,122 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
-from .agent import run_live_task, run_task
+from . import config
+from .agent import ApprovalOutcome, ApprovalPolicy, ApprovalRequest, run_live_task, run_task
 from .anthropic_client import AnthropicClient, MissingAnthropicKey
+from .budget import BudgetGuard
 from .demo_fixture import write_fixture
 from .trace import TraceRecorder, load_trace, render_tree, show_context
+
+
+def _stdin_prompt(stream: object | None = None) -> "callable":
+    fh = stream if stream is not None else sys.stdin
+
+    def ask(request: ApprovalRequest) -> ApprovalOutcome:
+        sys.stderr.write(f"[approval] {request.tool}  {request.summary}\\n")
+        sys.stderr.write("  1) yes  2) yes (this folder)  3) yes (always)  4) no  5) abort\\n> ")
+        sys.stderr.flush()
+        line = fh.readline().strip()
+        if not line:
+            return ApprovalOutcome(decision="denied", reason="no input")
+        choice = line.split()[0]
+        if choice == "1":
+            return ApprovalOutcome(decision="approved", reason="user yes")
+        if choice == "2":
+            path = request.path or ""
+            normalized = path.replace("\\\\", "/")
+            parent = "/".join(normalized.split("/")[:-1])
+            if request.tool == "run_bash":
+                command = str(request.args.get("command") or "")
+                head = command.strip().split()[0] if command.strip() else ""
+                scope = f"cmd:{head}" if head else "*"
+            elif request.tool == "spawn_subagent":
+                scope = "*"
+            else:
+                scope = parent
+            return ApprovalOutcome(decision="approved_scoped", scope_key=scope, reason="user yes-folder")
+        if choice == "3":
+            return ApprovalOutcome(decision="approved_always", scope_key="*", reason="user yes-always")
+        if choice == "5":
+            return ApprovalOutcome(decision="aborted", reason="user abort")
+        return ApprovalOutcome(decision="denied", reason="user no")
+
+    return ask
+
+
+def _make_policy(args: argparse.Namespace) -> ApprovalPolicy:
+    mode = args.require_approval
+    if mode == "off":
+        return ApprovalPolicy(mode="off")
+    return ApprovalPolicy(
+        mode=mode,
+        auto_yes=bool(args.yes),
+        prompt=_stdin_prompt(),
+    )
+
+
+def _print_budget(guard: BudgetGuard) -> None:
+    sys.stdout.write(
+        f"steps {guard.step_count}/{guard.max_steps}  "
+        f"tokens {guard.running_tokens}/{guard.max_tokens}  "
+        f"usd {guard.running_usd:.6f}/{guard.max_usd}  "
+        f"daily_remaining {guard.daily_remaining_usd:.6f}\\n"
+    )
+
+
+def _chat_loop(root: Path, args: argparse.Namespace) -> int:
+    recorder = TraceRecorder(root, redact=not args.no_redact)
+    policy = _make_policy(args)
+    guard = BudgetGuard.for_workspace(root)
+    sys.stderr.write("VG Agent chat mode. Type /help for commands.\\n")
+    while True:
+        sys.stderr.write("vg> ")
+        sys.stderr.flush()
+        try:
+            line = sys.stdin.readline()
+        except KeyboardInterrupt:
+            recorder.emit("budget_event", budget_reason="user_abort", details={})
+            break
+        if not line:
+            break
+        prompt = line.strip()
+        if not prompt:
+            continue
+        if prompt in {"/exit", "/quit"}:
+            break
+        if prompt == "/budget":
+            _print_budget(guard)
+            continue
+        if prompt == "/approvals":
+            for entry in policy.cache.listing():
+                sys.stdout.write(f"  {entry[0]}  {entry[1]}\\n")
+            continue
+        if prompt == "/reset":
+            policy.cache.clear()
+            guard = BudgetGuard.for_workspace(root)
+            recorder.emit("session_reset")
+            continue
+        if prompt.startswith("/show-context"):
+            parts = prompt.split()
+            step = int(parts[1]) if len(parts) > 1 else 0
+            sys.stdout.write(json.dumps(show_context(recorder.events, step), indent=2, ensure_ascii=False) + "\\n")
+            continue
+        if prompt == "/help":
+            sys.stdout.write("/exit /quit /budget /approvals /reset /show-context N /help\\n")
+            continue
+        if args.live_model:
+            try:
+                client = AnthropicClient.from_env()
+            except MissingAnthropicKey as exc:
+                sys.stderr.write(f"error: {exc}\\n")
+                return 2
+            run_live_task(root, prompt, recorder, client=client, guard=guard, policy=policy)
+        else:
+            run_task(root, prompt, recorder, policy=policy)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1169,7 +1694,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--show-context", type=int)
     parser.add_argument("--seed-fixture", action="store_true")
     parser.add_argument("--live-model", action="store_true")
+    parser.add_argument("--chat", action="store_true")
+    parser.add_argument("--require-approval", choices=["off", "writes", "all"], default=config.REQUIRE_APPROVAL_DEFAULT)
+    parser.add_argument("--yes", action="store_true")
+    parser.add_argument("--no-redact", action="store_true")
     args = parser.parse_args(argv)
+
+    if args.no_redact:
+        sys.stderr.write("warning: --no-redact disables trace secret redaction.\\n")
 
     root = Path.cwd()
     if args.seed_fixture:
@@ -1185,18 +1717,22 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(show_context(events, args.show_context), indent=2, ensure_ascii=False))
         return 0
 
-    if not args.task:
-        parser.error("--task, --replay, or --seed-fixture is required")
+    if args.chat:
+        return _chat_loop(root, args)
 
-    recorder = TraceRecorder(root)
+    if not args.task:
+        parser.error("--task, --chat, --replay, or --seed-fixture is required")
+
+    recorder = TraceRecorder(root, redact=not args.no_redact)
+    policy = _make_policy(args)
     if args.live_model:
         try:
             client = AnthropicClient.from_env()
         except MissingAnthropicKey as exc:
             parser.exit(2, f"error: {exc}\\n")
-        run_live_task(root, args.task, recorder, client=client)
+        run_live_task(root, args.task, recorder, client=client, policy=policy)
     else:
-        run_task(root, args.task, recorder)
+        run_task(root, args.task, recorder, policy=policy)
     if args.trace:
         print(render_tree(recorder.events))
         print(f"trace: {recorder.path}")
@@ -1211,14 +1747,14 @@ if __name__ == "__main__":
 }
 
 
-def write_generated(src_dir: Path, digest: str, cfg: dict[str, str], clean: bool) -> None:
+def write_generated(src_dir: Path, digest: str, cfg: dict[str, str], prompts: dict[str, str], clean: bool) -> None:
     if clean and src_dir.exists():
         shutil.rmtree(src_dir)
     src_dir.mkdir(parents=True, exist_ok=True)
     for rel_path, text in GENERATED_FILES.items():
         path = src_dir / rel_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(render(text, digest, cfg), encoding="utf-8", newline="\n")
+        path.write_text(render(text, digest, cfg, prompts), encoding="utf-8", newline="\n")
 
 
 def write_fixture(fixture_dir: Path, clean: bool) -> None:
@@ -1243,9 +1779,10 @@ def main() -> int:
     args = parser.parse_args()
 
     cfg = read_config()
+    prompts = read_prompts()
     digest = spec_digest()
     src_dir = Path(args.src_dir)
-    write_generated(src_dir, digest, cfg, args.clean)
+    write_generated(src_dir, digest, cfg, prompts, args.clean)
     if not args.no_fixture:
         write_fixture(Path(args.fixture_dir), args.clean)
     print(f"generated {src_dir} from specs digest {digest}")
