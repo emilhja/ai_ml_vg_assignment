@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 
@@ -53,6 +53,7 @@ class TraceRecorder:
     session_id: str | None = None
     events: list[dict[str, object]] = field(default_factory=list)
     redact: bool = True
+    event_sink: Callable[[dict[str, object]], None] | None = None
 
     def __post_init__(self) -> None:
         self.trace_dir = self.root / "traces"
@@ -78,6 +79,8 @@ class TraceRecorder:
         self.events.append(event)
         with self.path.open("a", encoding="utf-8", newline="\n") as fh:
             fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+        if self.event_sink is not None:
+            self.event_sink(event)
         if redaction_summary and kind != "redaction":
             self._emit_redaction(int(event["event_idx"]), redaction_summary)
         return event
@@ -101,7 +104,9 @@ def render_tree(events: list[dict[str, object]]) -> str:
     for event in events:
         prefix = "  " if event.get("parent_id") else ""
         kind = event["kind"]
-        if kind == "assistant_step":
+        if kind == "llm_start":
+            lines.append(f"{prefix}{event['event_idx']:03d} {event['agent_id']} llm_start step {event.get('step_idx')} model={event.get('model')}")
+        elif kind == "assistant_step":
             lines.append(f"{prefix}{event['event_idx']:03d} {event['agent_id']} assistant step {event.get('step_idx')} model={event.get('model')}")
         elif kind == "tool_result":
             lines.append(f"{prefix}{event['event_idx']:03d} {event['agent_id']} tool_result {event.get('tool')} tokens={event.get('tokens')} status={event.get('status')}")

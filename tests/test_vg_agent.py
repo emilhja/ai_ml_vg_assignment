@@ -256,9 +256,22 @@ def test_live_parent_tool_flow_reads_and_edits_fixture(tmp_path: Path) -> None:
     run_live_task(tmp_path, "rename foo to baz", recorder, client=client)
     assert "def baz(" in (tmp_path / "app.py").read_text(encoding="utf-8")
     events = read_events(recorder.path)
+    assert events[1]["kind"] == "llm_start"
+    assert events[1]["model"] == config.PARENT_MODEL_ID
     assert [e["tool"] for e in events if e["kind"] == "tool_result"] == ["read_file", "edit_file"]
     assert events[-1]["final_status"] == "ok"
     assert len(client.calls) == 2
+
+
+def test_trace_event_sink_receives_progress_events(tmp_path: Path) -> None:
+    seen: list[dict[str, object]] = []
+    recorder = TraceRecorder(tmp_path, event_sink=seen.append)
+    recorder.emit("llm_start", model=config.PARENT_MODEL_ID, step_idx=1, tokens_in=10, max_tokens=20)
+
+    from vg_agent.__main__ import _format_progress_event
+
+    assert seen and seen[0]["kind"] == "llm_start"
+    assert "[llm] parent step 1" in str(_format_progress_event(seen[0]))
 
 
 def test_live_explorer_context_excludes_child_intermediate_results(tmp_path: Path) -> None:
@@ -490,6 +503,31 @@ def test_approval_scope_does_not_bypass_denylist(tmp_path: Path) -> None:
     assert sensitive_errors
 
 
+def test_unsafe_run_bash_is_rejected_before_approval_prompt(tmp_path: Path) -> None:
+    calls = {"count": 0}
+
+    def approve(_request: ApprovalRequest) -> ApprovalOutcome:
+        calls["count"] += 1
+        return ApprovalOutcome(decision="approved", reason="unused")
+
+    policy = ApprovalPolicy(mode="writes", prompt=approve)
+    client = FakeClient([
+        ModelTurn(
+            "try unsafe shell",
+            [ToolCall("bad-find", "run_bash", {"command": 'find . -name "calculator.py" | head -20'})],
+            stop_reason="tool_use",
+            input_tokens=10,
+            output_tokens=5,
+        )
+    ])
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "inspect", recorder, client=client, policy=policy)
+    assert calls["count"] == 0
+    result = next(e for e in recorder.events if e["kind"] == "tool_result")
+    assert result["status"] == "error"
+    assert "shell control" in str(result["result_full"])
+
+
 def test_daily_spend_persists_across_runs(tmp_path: Path) -> None:
     ledger = DailySpendLedger(tmp_path)
     assert ledger.remaining_today() == config.MAX_USD_PER_DAY
@@ -568,6 +606,7 @@ def test_chat_persists_budget_and_approvals_across_turns(tmp_path: Path) -> None
     assert completed.returncode == 0, completed.stderr
     # Budget output should be present in stdout
     assert "steps" in completed.stdout
+    assert "Renamed foo to bar in app.py." in completed.stdout
     # Trace should be a single JSONL with one session_id
     trace_dir = tmp_path / "traces"
     traces = list(trace_dir.glob("*.jsonl"))

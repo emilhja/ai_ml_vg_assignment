@@ -5,7 +5,66 @@ The source of truth is the markdown spec set plus `PROMPTS.md` and
 `MODEL_CONFIG.md`; executable project code is generated from those files or
 from generated-code templates with traceable provenance.
 
-## One-command generation
+## Recommended Run Path: Docker
+
+Use Docker Compose for demos and grading. The default `vg-agent` service runs
+with `network_mode: none`, so deterministic runs do not need an API key and
+cannot make network calls.
+
+### 1. Build And Seed
+
+```powershell
+Copy-Item .env.example .env
+New-Item -ItemType Directory -Force workspace,traces
+docker compose build
+docker compose run --rm vg-agent --seed-fixture
+```
+
+### 2. Deterministic Demo, No API Key
+
+```powershell
+docker compose run --rm vg-agent `
+  --task "read data/sample.log, then summarise auth/ and utils.py in parallel" `
+  --trace --show-context 8
+```
+
+This is the primary evidence path. It proves tracing, replayability,
+compaction, sub-agent isolation, budget guards, and safety behavior without
+using a live model.
+
+### 3. Optional Live OpenRouter Demo
+
+Edit `.env` and set:
+
+```ini
+OPENROUTER_API_KEY=your-key
+```
+
+Then run the live service:
+
+```powershell
+docker compose run --rm vg-agent-live `
+  --task "inspect app.py and suggest one small improvement" `
+  --live-model --trace --show-context 3
+```
+
+`vg-agent-live` is the only Compose service intended for live model calls. The
+client still pins egress to `openrouter.ai` before calling LiteLLM.
+
+### 4. Replay A Trace
+
+After any traced run, replay it without network:
+
+```powershell
+docker compose run --rm vg-agent --replay traces/<run_id>.jsonl --trace --show-context 3
+```
+
+## Developer Commands
+
+Local `uv` commands are for development and test iteration. Prefer Docker for
+demo runs.
+
+### Regenerate Generated Code
 
 ```powershell
 python scripts/generate_project.py --clean
@@ -21,22 +80,6 @@ prompt/config files. Provenance verification regenerates generated artifacts
 into a temporary directory and compares them byte-for-byte with the checked-in
 tree.
 
-## Docker demo commands
-
-Canonical grading path:
-
-```powershell
-Copy-Item .env.example .env
-New-Item -ItemType Directory -Force workspace,traces
-docker compose build
-docker compose run --rm vg-agent --seed-fixture
-docker compose run --rm vg-agent --task "read data/sample.log, then summarise auth/ and utils.py in parallel" --trace --show-context 8
-```
-
-`vg-agent` has `network_mode: none` and is the primary deterministic
-evidence path. `vg-agent-live --live-model` is optional polish after the
-deterministic scene passes.
-
 Presentation script for local development:
 
 ```powershell
@@ -44,43 +87,16 @@ Presentation script for local development:
 .\scripts\run_demo.ps1 -SkipTests
 ```
 
-Local developer verification:
+Test locally:
 
 ```powershell
 python scripts/generate_project.py --clean
 uv run pytest
 ```
 
-Sanity edit (local developer path):
-
-```powershell
-cd fixtures/demo_repo
-uv run --project ../.. python -m vg_agent --task "rename foo to bar in app.py" --trace
-```
-
-VG slide:
-
-```powershell
-cd fixtures/demo_repo
-uv run --project ../.. python -m vg_agent --task "find all auth handling and summarise" --trace --show-context 3
-```
-
 Cost-cap demo: use the deterministic Docker scene in
 `specs/70_demo_runbook.md` so the hard cap proof does not depend on live
 model behavior.
-
-Replay:
-
-```powershell
-uv run python -m vg_agent --replay fixtures/demo_repo/traces/<run_id>.jsonl --trace --show-context 3
-```
-
-Optional live OpenRouter-backed extension run:
-
-```powershell
-$env:OPENROUTER_API_KEY="..."
-uv run python -m vg_agent --task "add input validation to app.py" --live-model --parent-model openrouter/anthropic/claude-haiku-4.5 --trace --show-context 3
-```
 
 Without `--live-model`, commands use deterministic demo routes and do not call
 external APIs.

@@ -1,12 +1,13 @@
 """Generated runtime constants from MODEL_CONFIG.md."""
 
-SPEC_DIGEST = "22fb5187a6358ff2dc348d884fc8978829924711cb44fb9b731701a745437dd0"
+SPEC_DIGEST = "c848b3c281b81e4a5f0593ff0d432184c96eef8835cb87466c72c1e9dbdbb900"
 
-PARENT_MODEL_ID = "openrouter/anthropic/claude-haiku-4.5"
-EXPLORER_MODEL_ID = "openrouter/anthropic/claude-haiku-4.5"
-COMPACTOR_MODEL_ID = "openrouter/anthropic/claude-haiku-4.5"
+PARENT_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
+EXPLORER_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
+COMPACTOR_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
 
 PRICING_USD_PER_MTOK = {
+    "openrouter/google/gemini-2.0-flash-001": {"input": 0.10, "output": 0.40},
     "openrouter/anthropic/claude-haiku-4.5": {"input": 1.00, "output": 5.00},
     "openrouter/anthropic/claude-sonnet-4.6": {"input": 3.00, "output": 15.00},
 }

@@ -7,23 +7,23 @@ Sources:
 - https://docs.litellm.ai/docs/providers/openrouter
 - https://openrouter.ai/docs
 
-## Default Profile - Haiku-Class OpenRouter
+## Default Profile - Gemini 2.0 Flash OpenRouter
 
 The default profile uses LiteLLM executable OpenRouter model IDs for the
 parent and every sub-agent. This keeps demo cost low and is the configuration
 tested by the spec assertions in `specs/40_demo_and_eval.md`.
 
 ```yaml
-PARENT_MODEL_ID: openrouter/anthropic/claude-haiku-4.5
-GRILLING_MODEL_ID: openrouter/anthropic/claude-haiku-4.5
-EXPLORER_MODEL_ID: openrouter/anthropic/claude-haiku-4.5
-CODER_MODEL_ID: openrouter/anthropic/claude-haiku-4.5
-REVIEWER_MODEL_ID: openrouter/anthropic/claude-haiku-4.5
-COMPACTOR_MODEL_ID: openrouter/anthropic/claude-haiku-4.5
+PARENT_MODEL_ID: openrouter/google/gemini-2.0-flash-001
+GRILLING_MODEL_ID: openrouter/google/gemini-2.0-flash-001
+EXPLORER_MODEL_ID: openrouter/google/gemini-2.0-flash-001
+CODER_MODEL_ID: openrouter/google/gemini-2.0-flash-001
+REVIEWER_MODEL_ID: openrouter/google/gemini-2.0-flash-001
+COMPACTOR_MODEL_ID: openrouter/google/gemini-2.0-flash-001
 ```
 
 Optional examples for manual demos include
-`openrouter/openai/gpt-5.2`, `openrouter/google/gemini-3.1-pro-preview`,
+`openrouter/anthropic/claude-haiku-4.5`, `openrouter/openai/gpt-5.2`,
 and `openrouter/deepseek/deepseek-r1`. They are not test requirements.
 
 ## Egress Pin
@@ -43,6 +43,8 @@ explicit response cost; otherwise live mode fails closed before the next step.
 Preflight budget checks use a conservative estimate for unknown models.
 
 ```yaml
+GEMINI_2_0_FLASH_INPUT_PER_MTOK: 0.10
+GEMINI_2_0_FLASH_OUTPUT_PER_MTOK: 0.40
 CLAUDE_SONNET_4_6_INPUT_PER_MTOK: 3.00
 CLAUDE_SONNET_4_6_OUTPUT_PER_MTOK: 15.00
 CLAUDE_HAIKU_4_5_INPUT_PER_MTOK: 1.00

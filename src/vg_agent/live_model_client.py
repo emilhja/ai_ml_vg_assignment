@@ -2,13 +2,45 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import logging
 import os
+import sys
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
 from . import config
+
+
+class _LiteLLMNoiseFilter(io.TextIOBase):
+    """Drops LiteLLM's raw ``print()`` calls (e.g. the red ``Provider List`` banner)
+    while letting through anything else written to the wrapped stream."""
+
+    _DROP_MARKERS = ("Provider List:", "GetLLMProvider")
+
+    def __init__(self, wrapped: Any) -> None:
+        self._wrapped = wrapped
+        self._buffer = ""
+
+    def write(self, text: str) -> int:
+        self._buffer += text
+        if "\n" in self._buffer:
+            lines = self._buffer.split("\n")
+            self._buffer = lines.pop()
+            for line in lines:
+                if not any(marker in line for marker in self._DROP_MARKERS):
+                    self._wrapped.write(line + "\n")
+        return len(text)
+
+    def flush(self) -> None:
+        if self._buffer:
+            if not any(marker in self._buffer for marker in self._DROP_MARKERS):
+                self._wrapped.write(self._buffer)
+            self._buffer = ""
+        self._wrapped.flush()
 
 
 class MissingOpenRouterKey(RuntimeError):
@@ -82,20 +114,32 @@ class LiveModelClient:
         if not model.startswith("openrouter/"):
             raise RuntimeError(f"live model id must use LiteLLM OpenRouter form 'openrouter/...': {model!r}")
 
+        logging.getLogger("LiteLLM").setLevel(logging.ERROR)
+        logging.getLogger("litellm").setLevel(logging.ERROR)
+        os.environ.setdefault("LITELLM_LOG", "ERROR")
         try:
             import litellm
         except ImportError as exc:
             raise RuntimeError("LiteLLM is required for --live-model runs; install the project dependencies") from exc
+        litellm.suppress_debug_info = True
+        litellm.set_verbose = False
 
-        response = litellm.completion(
-            model=model,
-            messages=_to_litellm_messages(system_prompt, messages),
-            tools=_to_litellm_tools(tools) if tools else None,
-            max_tokens=max_tokens,
-            api_key=self.api_key,
-            api_base=self.endpoint,
-            extra_headers=_openrouter_headers(),
-        )
+        stdout_filter = _LiteLLMNoiseFilter(sys.stdout)
+        stderr_filter = _LiteLLMNoiseFilter(sys.stderr)
+        with contextlib.redirect_stdout(stdout_filter), contextlib.redirect_stderr(stderr_filter):
+            try:
+                response = litellm.completion(
+                    model=model,
+                    messages=_to_litellm_messages(system_prompt, messages),
+                    tools=_to_litellm_tools(tools) if tools else None,
+                    max_tokens=max_tokens,
+                    api_key=self.api_key,
+                    api_base=self.endpoint,
+                    extra_headers=_openrouter_headers(),
+                )
+            finally:
+                stdout_filter.flush()
+                stderr_filter.flush()
         return _normalise_response(response, model)
 
 

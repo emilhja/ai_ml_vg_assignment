@@ -66,12 +66,12 @@ packaged configuration surface is the TOML schema below:
 
 ```toml
 [models]
-parent = "openrouter/anthropic/claude-haiku-4.5"
-grilling = "openrouter/anthropic/claude-haiku-4.5"
-explorer = "openrouter/anthropic/claude-haiku-4.5"
-coder = "openrouter/anthropic/claude-haiku-4.5"
-reviewer = "openrouter/anthropic/claude-haiku-4.5"
-compactor = "openrouter/anthropic/claude-haiku-4.5"
+parent = "openrouter/google/gemini-2.0-flash-001"
+grilling = "openrouter/google/gemini-2.0-flash-001"
+explorer = "openrouter/google/gemini-2.0-flash-001"
+coder = "openrouter/google/gemini-2.0-flash-001"
+reviewer = "openrouter/google/gemini-2.0-flash-001"
+compactor = "openrouter/google/gemini-2.0-flash-001"
 
 [budget]
 max_usd_per_run = 0.50
@@ -103,12 +103,12 @@ OPENROUTER_SITE_URL=
 OPENROUTER_APP_NAME=
 
 # Optional overrides (see config.toml for the same keys).
-VG_PARENT_MODEL=openrouter/anthropic/claude-haiku-4.5
-VG_GRILLING_MODEL=openrouter/anthropic/claude-haiku-4.5
-VG_EXPLORER_MODEL=openrouter/anthropic/claude-haiku-4.5
-VG_CODER_MODEL=openrouter/anthropic/claude-haiku-4.5
-VG_REVIEWER_MODEL=openrouter/anthropic/claude-haiku-4.5
-VG_COMPACTOR_MODEL=openrouter/anthropic/claude-haiku-4.5
+VG_PARENT_MODEL=openrouter/google/gemini-2.0-flash-001
+VG_GRILLING_MODEL=openrouter/google/gemini-2.0-flash-001
+VG_EXPLORER_MODEL=openrouter/google/gemini-2.0-flash-001
+VG_CODER_MODEL=openrouter/google/gemini-2.0-flash-001
+VG_REVIEWER_MODEL=openrouter/google/gemini-2.0-flash-001
+VG_COMPACTOR_MODEL=openrouter/google/gemini-2.0-flash-001
 VG_MAX_USD_PER_RUN=0.50
 VG_MAX_USD_PER_DAY=5.00
 VG_MAX_TOKENS_PER_RUN=80000
