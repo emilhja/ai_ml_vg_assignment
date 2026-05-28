@@ -6,8 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The source of truth for runtime behavior is **markdown**, not Python:
 
-- `specs/00_overview.md`–`specs/40_demo_and_eval.md` — architecture, contracts, demo assertions
-- `PROMPTS.md` — parent / Explorer / compaction system prompts
+- `specs/*.md` — architecture, source-of-truth rules, CLI contract,
+  packaging, observability, and demo assertions
+- `PROMPTS.md` — parent, sub-agent, and compaction system prompts
 - `MODEL_CONFIG.md` — Anthropic model IDs and pricing constants
 
 `src/vg_agent/`, `fixtures/demo_repo/`, and the demo scripts are **generated
@@ -41,11 +42,12 @@ uv run pytest tests/test_vg_agent.py::test_sanity_run_edits_app
 .\scripts\run_demo.ps1
 .\scripts\run_demo.ps1 -SkipTests   # skip pytest
 
-# Deterministic demos (no API key needed)
-cd fixtures/demo_repo
-uv run --project ../.. python -m vg_agent --task "rename foo to bar in app.py" --trace
-uv run --project ../.. python -m vg_agent --task "find all auth handling and summarise" --trace --show-context 3
-uv run --project ../.. python -m vg_agent --task "search this repo for the string __VG_SENTINEL_NEVER_PRESENT__ and don't stop until you find it" --trace
+# Canonical deterministic Docker demo (no API key needed)
+Copy-Item .env.example .env
+New-Item -ItemType Directory -Force workspace,traces
+docker compose build
+docker compose run --rm vg-agent --seed-fixture
+docker compose run --rm vg-agent --task "read data/sample.log, then summarise auth/ and utils.py in parallel" --trace --show-context 8
 
 # Replay a previous run from its JSONL trace
 uv run python -m vg_agent --replay fixtures/demo_repo/traces/<run_id>.jsonl --trace --show-context 3
@@ -57,9 +59,10 @@ uv run python -m vg_agent --task "add input validation to app.py" --live-model -
 
 ## Architecture
 
-One parent agent + one read-only `Explorer` sub-agent type. The agent shell
-(not model quality) is the VG claim: tool execution, context engineering,
-sub-agent boundaries, tracing, replay, safety, cost control.
+One parent agent + typed sub-agents (`Grilling`, `Explorer`, `Coder`,
+`Reviewer`). The agent shell (not model quality) is the VG claim: tool
+execution, context engineering, sub-agent boundaries, tracing, replay,
+safety, cost control.
 
 **Runtime modules (`src/vg_agent/`, all generated):**
 
@@ -68,10 +71,11 @@ sub-agent boundaries, tracing, replay, safety, cost control.
   compaction, Explorer spawning, trace writing.
 - `tools.py` — `read_file`, `read_file_range`, `write_file`, `edit_file`,
   `run_bash`. `run_bash` is **deny-by-default**: an allowlist of read-only
-  commands (`grep`, `rg`, `find`, `ls`, `pwd`, `cat`, `sed`, `head`, `tail`,
-  `wc`), rejection of shell control / redirection / substitution, and an
-  explicit destructive-token blocklist. All file tools resolve paths under
-  the workspace root and refuse absolute paths or `..` traversal.
+  commands (`grep`, `rg`, `find`, `ls`, `pwd`, `cat`, `head`, `tail`,
+  `wc`; `sed` is excluded), rejection of shell control / redirection /
+  substitution, and an explicit destructive-token blocklist. All file tools
+  resolve paths under the workspace root and refuse absolute paths or `..`
+  traversal.
 - `budget.py` — `BudgetGuard` enforces step/token/USD/daily caps plus a
   3-strike repetition guard. Emits `budget_event` with a `budget_reason`
   enum (`step_cap`, `token_cap`, `usd_cap`, `daily_cap`,
@@ -96,7 +100,8 @@ sub-agent boundaries, tracing, replay, safety, cost control.
    `original_event_idx` and `original_sha256` of the full payload. The next
    parent model turn sees only the compacted marker; the full payload stays
    in the JSONL trace and is retrievable via `read_file_range` or replay.
-2. **Explorer offloading** — `spawn_subagent` invokes Explorer with
+2. **Explorer offloading** — `spawn_subagent` invokes one Explorer and
+   `spawn_subagents` invokes parallel Explorers with
    read-only tools (`MAX_SUBAGENT_DEPTH = 1`, no nested spawns). Parent
    context receives **only** the Explorer return summary (≤2 KB), never
    Explorer's intermediate `tool_call` / `tool_result` events.

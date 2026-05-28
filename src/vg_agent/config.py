@@ -1,8 +1,8 @@
 """Generated runtime constants from MODEL_CONFIG.md."""
 
-SPEC_DIGEST = "e11b8b45463640bba71afae31922c43eb9d1ace2cebdb510351c537b27437202"
+SPEC_DIGEST = "947801432e78a60ed82996611a127f832955c6f28572d2e627cb827d9116aeef"
 
-PARENT_MODEL_ID = "claude-sonnet-4-6"
+PARENT_MODEL_ID = "claude-haiku-4-5-20251001"
 EXPLORER_MODEL_ID = "claude-haiku-4-5-20251001"
 COMPACTOR_MODEL_ID = "claude-haiku-4-5-20251001"
 

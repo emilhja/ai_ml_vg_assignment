@@ -5,9 +5,13 @@ Constants:
 - `MAX_PARENT_STEPS = 15`
 - `MAX_SUBAGENT_STEPS = 8`
 - `MAX_SUBAGENT_DEPTH = 1`
+- `MAX_PARALLEL_SUBAGENTS = 4`
 - `MAX_TOKENS_PER_RUN = 80000`
 - `MAX_USD_PER_RUN = 0.50`
 - `MAX_USD_PER_DAY = 5.00`
+- `WARN_USD_FRACTION = 0.8`
+- `WARN_TOKEN_FRACTION = 0.8`
+- `WARN_STEP_FRACTION = 0.8`
 - `WALL_CLOCK_TIMEOUT = 120`
 - `TOOL_TIMEOUT = 30`
 - `K_COMPACT = 4000`
@@ -21,14 +25,33 @@ Model and pricing constants are imported from `MODEL_CONFIG.md`.
 Event kinds:
 
 - Top-level `kind` is always the event discriminator. Defined kinds:
-  `user_prompt`, `assistant_step`, `tool_result`, `compaction`,
+  `user_prompt`, `assistant_step`, `tool_call`, `tool_result`, `compaction`,
   `subagent_spawn`, `subagent_return`, `budget_event`, `approval`,
-  `egress_blocked`, `redaction`, `session_reset`, `run_end`.
+  `egress_blocked`, `redaction`, `session_reset`, `statusline`, `run_end`.
+
+Per-event attribution (see `specs/60_observability.md`):
+
+- Every event carries `agent_id`, `agent_type`
+  (`parent` | `grilling` | `explorer` | `coder` | `reviewer`), and
+  `event_idx`.
+- Sub-agent events also carry `parent_step_idx`.
+- `assistant_step` events carry `model_id`, `tokens_in`, `tokens_out`,
+  `usd`.
+- `tool_call` and `tool_result` carry `tool_call_index` (monotonic per
+  `agent_id`).
+- `subagent_spawn`, `subagent_return`, and `tool_call` carry `started_at`
+  / `ended_at` (ISO-8601 UTC). Parallel overlap is computed from these.
 
 Budget events:
 
-- Budget abort causes use `budget_reason`, one of `step_cap`, `token_cap`,
-  `usd_cap`, `daily_cap`, `repetition_abort`, `timeout`, or `user_abort`.
+- `budget_reason` enum: `step_cap`, `token_cap`, `usd_cap`, `daily_cap`,
+  `repetition_abort`, `timeout`, `user_abort`, `parallel_aborted`,
+  `warn_usd`, `warn_tokens`, `warn_steps`.
+- `warn_*` reasons are emitted **once** when their respective fraction is
+  first crossed; they do not abort the run.
+- `parallel_aborted` is emitted when any per-slice budget is exceeded inside
+  a parallel `spawn_subagents` call; remaining in-flight sub-agents are
+  cancelled.
 - Live model calls must check budget before each Anthropic request using a
   conservative token estimate and record actual returned usage afterward.
 
@@ -87,21 +110,30 @@ Approval cache persistence (opt-in):
 
 Execution safety:
 
-- Tool-level safety is mandatory but not sufficient. `run_bash` must deny
-  destructive commands before execution, and demos should run in an outer
-  sandbox when possible.
-- Recommended Docker runtime flags for live demos:
-  `--network none --cap-drop ALL --security-opt no-new-privileges --pids-limit 128`.
-  `--network none` is incompatible with `--live-model`; bridge with an
-  HTTPS proxy if both are required (not built; documented in
-  `dev_docs/dangerous_cli.md`).
-- Prefer writing traces and temporary fixture edits inside the container
-  rather than bind-mounting the host workspace writable.
-- If a host bind mount is needed for inspection, mount it read-only and
-  provide a separate writable temp volume for traces.
-- The agent must never rely on Docker for correctness: every in-process
-  safety property must hold without it; unit tests run without Docker.
+- Docker is the **primary execution boundary** for demos
+  (`specs/50_packaging.md`). `docker-compose.yml` defines two services:
+  `vg-agent` with `network_mode: none` (replay and non-live runs) and
+  `vg-agent-live` with bridged network for the Anthropic API (the default
+  presentation path).
+- Mandatory container flags applied by `docker-compose.yml`:
+  `cap_drop: [ALL]`, `security_opt: [no-new-privileges]`, `pids_limit: 128`,
+  non-root user `vg`.
+- Tool-level safety is mandatory and independent of Docker. `run_bash` must
+  deny destructive commands before execution; the sensitive-path denylist
+  must hold for every file tool. Unit tests run without Docker and assert
+  every in-process safety property.
+- `--network none` is incompatible with `--live-model`; the
+  `vg-agent-live` service therefore allows bridged egress while the egress
+  pin (`ANTHROPIC_ENDPOINT_HOST`) refuses any non-Anthropic host. An HTTPS
+  proxy bridge that would allow `--network none` + `--live-model`
+  simultaneously is documented as future work in `dev_docs/dangerous_cli.md`.
+- The `./workspace` bind mount is read-write so the agent can edit fixture
+  files; the host repo itself is never mounted into the container.
 - Live tests must use fake clients; unit tests must not call external APIs.
+- Deterministic replay/fake-client evidence is the primary grading proof for
+  hard caps, safety, and parallel trace shape. Live Anthropic runs are useful
+  presentation evidence but must not be the only proof of a critical rubric
+  item.
 
 Prompt injection:
 

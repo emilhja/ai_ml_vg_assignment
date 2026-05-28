@@ -1,0 +1,16 @@
+[models]
+parent = "claude-haiku-4-5-20251001"
+grilling = "claude-haiku-4-5-20251001"
+explorer = "claude-haiku-4-5-20251001"
+coder = "claude-haiku-4-5-20251001"
+reviewer = "claude-haiku-4-5-20251001"
+compactor = "claude-haiku-4-5-20251001"
+
+[budget]
+max_usd_per_run = 0.50
+max_usd_per_day = 5.00
+max_tokens_per_run = 80000
+
+[approval]
+mode = "writes"
+

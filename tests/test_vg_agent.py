@@ -15,6 +15,7 @@ from vg_agent.agent import (
     ApprovalOutcome,
     ApprovalPolicy,
     ApprovalRequest,
+    PARENT_TOOL_SCHEMAS,
     run_live_task,
     run_task,
 )
@@ -282,6 +283,43 @@ def test_live_explorer_context_excludes_child_intermediate_results(tmp_path: Pat
     assert "Explorer summary: the requested file was inspected." in context_text
     assert "CHILD_PRIVATE_TOKEN" not in context_text
     assert "child-read" not in context_text
+
+
+def test_parent_exposes_parallel_spawn_tool_and_consumes_returns(tmp_path: Path) -> None:
+    names = {schema["name"] for schema in PARENT_TOOL_SCHEMAS}
+    assert {"spawn_subagent", "spawn_subagents"} <= names
+
+    client = FakeClient([
+        ModelTurn(
+            "Delegating two bounded inspections.",
+            [
+                ToolCall(
+                    "spawn-many",
+                    "spawn_subagents",
+                    {
+                        "requests": [
+                            {"question": "inspect app.py"},
+                            {"question": "inspect utils.py"},
+                        ]
+                    },
+                )
+            ],
+            stop_reason="tool_use",
+            input_tokens=100,
+            output_tokens=40,
+        ),
+        ModelTurn("Explorer summary: app.py inspected.", input_tokens=60, output_tokens=20),
+        ModelTurn("Explorer summary: utils.py inspected.", input_tokens=60, output_tokens=20),
+        ModelTurn("Parent final using both Explorer summaries.", input_tokens=100, output_tokens=20),
+    ])
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "inspect app.py and utils.py", recorder, client=client)
+    results = [e for e in read_events(recorder.path) if e["kind"] == "tool_result"]
+    parallel_result = next(e for e in results if e["tool"] == "spawn_subagents")
+    payload = json.loads(str(parallel_result["result_full"]))
+    assert [item["status"] for item in payload] == ["ok", "ok"]
+    assert "app.py inspected" in payload[0]["payload"]
+    assert "utils.py inspected" in payload[1]["payload"]
 
 
 def test_live_parent_large_tool_result_compacted_before_next_turn(tmp_path: Path) -> None:

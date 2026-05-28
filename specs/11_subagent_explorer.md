@@ -1,22 +1,25 @@
 # 11 Explorer Sub-Agent
 
-Explorer is read-only, depth-limited, and cheaper than the parent.
+Explorer is one of four typed sub-agents. Orchestration (sequential and
+parallel), failure modes, and the full type table live in
+`specs/12_subagent_pipeline.md`. This file specifies only the Explorer type.
 
 Contract:
 
-- `MAX_SUBAGENT_DEPTH = 1`.
-- Explorer cannot call `spawn_subagent`.
-- Explorer returns one string of at most 2 KB.
-- Parent context receives only the Explorer return summary, never Explorer
-  intermediate `assistant_step`, `tool_call`, or `tool_result` events.
-- In live mode the parent may invoke Explorer through `spawn_subagent` with a
-  bounded question. Explorer receives read-only tools only and uses
-  `EXPLORER_MODEL_ID`.
-- Explorer never receives parent-private write tools and cannot invoke
-  `spawn_subagent`.
+- Read-only. Tools: `read_file`, `read_file_range`, `run_bash` (the
+  read-only allowlist from `specs/20_tools.md`).
+- `MAX_SUBAGENT_DEPTH = 1`. Explorer cannot call `spawn_subagent` or
+  `spawn_subagents`.
+- Returns one string of at most 2 KB as `subagent_return.payload`.
+- Uses `EXPLORER_MODEL_ID` (`MODEL_CONFIG.md`).
+- Parent context receives only the return summary. Intermediate
+  `assistant_step`, `tool_call`, and `tool_result` events stay in the JSONL
+  trace under Explorer's `agent_id` and are filtered out of `show_context`.
 
-Auth demo behavior:
+Auth demo behavior (Scene 2, `specs/70_demo_runbook.md`):
 
-- Inspect `auth/session.py` and `auth/middleware.py`.
-- Summarise token issuing, token validation, session loading, and route guard
-  behavior.
+- One Explorer inspects `auth/session.py` and `auth/middleware.py` and
+  summarises token issuing, token validation, session loading, and route
+  guard behavior.
+- A second Explorer, spawned in parallel, summarises `utils.py`.
+- The parent's next `assistant_step` integrates both summaries.

@@ -14,6 +14,26 @@ Common result fields:
 - `latency_ms`
 - `status`
 
+Tool semantics:
+
+- `read_file(path)` — returns the entire UTF-8 content of `path` under the
+  workspace root.
+- `read_file_range(path, start_line, end_line)` — returns lines
+  `start_line..end_line` (1-indexed, inclusive) of `path`. Used for
+  targeted follow-up after compaction.
+- `write_file(path, content)` — **whole-file overwrite or create**. Creates
+  parent directories as needed. Used only when no prior content exists
+  worth preserving.
+- `edit_file(path, old_string, new_string)` — **partial / find-and-replace
+  edit** (the `str_replace` equivalent). `old_string` must appear in the
+  file **exactly once**; the runtime returns `tool_result.status="error"`
+  with reason `"not_found"` if it is absent and `"ambiguous"` if it
+  matches more than once. Indentation, newlines, and trailing whitespace
+  must match byte-for-byte. The file's other content is untouched. This
+  is the canonical partial-edit operation for VG.6 and the operation
+  Coder is instructed to prefer (`PROMPTS.md`).
+- `run_bash(command)` — see Windows/Git Bash rules below.
+
 Windows/Git Bash rules:
 
 - `run_bash` invokes `bash -c`.
@@ -77,7 +97,8 @@ Approval policy (see `specs/10_main_agent.md` and `specs/30_runtime_governance.m
 - Tools are grouped into approval categories: `reads` (`read_file`,
   `read_file_range`, `run_bash`) and `writes` (`write_file`, `edit_file`,
   `run_bash` when it would mutate — not currently reachable, but
-  `spawn_subagent` is also gated because it consumes budget).
+  `spawn_subagent` and `spawn_subagents` are also gated because they consume
+  budget).
 - The runtime exposes `--require-approval [off|writes|all]` and `--yes`.
   Default is `off` so the deterministic demo and tests stay reproducible;
   `writes` is the recommended live setting.

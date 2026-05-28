@@ -865,7 +865,7 @@ PARENT_SYSTEM_PROMPT = __PARENT_SYSTEM_PROMPT_LITERAL__
 
 EXPLORER_SYSTEM_PROMPT = __EXPLORER_SYSTEM_PROMPT_LITERAL__
 
-GATED_WRITES = {"write_file", "edit_file", "run_bash", "spawn_subagent"}
+GATED_WRITES = {"write_file", "edit_file", "run_bash", "spawn_subagent", "spawn_subagents"}
 GATED_ALL = {"read_file", "read_file_range"} | GATED_WRITES
 
 
@@ -909,7 +909,7 @@ def _scope_candidates(request: ApprovalRequest) -> list[str]:
         command = str(request.args.get("command") or "")
         head = command.strip().split()[0] if command.strip() else ""
         return [f"cmd:{head}", "*"] if head else ["*"]
-    if request.tool == "spawn_subagent":
+    if request.tool in {"spawn_subagent", "spawn_subagents"}:
         return ["*"]
     if request.path is None:
         return ["*"]
@@ -983,6 +983,11 @@ def _args_summary(tool: str, args: dict[str, Any]) -> str:
         return str(args.get("command") or "")
     if tool == "spawn_subagent":
         return str(args.get("question") or "")[:120]
+    if tool == "spawn_subagents":
+        requests = args.get("requests") or []
+        if isinstance(requests, list):
+            return f"{len(requests)} sub-agent requests"
+        return "parallel sub-agent requests"
     return json.dumps(args, sort_keys=True, ensure_ascii=False)[:160]
 
 
@@ -1045,6 +1050,26 @@ PARENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "spawn_subagent",
         "description": "Ask Explorer a bounded read-only repository-inspection question.",
         "input_schema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]},
+    },
+    {
+        "name": "spawn_subagents",
+        "description": "Ask two or more Explorer sub-agents independent bounded read-only questions in parallel.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "requests": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "properties": {"question": {"type": "string"}},
+                        "required": ["question"],
+                    },
+                }
+            },
+            "required": ["requests"],
+        },
     },
 ]
 
@@ -1185,6 +1210,29 @@ def _execute_live_tool(
         recorder.emit("subagent_spawn", child_agent_id=child_id, question=question, model=config.EXPLORER_MODEL_ID)
         summary = _run_live_explorer(root, question, recorder, client, guard, child_id, started, policy)
         return _result(call.tool_use_id, "spawn_subagent", summary, "ok", tool_started)
+    if tool_name == "spawn_subagents":
+        if not allow_spawn:
+            return _result(call.tool_use_id, tool_name, "Explorer cannot spawn sub-agents", "error", tool_started)
+        raw_requests = args.get("requests") or []
+        if not isinstance(raw_requests, list) or len(raw_requests) < 2:
+            return _result(call.tool_use_id, tool_name, "spawn_subagents requires at least two requests", "error", tool_started)
+        summaries: list[dict[str, str]] = []
+        accepted: list[tuple[str, str]] = []
+        overflow = raw_requests[4:]
+        for raw in raw_requests[:4]:
+            if not isinstance(raw, dict):
+                continue
+            question = str(raw.get("question") or "")
+            child_id = f"explorer-{sum(1 for event in recorder.events if event.get('kind') == 'subagent_spawn') + 1}"
+            recorder.emit("subagent_spawn", child_agent_id=child_id, question=question, model=config.EXPLORER_MODEL_ID)
+            accepted.append((child_id, question))
+        for child_id, question in accepted:
+            summary = _run_live_explorer(root, question, recorder, client, guard, child_id, started, policy)
+            summaries.append({"agent_id": child_id, "status": "ok", "payload": summary})
+        for raw in overflow:
+            child_id = f"explorer-overflow-{sum(1 for event in recorder.events if event.get('kind') == 'subagent_spawn') + 1}"
+            summaries.append({"agent_id": child_id, "status": "tool_error", "payload": "parallel cap exceeded"})
+        return _result(call.tool_use_id, "spawn_subagents", json.dumps(summaries, ensure_ascii=False), "ok", tool_started)
     return _result(call.tool_use_id, tool_name, f"unknown tool {tool_name!r}", "error", tool_started)
 
 
@@ -1600,7 +1648,7 @@ def _stdin_prompt(stream: object | None = None) -> "callable":
                 command = str(request.args.get("command") or "")
                 head = command.strip().split()[0] if command.strip() else ""
                 scope = f"cmd:{head}" if head else "*"
-            elif request.tool == "spawn_subagent":
+            elif request.tool in {"spawn_subagent", "spawn_subagents"}:
                 scope = "*"
             else:
                 scope = parent

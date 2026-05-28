@@ -36,7 +36,7 @@ def _stdin_prompt(stream: object | None = None) -> "callable":
                 command = str(request.args.get("command") or "")
                 head = command.strip().split()[0] if command.strip() else ""
                 scope = f"cmd:{head}" if head else "*"
-            elif request.tool == "spawn_subagent":
+            elif request.tool in {"spawn_subagent", "spawn_subagents"}:
                 scope = "*"
             else:
                 scope = parent

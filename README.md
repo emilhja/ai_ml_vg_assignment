@@ -21,23 +21,37 @@ prompt/config files. Provenance verification regenerates generated artifacts
 into a temporary directory and compares them byte-for-byte with the checked-in
 tree.
 
-## Demo commands
+## Docker demo commands
 
-Presentation script:
+Canonical grading path:
+
+```powershell
+Copy-Item .env.example .env
+New-Item -ItemType Directory -Force workspace,traces
+docker compose build
+docker compose run --rm vg-agent --seed-fixture
+docker compose run --rm vg-agent --task "read data/sample.log, then summarise auth/ and utils.py in parallel" --trace --show-context 8
+```
+
+`vg-agent` has `network_mode: none` and is the primary deterministic
+evidence path. `vg-agent-live --live-model` is optional polish after the
+deterministic scene passes.
+
+Presentation script for local development:
 
 ```powershell
 .\scripts\run_demo.ps1
+.\scripts\run_demo.ps1 -SkipTests
 ```
 
-Use `.\scripts\run_demo.ps1 -SkipTests` when you already ran the test suite
-and only want the live demo flow.
+Local developer verification:
 
 ```powershell
 python scripts/generate_project.py --clean
 uv run pytest
 ```
 
-Sanity edit:
+Sanity edit (local developer path):
 
 ```powershell
 cd fixtures/demo_repo
@@ -51,12 +65,9 @@ cd fixtures/demo_repo
 uv run --project ../.. python -m vg_agent --task "find all auth handling and summarise" --trace --show-context 3
 ```
 
-Cost-cap demo:
-
-```powershell
-cd fixtures/demo_repo
-uv run --project ../.. python -m vg_agent --task "search this repo for the string __VG_SENTINEL_NEVER_PRESENT__ and don't stop until you find it" --trace
-```
+Cost-cap demo: use the deterministic Docker scene in
+`specs/70_demo_runbook.md` so the hard cap proof does not depend on live
+model behavior.
 
 Replay:
 
@@ -104,8 +115,8 @@ readable so the agent can learn the schema.
 
 Approval gate:
 
-- `--require-approval off|writes|all` controls whether mutating tools (and
-  `spawn_subagent`) prompt before execution. Default is `off` so the
+- `--require-approval off|writes|all` controls whether mutating tools and
+  sub-agent spawns prompt before execution. Default is `off` so the
   deterministic demo and tests remain reproducible.
 - `--yes` auto-approves and still records an `approval` event with
   `decision="auto"` so the audit trail is preserved.
@@ -132,20 +143,9 @@ Trace redaction:
 See [`dev_docs/dangerous_cli.md`](dev_docs/dangerous_cli.md) for the *why*
 behind every command, argument token, and path on the deny-list.
 
-For a safer live demo, run inside Docker and let the container absorb any file
-changes:
-
-```powershell
-docker build -t vg-agent-demo .
-docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 vg-agent-demo
-```
-
-Interactive VG-slide demo in the container:
-
-```powershell
-docker run --rm -it --network none --cap-drop ALL --security-opt no-new-privileges --pids-limit 128 vg-agent-demo `
-  python -m vg_agent --task "find all auth handling and summarise" --trace --show-context 3
-```
+Docker Compose is the canonical demo wrapper. The `vg-agent` service runs
+without networking; `vg-agent-live` is the only service intended for live
+Anthropic calls.
 
 Docker is an outer safety layer, not the only safety layer. The Python
 `run_bash` gate still rejects dangerous commands before shell execution.
