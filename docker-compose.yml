@@ -17,6 +17,8 @@ services:
 
   vg-agent-live:
     build: .
+    # Bridged network is for OpenRouter only; the in-process egress pin
+    # refuses any non-openrouter.ai endpoint.
     working_dir: /workspace
     volumes:
       - ./workspace:/workspace

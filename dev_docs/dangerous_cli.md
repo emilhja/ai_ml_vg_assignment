@@ -69,14 +69,14 @@ VG Agent has exactly two egress channels:
 
 1. **`run_bash`** — covered by the command deny-list above. Any tool that
    could open a socket is rejected.
-2. **Anthropic Messages client** — `anthropic_client.py` parses
-   `self.endpoint` with `urllib.parse.urlparse` and refuses to open if
-   `host != ANTHROPIC_ENDPOINT_HOST`. Raises `EndpointPinViolation` *before*
+2. **LiteLLM OpenRouter client** — `live_model_client.py` parses
+   `self.endpoint` with `urllib.parse.urlparse` and refuses to call LiteLLM if
+   `host != OPENROUTER_ENDPOINT_HOST`. Raises `EndpointPinViolation` *before*
    the socket opens.
 
 `--network none` in Docker is incompatible with `--live-model` for obvious
 reasons. The documented bridge is an HTTPS proxy whitelisted to
-`api.anthropic.com`. Not built.
+`openrouter.ai`. Not built.
 
 ## 4. Sensitive-path denylist
 
@@ -165,6 +165,6 @@ the customer hasn't built the image. The in-process gates are the contract.
 | `find -delete` | `python -m vg_agent --task "run find . -delete"` | "forbidden argument token '-delete' is not allowed" |
 | Approval prompt | `--require-approval writes` on a rename task | five-choice menu before the edit |
 | Endpoint pin | unit test asserts `EndpointPinViolation` for `evil.example` | exception before socket open |
-| Redaction | tool output containing `sk-ant-…` | `***REDACTED***` in JSONL + `redaction` event |
+| Redaction | tool output containing `sk-or-v1-...` | `***REDACTED***` in JSONL + `redaction` event |
 
 Each of these has a corresponding test in `tests/test_vg_agent.py`.

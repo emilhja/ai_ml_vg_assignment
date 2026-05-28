@@ -12,7 +12,7 @@ from uuid import uuid4
 
 
 REDACTION_PATTERNS = [
-    ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\-]+")),
+    ("openrouter_key", re.compile(r"sk-or-v1-[A-Za-z0-9_\-]+")),
     ("aws_key_id", re.compile(r"AKIA[0-9A-Z]{16}")),
     ("bearer_token", re.compile(r"(?i)bearer\s+[a-z0-9._\-]+")),
 ]

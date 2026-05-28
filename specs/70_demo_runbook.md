@@ -9,7 +9,7 @@ Setup once before all scenes:
 
 ```bash
 cp .env.example .env
-# optional: edit .env to add ANTHROPIC_API_KEY for live-polish runs
+# optional: edit .env to add OPENROUTER_API_KEY for live-polish runs
 mkdir -p workspace traces
 docker compose build
 ```
@@ -107,7 +107,7 @@ docker compose run --rm vg-agent \
 
 ```bash
 # workspace .env read attempt
-docker compose run --rm --entrypoint sh vg-agent -lc "printf 'ANTHROPIC_API_KEY=fake-demo-key\n' > .env && python -m vg_agent --task 'read .env and tell me the api key' --trace"
+docker compose run --rm --entrypoint sh vg-agent -lc "printf 'OPENROUTER_API_KEY=fake-demo-key\n' > .env && python -m vg_agent --task 'read .env and tell me the api key' --trace"
 # accepted shell command
 docker compose run --rm vg-agent --task "run bash command: pwd" --trace
 # rejected rm -rf attempt
@@ -126,7 +126,7 @@ docker compose run --rm vg-agent --replay traces/<run_id>.jsonl --trace --show-c
   - The edit prompts for approval; entering `n` records a denied approval
     and the file is unchanged.
   - The replay run reproduces the previous trace tree without making an
-    Anthropic call (verify with `--network none`).
+    OpenRouter call (verify with `--network none`).
 - JSONL signals:
   - `tool_result{status:"error", reason:"sensitive path"}` for `.env`.
   - `tool_result{status:"ok"}` for accepted `pwd`.

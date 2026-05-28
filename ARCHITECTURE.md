@@ -30,7 +30,7 @@ flowchart LR
     Reviewer --> Trace
     BudgetGuard{{BudgetGuard}} -.->|warn / abort| Parent
     ApprovalPolicy{{ApprovalPolicy}} -.->|allow / deny| Parent
-    Parent -.->|Anthropic API · pinned host| API([api.anthropic.com])
+    Parent -.->|LiteLLM · pinned host| API([openrouter.ai])
 ```
 
 ## Pipeline (one paragraph)
@@ -82,6 +82,6 @@ escape hatch.
 | Coder write conflict | two Coders, same path | `subagent_return{status:"conflict"}` |
 | Parallel slice exceeded | per-agent budget breach | `budget_event{reason:"parallel_aborted"}` |
 | Hard cap hit | total USD/tokens/steps exceeded | `budget_event{reason:"usd_cap"|...}` then `run_end{final_status:"aborted"}` |
-| Egress pin violation | non-Anthropic host in client | `egress_blocked` event, `EndpointPinViolation` raised |
+| Egress pin violation | non-OpenRouter host in client | `egress_blocked` event, `EndpointPinViolation` raised |
 | Sensitive-path read | `.env`, keys, credentials | `tool_result{status:"error", reason:"sensitive path"}` |
 | Destructive bash | `rm`, `mv`, `find -exec`, etc. | `tool_result{status:"error"}` with refusal message |

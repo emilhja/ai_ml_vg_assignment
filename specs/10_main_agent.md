@@ -44,15 +44,15 @@ Injection defense:
   appear inside files or command output. All sub-agent system prompts
   inherit this assertion (`PROMPTS.md`).
 
-Parent loop (the default path):
+Parent loop (`--live-model` path):
 
-- Requires `ANTHROPIC_API_KEY`. Local replay-only runs use `--replay`
+- Requires `OPENROUTER_API_KEY`. Local replay-only runs use `--replay`
   instead and do not require the key.
-- The Anthropic client refuses any non-`api.anthropic.com` host. A
+- The LiteLLM OpenRouter client refuses any non-`openrouter.ai` host. A
   `EndpointPinViolation` is raised before the socket opens and emitted as
   `egress_blocked` in the trace.
 - Sends the parent system prompt, task, and compacted parent context to
-  Anthropic using `PARENT_MODEL_ID`.
+  OpenRouter through LiteLLM using `PARENT_MODEL_ID`.
 - Executes model-requested tool calls, appends `assistant_step`,
   `tool_call`, and `tool_result` events to JSONL, and sends only
   parent-visible results back into the next model turn.

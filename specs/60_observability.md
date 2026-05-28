@@ -54,9 +54,9 @@ Every event the trace recorder writes must carry these fields (or
 | `agent_id` | all | UUID of the agent that produced the event (parent or sub-agent) |
 | `agent_type` | all | `parent` \| `grilling` \| `explorer` \| `coder` \| `reviewer` |
 | `parent_step_idx` | sub-agent events | parent step that spawned this sub-agent |
-| `model_id` | `assistant_step` and any event tied to an Anthropic request | exact model ID used |
-| `tokens_in` / `tokens_out` | `assistant_step` | usage from the Messages API response |
-| `usd` | `assistant_step` | computed from `MODEL_CONFIG.md` pricing |
+| `model_id` | `assistant_step` and any event tied to an OpenRouter request | exact model ID used |
+| `tokens_in` / `tokens_out` | `assistant_step` | usage from the LiteLLM/OpenRouter response |
+| `usd` | `assistant_step` | provider-returned cost or computed from `MODEL_CONFIG.md` pricing |
 | `tool_call_index` | `tool_call`, `tool_result` | monotonically increasing per `agent_id` |
 | `started_at` / `ended_at` | `subagent_spawn`, `subagent_return`, `tool_call` | ISO-8601 UTC; parallel overlap is computed from these |
 

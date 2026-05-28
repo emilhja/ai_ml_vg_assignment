@@ -30,7 +30,9 @@ def read_config() -> dict[str, str]:
         "CLAUDE_SONNET_4_6_OUTPUT_PER_MTOK",
         "CLAUDE_HAIKU_4_5_INPUT_PER_MTOK",
         "CLAUDE_HAIKU_4_5_OUTPUT_PER_MTOK",
-        "ANTHROPIC_ENDPOINT_HOST",
+        "UNKNOWN_MODEL_INPUT_ESTIMATE_PER_MTOK",
+        "UNKNOWN_MODEL_OUTPUT_ESTIMATE_PER_MTOK",
+        "OPENROUTER_ENDPOINT_HOST",
     ]
     values: dict[str, str] = {}
     for key in keys:
@@ -98,10 +100,10 @@ EXPLORER_MODEL_ID = "__EXPLORER_MODEL_ID__"
 COMPACTOR_MODEL_ID = "__COMPACTOR_MODEL_ID__"
 
 PRICING_USD_PER_MTOK = {
-    PARENT_MODEL_ID: {"input": __CLAUDE_SONNET_4_6_INPUT_PER_MTOK__, "output": __CLAUDE_SONNET_4_6_OUTPUT_PER_MTOK__},
-    EXPLORER_MODEL_ID: {"input": __CLAUDE_HAIKU_4_5_INPUT_PER_MTOK__, "output": __CLAUDE_HAIKU_4_5_OUTPUT_PER_MTOK__},
-    COMPACTOR_MODEL_ID: {"input": __CLAUDE_HAIKU_4_5_INPUT_PER_MTOK__, "output": __CLAUDE_HAIKU_4_5_OUTPUT_PER_MTOK__},
+    "openrouter/anthropic/claude-haiku-4.5": {"input": __CLAUDE_HAIKU_4_5_INPUT_PER_MTOK__, "output": __CLAUDE_HAIKU_4_5_OUTPUT_PER_MTOK__},
+    "openrouter/anthropic/claude-sonnet-4.6": {"input": __CLAUDE_SONNET_4_6_INPUT_PER_MTOK__, "output": __CLAUDE_SONNET_4_6_OUTPUT_PER_MTOK__},
 }
+UNKNOWN_MODEL_ESTIMATE_USD_PER_MTOK = {"input": __UNKNOWN_MODEL_INPUT_ESTIMATE_PER_MTOK__, "output": __UNKNOWN_MODEL_OUTPUT_ESTIMATE_PER_MTOK__}
 
 MAX_PARENT_STEPS = 15
 MAX_SUBAGENT_STEPS = 8
@@ -114,7 +116,7 @@ WALL_CLOCK_TIMEOUT = 120
 TOOL_TIMEOUT = 30
 K_COMPACT = 4000
 
-ANTHROPIC_ENDPOINT_HOST = "__ANTHROPIC_ENDPOINT_HOST__"
+OPENROUTER_ENDPOINT_HOST = "__OPENROUTER_ENDPOINT_HOST__"
 MAX_TOOL_RESULT_BYTES = 1_048_576
 DAILY_SPEND_FILE = ".vg_daily_spend.json"
 APPROVALS_FILE = ".vg_approvals.json"
@@ -130,6 +132,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
+
+
+class PricingUnavailable(RuntimeError):
+    pass
 
 
 @dataclass
@@ -209,7 +215,7 @@ class BudgetGuard:
         return cls(**kwargs)  # type: ignore[arg-type]
 
     def estimate_cost(self, model: str, input_tokens: int, output_tokens: int) -> float:
-        price = config.PRICING_USD_PER_MTOK[model]
+        price = config.PRICING_USD_PER_MTOK.get(model, config.UNKNOWN_MODEL_ESTIMATE_USD_PER_MTOK)
         return (input_tokens / 1_000_000) * price["input"] + (output_tokens / 1_000_000) * price["output"]
 
     def before_model_call(self, model: str, worst_input_tokens: int, worst_output_tokens: int) -> BudgetDecision:
@@ -224,10 +230,17 @@ class BudgetGuard:
             return BudgetDecision(False, "daily_cap", {"running_usd": self.running_usd, "daily_remaining_usd": self.daily_remaining_usd})
         return BudgetDecision(True)
 
-    def record_model_call(self, model: str, input_tokens: int, output_tokens: int) -> float:
+    def record_model_call(self, model: str, input_tokens: int, output_tokens: int, cost_usd: float | None = None) -> float:
         self.step_count += 1
         self.running_tokens += input_tokens + output_tokens
-        cost = self.estimate_cost(model, input_tokens, output_tokens)
+        if cost_usd is not None:
+            cost = float(cost_usd)
+        elif model in config.PRICING_USD_PER_MTOK:
+            cost = self.estimate_cost(model, input_tokens, output_tokens)
+        else:
+            raise PricingUnavailable(
+                f"no local pricing for live model {model!r}; OpenRouter/LiteLLM must return explicit response cost"
+            )
         self.running_usd += cost
         if self.ledger is not None:
             self.ledger.add(cost)
@@ -244,22 +257,20 @@ class BudgetGuard:
             return BudgetDecision(False, "repetition_abort", {"tool": tool, "args_key": args_key, "repeat_count": self.repeat_count})
         return BudgetDecision(True)
 ''',
-    "anthropic_client.py": '''"""Generated Anthropic Messages API client."""
+    "live_model_client.py": '''"""Generated LiteLLM OpenRouter live-model client."""
 
 from __future__ import annotations
 
 import json
 import os
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
 from . import config
 
 
-class MissingAnthropicKey(RuntimeError):
+class MissingOpenRouterKey(RuntimeError):
     pass
 
 
@@ -282,22 +293,40 @@ class ModelTurn:
     input_tokens: int = 0
     output_tokens: int = 0
     raw_content: list[dict[str, Any]] = field(default_factory=list)
+    model_id: str = ""
+    cost_usd: float | None = None
 
 
-class AnthropicClient:
-    endpoint = "https://api.anthropic.com/v1/messages"
+class LiveModelClient:
+    endpoint = "https://openrouter.ai/api/v1"
 
-    def __init__(self, api_key: str, endpoint: str | None = None) -> None:
+    def __init__(self, api_key: str, endpoint: str | None = None, recorder: Any | None = None) -> None:
         self.api_key = api_key
+        self.recorder = recorder
         if endpoint is not None:
             self.endpoint = endpoint
 
     @classmethod
-    def from_env(cls) -> "AnthropicClient":
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+    def from_env(cls, recorder: Any | None = None) -> "LiveModelClient":
+        api_key = os.environ.get("OPENROUTER_API_KEY")
         if not api_key:
-            raise MissingAnthropicKey("ANTHROPIC_API_KEY is required when --live-model is used")
-        return cls(api_key)
+            raise MissingOpenRouterKey("OPENROUTER_API_KEY is required when --live-model is used")
+        return cls(api_key, recorder=recorder)
+
+    def _assert_endpoint_pinned(self) -> None:
+        parsed_url = urllib.parse.urlparse(self.endpoint)
+        if parsed_url.hostname != config.OPENROUTER_ENDPOINT_HOST:
+            if self.recorder is not None:
+                self.recorder.emit(
+                    "egress_blocked",
+                    host=parsed_url.hostname,
+                    expected_host=config.OPENROUTER_ENDPOINT_HOST,
+                    endpoint=self.endpoint,
+                )
+            raise EndpointPinViolation(
+                f"refusing to call non-pinned host {parsed_url.hostname!r}; "
+                f"endpoint must use {config.OPENROUTER_ENDPOINT_HOST!r}"
+            )
 
     def complete(
         self,
@@ -308,66 +337,153 @@ class AnthropicClient:
         tools: list[dict[str, Any]],
         max_tokens: int = 4096,
     ) -> ModelTurn:
-        parsed_url = urllib.parse.urlparse(self.endpoint)
-        if parsed_url.hostname != config.ANTHROPIC_ENDPOINT_HOST:
-            raise EndpointPinViolation(
-                f"refusing to call non-pinned host {parsed_url.hostname!r}; "
-                f"endpoint must use {config.ANTHROPIC_ENDPOINT_HOST!r}"
-            )
-        payload = {
-            "model": model,
-            "system": system_prompt,
-            "messages": messages,
-            "tools": tools,
-            "max_tokens": max_tokens,
-        }
-        data = json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(
-            self.endpoint,
-            data=data,
-            headers={
-                "content-type": "application/json",
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                parsed = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Anthropic API error {exc.code}: {body}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Anthropic API request failed: {exc.reason}") from exc
+        self._assert_endpoint_pinned()
+        if not model.startswith("openrouter/"):
+            raise RuntimeError(f"live model id must use LiteLLM OpenRouter form 'openrouter/...': {model!r}")
 
-        content = parsed.get("content", [])
-        text_parts: list[str] = []
-        tool_calls: list[ToolCall] = []
-        raw_content: list[dict[str, Any]] = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            raw_content.append(block)
-            if block.get("type") == "text":
-                text_parts.append(str(block.get("text", "")))
-            elif block.get("type") == "tool_use":
-                tool_calls.append(
-                    ToolCall(
-                        tool_use_id=str(block.get("id", "")),
-                        name=str(block.get("name", "")),
-                        args=dict(block.get("input") or {}),
-                    )
-                )
-        usage = parsed.get("usage") or {}
-        return ModelTurn(
-            assistant_text="\\n".join(part for part in text_parts if part),
-            tool_calls=tool_calls,
-            stop_reason=str(parsed.get("stop_reason") or ("tool_use" if tool_calls else "end_turn")),
-            input_tokens=int(usage.get("input_tokens") or 0),
-            output_tokens=int(usage.get("output_tokens") or 0),
-            raw_content=raw_content,
+        try:
+            import litellm
+        except ImportError as exc:
+            raise RuntimeError("LiteLLM is required for --live-model runs; install the project dependencies") from exc
+
+        response = litellm.completion(
+            model=model,
+            messages=_to_litellm_messages(system_prompt, messages),
+            tools=_to_litellm_tools(tools) if tools else None,
+            max_tokens=max_tokens,
+            api_key=self.api_key,
+            api_base=self.endpoint,
+            extra_headers=_openrouter_headers(),
         )
+        return _normalise_response(response, model)
+
+
+LiteLLMOpenRouterClient = LiveModelClient
+
+
+def _openrouter_headers() -> dict[str, str] | None:
+    headers: dict[str, str] = {}
+    site_url = os.environ.get("OPENROUTER_SITE_URL")
+    app_name = os.environ.get("OPENROUTER_APP_NAME")
+    if site_url:
+        headers["HTTP-Referer"] = site_url
+    if app_name:
+        headers["X-Title"] = app_name
+    return headers or None
+
+
+def _to_litellm_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        converted.append({
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
+            },
+        })
+    return converted
+
+
+def _to_litellm_messages(system_prompt: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    for message in messages:
+        role = str(message.get("role") or "user")
+        content = message.get("content", "")
+        if role == "assistant" and isinstance(content, list):
+            text_parts: list[str] = []
+            tool_calls: list[dict[str, Any]] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text":
+                    text_parts.append(str(block.get("text", "")))
+                elif block.get("type") == "tool_use":
+                    tool_calls.append({
+                        "id": str(block.get("id", "")),
+                        "type": "function",
+                        "function": {
+                            "name": str(block.get("name", "")),
+                            "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                        },
+                    })
+            converted_message: dict[str, Any] = {"role": "assistant", "content": "\\n".join(text_parts) or None}
+            if tool_calls:
+                converted_message["tool_calls"] = tool_calls
+            converted.append(converted_message)
+        elif role == "user" and isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    converted.append({
+                        "role": "tool",
+                        "tool_call_id": str(block.get("tool_use_id", "")),
+                        "content": str(block.get("content", "")),
+                    })
+                else:
+                    converted.append({"role": "user", "content": str(block)})
+        else:
+            converted.append({"role": role, "content": content})
+    return converted
+
+
+def _value(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _normalise_response(response: Any, requested_model: str) -> ModelTurn:
+    choices = _value(response, "choices", []) or []
+    choice = choices[0] if choices else {}
+    message = _value(choice, "message", {}) or {}
+    content = _value(message, "content", "") or ""
+    stop_reason = str(_value(choice, "finish_reason", None) or "end_turn")
+    tool_calls: list[ToolCall] = []
+    raw_content: list[dict[str, Any]] = []
+    if content:
+        raw_content.append({"type": "text", "text": str(content)})
+    for call in _value(message, "tool_calls", []) or []:
+        function = _value(call, "function", {}) or {}
+        args_raw = _value(function, "arguments", "{}") or "{}"
+        try:
+            args = json.loads(args_raw) if isinstance(args_raw, str) else dict(args_raw)
+        except (TypeError, ValueError):
+            args = {"_raw_arguments": str(args_raw)}
+        tool_call = ToolCall(
+            tool_use_id=str(_value(call, "id", "")),
+            name=str(_value(function, "name", "")),
+            args=args,
+        )
+        tool_calls.append(tool_call)
+        raw_content.append({
+            "type": "tool_use",
+            "id": tool_call.tool_use_id,
+            "name": tool_call.name,
+            "input": tool_call.args,
+        })
+    usage = _value(response, "usage", {}) or {}
+    cost = _extract_cost_usd(response)
+    return ModelTurn(
+        assistant_text=str(content),
+        tool_calls=tool_calls,
+        stop_reason=stop_reason,
+        input_tokens=int(_value(usage, "prompt_tokens", _value(usage, "input_tokens", 0)) or 0),
+        output_tokens=int(_value(usage, "completion_tokens", _value(usage, "output_tokens", 0)) or 0),
+        raw_content=raw_content,
+        model_id=requested_model,
+        cost_usd=cost,
+    )
+
+
+def _extract_cost_usd(response: Any) -> float | None:
+    for key in ("response_cost", "cost", "cost_usd"):
+        value = _value(response, key, None)
+        if value is not None:
+            return float(value)
+    hidden = _value(response, "_hidden_params", {}) or {}
+    value = _value(hidden, "response_cost", None)
+    return float(value) if value is not None else None
 ''',
     "tools.py": '''"""Generated local tools."""
 
@@ -579,7 +695,7 @@ from uuid import uuid4
 
 
 REDACTION_PATTERNS = [
-    ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\\-]+")),
+    ("openrouter_key", re.compile(r"sk-or-v1-[A-Za-z0-9_\\-]+")),
     ("aws_key_id", re.compile(r"AKIA[0-9A-Z]{16}")),
     ("bearer_token", re.compile(r"(?i)bearer\\s+[a-z0-9._\\-]+")),
 ]
@@ -856,7 +972,7 @@ from typing import Any, Callable
 from pathlib import Path
 
 from . import config, tools
-from .anthropic_client import AnthropicClient, ModelTurn, ToolCall
+from .live_model_client import LiveModelClient, ModelTurn, ToolCall
 from .budget import BudgetGuard
 from .trace import TraceRecorder, compacted_marker
 
@@ -1270,14 +1386,16 @@ def _run_live_explorer(
         if not isinstance(turn, ModelTurn):
             turn = ModelTurn(**turn)
         turn.tool_calls = [_normalise_tool_call(call) for call in turn.tool_calls]
+        model_id = turn.model_id or config.EXPLORER_MODEL_ID
         input_tokens = turn.input_tokens or expected_in
         output_tokens = turn.output_tokens or tools.estimate_tokens(turn.assistant_text + json.dumps([asdict(c) for c in turn.tool_calls], sort_keys=True))
-        cost = guard.record_model_call(config.EXPLORER_MODEL_ID, input_tokens, output_tokens)
+        cost = guard.record_model_call(model_id, input_tokens, output_tokens, cost_usd=turn.cost_usd)
         recorder.emit(
             "assistant_step",
             agent_id=child_id,
             parent_id="parent",
-            model=config.EXPLORER_MODEL_ID,
+            model=model_id,
+            model_id=model_id,
             step_idx=local_step,
             tokens_in=input_tokens,
             tokens_out=output_tokens,
@@ -1333,7 +1451,9 @@ def run_live_task(
     policy: ApprovalPolicy | None = None,
 ) -> TraceRecorder:
     recorder = recorder or TraceRecorder(root)
-    client = client or AnthropicClient.from_env()
+    client = client or LiveModelClient.from_env(recorder=recorder)
+    if isinstance(client, LiveModelClient) and client.recorder is None:
+        client.recorder = recorder
     guard = guard or BudgetGuard.for_workspace(root)
     policy = policy or ApprovalPolicy()
     started = time.perf_counter()
@@ -1360,13 +1480,15 @@ def run_live_task(
         if not isinstance(turn, ModelTurn):
             turn = ModelTurn(**turn)
         turn.tool_calls = [_normalise_tool_call(call) for call in turn.tool_calls]
+        model_id = turn.model_id or config.PARENT_MODEL_ID
         input_tokens = turn.input_tokens or expected_in
         output_tokens = turn.output_tokens or tools.estimate_tokens(turn.assistant_text + json.dumps([asdict(c) for c in turn.tool_calls], sort_keys=True))
-        cost = guard.record_model_call(config.PARENT_MODEL_ID, input_tokens, output_tokens)
+        cost = guard.record_model_call(model_id, input_tokens, output_tokens, cost_usd=turn.cost_usd)
         step_idx = guard.step_count
         recorder.emit(
             "assistant_step",
-            model=config.PARENT_MODEL_ID,
+            model=model_id,
+            model_id=model_id,
             step_idx=step_idx,
             tokens_in=input_tokens,
             tokens_out=output_tokens,
@@ -1437,6 +1559,7 @@ def _explore_auth(root: Path, recorder: TraceRecorder, policy: ApprovalPolicy | 
         agent_id=child_id,
         parent_id="parent",
         model=config.EXPLORER_MODEL_ID,
+        model_id=config.EXPLORER_MODEL_ID,
         step_idx=1,
         tokens_in=600,
         tokens_out=80,
@@ -1485,6 +1608,7 @@ def run_task(
         recorder.emit(
             "assistant_step",
             model=config.PARENT_MODEL_ID,
+            model_id=config.PARENT_MODEL_ID,
             step_idx=1,
             tokens_in=500,
             tokens_out=80,
@@ -1514,6 +1638,7 @@ def run_task(
         recorder.emit(
             "assistant_step",
             model=config.PARENT_MODEL_ID,
+            model_id=config.PARENT_MODEL_ID,
             step_idx=2,
             tokens_in=350,
             tokens_out=60,
@@ -1531,6 +1656,7 @@ def run_task(
             recorder.emit(
                 "assistant_step",
                 model=config.PARENT_MODEL_ID,
+                model_id=config.PARENT_MODEL_ID,
                 step_idx=step,
                 tokens_in=700,
                 tokens_out=80,
@@ -1559,6 +1685,7 @@ def run_task(
     recorder.emit(
         "assistant_step",
         model=config.PARENT_MODEL_ID,
+        model_id=config.PARENT_MODEL_ID,
         step_idx=1,
         tokens_in=900,
         tokens_out=90,
@@ -1575,6 +1702,7 @@ def run_task(
     recorder.emit(
         "assistant_step",
         model=config.PARENT_MODEL_ID,
+        model_id=config.PARENT_MODEL_ID,
         step_idx=2,
         tokens_in=1000,
         tokens_out=120,
@@ -1599,6 +1727,7 @@ def run_task(
     recorder.emit(
         "assistant_step",
         model=config.PARENT_MODEL_ID,
+        model_id=config.PARENT_MODEL_ID,
         step_idx=3,
         tokens_in=900,
         tokens_out=100,
@@ -1621,7 +1750,7 @@ from pathlib import Path
 
 from . import config
 from .agent import ApprovalOutcome, ApprovalPolicy, ApprovalRequest, run_live_task, run_task
-from .anthropic_client import AnthropicClient, MissingAnthropicKey
+from .live_model_client import LiveModelClient, MissingOpenRouterKey
 from .budget import BudgetGuard
 from .demo_fixture import write_fixture
 from .trace import TraceRecorder, load_trace, render_tree, show_context
@@ -1682,6 +1811,14 @@ def _print_budget(guard: BudgetGuard) -> None:
     )
 
 
+def _apply_model_overrides(args: argparse.Namespace) -> None:
+    if getattr(args, "parent_model", None):
+        config.PARENT_MODEL_ID = args.parent_model
+    if getattr(args, "subagent_model", None):
+        config.EXPLORER_MODEL_ID = args.subagent_model
+        config.COMPACTOR_MODEL_ID = args.subagent_model
+
+
 def _chat_loop(root: Path, args: argparse.Namespace) -> int:
     recorder = TraceRecorder(root, redact=not args.no_redact)
     policy = _make_policy(args)
@@ -1724,8 +1861,8 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             continue
         if args.live_model:
             try:
-                client = AnthropicClient.from_env()
-            except MissingAnthropicKey as exc:
+                client = LiveModelClient.from_env(recorder=recorder)
+            except MissingOpenRouterKey as exc:
                 sys.stderr.write(f"error: {exc}\\n")
                 return 2
             run_live_task(root, prompt, recorder, client=client, guard=guard, policy=policy)
@@ -1742,11 +1879,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--show-context", type=int)
     parser.add_argument("--seed-fixture", action="store_true")
     parser.add_argument("--live-model", action="store_true")
+    parser.add_argument("--parent-model")
+    parser.add_argument("--subagent-model")
     parser.add_argument("--chat", action="store_true")
     parser.add_argument("--require-approval", choices=["off", "writes", "all"], default=config.REQUIRE_APPROVAL_DEFAULT)
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--no-redact", action="store_true")
     args = parser.parse_args(argv)
+    _apply_model_overrides(args)
 
     if args.no_redact:
         sys.stderr.write("warning: --no-redact disables trace secret redaction.\\n")
@@ -1775,8 +1915,8 @@ def main(argv: list[str] | None = None) -> int:
     policy = _make_policy(args)
     if args.live_model:
         try:
-            client = AnthropicClient.from_env()
-        except MissingAnthropicKey as exc:
+            client = LiveModelClient.from_env(recorder=recorder)
+        except MissingOpenRouterKey as exc:
             parser.exit(2, f"error: {exc}\\n")
         run_live_task(root, args.task, recorder, client=client, policy=policy)
     else:

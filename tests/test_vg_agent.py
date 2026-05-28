@@ -19,13 +19,13 @@ from vg_agent.agent import (
     run_live_task,
     run_task,
 )
-from vg_agent.anthropic_client import (
-    AnthropicClient,
+from vg_agent.live_model_client import (
     EndpointPinViolation,
+    LiveModelClient,
     ModelTurn,
     ToolCall,
 )
-from vg_agent.budget import BudgetGuard, DailySpendLedger
+from vg_agent.budget import BudgetGuard, DailySpendLedger, PricingUnavailable
 from vg_agent.demo_fixture import write_fixture
 from vg_agent.tools import (
     edit_file,
@@ -76,6 +76,11 @@ def test_budget_guard_reasons_and_costs() -> None:
     decision = guard.record_tool_signature("run_bash", "grep missing")
     assert not decision.allowed
     assert decision.budget_reason == "repetition_abort"
+
+    guard = BudgetGuard()
+    assert guard.record_model_call("openrouter/example/unknown", 10, 10, cost_usd=0.01) == pytest.approx(0.01)
+    with pytest.raises(PricingUnavailable):
+        guard.record_model_call("openrouter/example/unknown", 10, 10)
 
 
 def test_sanity_run_edits_app(tmp_path: Path) -> None:
@@ -173,9 +178,9 @@ def test_run_bash_rejects_dangerous_commands(tmp_path: Path) -> None:
     assert victim.exists()
 
 
-def test_live_model_cli_requires_anthropic_key(tmp_path: Path) -> None:
+def test_live_model_cli_requires_openrouter_key(tmp_path: Path) -> None:
     env = os.environ.copy()
-    env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("OPENROUTER_API_KEY", None)
     env["PYTHONPATH"] = str(ROOT / "src")
     completed = subprocess.run(
         [sys.executable, "-m", "vg_agent", "--task", "inspect", "--live-model"],
@@ -185,7 +190,7 @@ def test_live_model_cli_requires_anthropic_key(tmp_path: Path) -> None:
         capture_output=True,
     )
     assert completed.returncode == 2
-    assert "ANTHROPIC_API_KEY is required" in completed.stderr
+    assert "OPENROUTER_API_KEY is required" in completed.stderr
 
 
 def test_file_tools_reject_path_traversal(tmp_path: Path) -> None:
@@ -504,23 +509,26 @@ def test_daily_spend_fail_closed_on_corrupt_ledger(tmp_path: Path) -> None:
     assert ledger.remaining_today() == 0.0
 
 
-def test_endpoint_host_pinned() -> None:
-    client = AnthropicClient(api_key="dummy", endpoint="https://evil.example/v1/messages")
+def test_endpoint_host_pinned(tmp_path: Path) -> None:
+    recorder = TraceRecorder(tmp_path)
+    client = LiveModelClient(api_key="dummy", endpoint="https://evil.example/api/v1", recorder=recorder)
     with pytest.raises(EndpointPinViolation):
         client.complete(model=config.PARENT_MODEL_ID, system_prompt="x", messages=[], tools=[])
+    assert recorder.events[-1]["kind"] == "egress_blocked"
+    assert recorder.events[-1]["host"] == "evil.example"
 
 
 def test_trace_redacts_secrets(tmp_path: Path) -> None:
-    redacted, summary = _redact("token sk-ant-AbCdEf-12 and key AKIA0123456789ABCDEF and Bearer xyz")
+    redacted, summary = _redact("token sk-or-v1-AbCdEf-12 and key AKIA0123456789ABCDEF and Bearer xyz")
     assert "***REDACTED***" in redacted
-    assert "sk-ant" not in redacted
+    assert "sk-or-v1" not in redacted
     assert "AKIA" not in redacted
-    assert any(name == "anthropic_key" for name, _ in summary)
+    assert any(name == "openrouter_key" for name, _ in summary)
 
     recorder = TraceRecorder(tmp_path)
-    recorder.emit("tool_result", tool="read_file", tool_use_id="t1", result_full="leaked sk-ant-DEADBEEF-9")
+    recorder.emit("tool_result", tool="read_file", tool_use_id="t1", result_full="leaked sk-or-v1-DEADBEEF-9")
     events = recorder.events
-    assert not any("sk-ant-DEAD" in str(e.get("result_full", "")) for e in events)
+    assert not any("sk-or-v1-DEAD" in str(e.get("result_full", "")) for e in events)
     redaction_events = [e for e in events if e["kind"] == "redaction"]
     assert redaction_events
 

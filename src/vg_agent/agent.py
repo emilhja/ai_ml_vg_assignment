@@ -10,7 +10,7 @@ from typing import Any, Callable
 from pathlib import Path
 
 from . import config, tools
-from .anthropic_client import AnthropicClient, ModelTurn, ToolCall
+from .live_model_client import LiveModelClient, ModelTurn, ToolCall
 from .budget import BudgetGuard
 from .trace import TraceRecorder, compacted_marker
 
@@ -424,14 +424,16 @@ def _run_live_explorer(
         if not isinstance(turn, ModelTurn):
             turn = ModelTurn(**turn)
         turn.tool_calls = [_normalise_tool_call(call) for call in turn.tool_calls]
+        model_id = turn.model_id or config.EXPLORER_MODEL_ID
         input_tokens = turn.input_tokens or expected_in
         output_tokens = turn.output_tokens or tools.estimate_tokens(turn.assistant_text + json.dumps([asdict(c) for c in turn.tool_calls], sort_keys=True))
-        cost = guard.record_model_call(config.EXPLORER_MODEL_ID, input_tokens, output_tokens)
+        cost = guard.record_model_call(model_id, input_tokens, output_tokens, cost_usd=turn.cost_usd)
         recorder.emit(
             "assistant_step",
             agent_id=child_id,
             parent_id="parent",
-            model=config.EXPLORER_MODEL_ID,
+            model=model_id,
+            model_id=model_id,
             step_idx=local_step,
             tokens_in=input_tokens,
             tokens_out=output_tokens,
@@ -487,7 +489,9 @@ def run_live_task(
     policy: ApprovalPolicy | None = None,
 ) -> TraceRecorder:
     recorder = recorder or TraceRecorder(root)
-    client = client or AnthropicClient.from_env()
+    client = client or LiveModelClient.from_env(recorder=recorder)
+    if isinstance(client, LiveModelClient) and client.recorder is None:
+        client.recorder = recorder
     guard = guard or BudgetGuard.for_workspace(root)
     policy = policy or ApprovalPolicy()
     started = time.perf_counter()
@@ -514,13 +518,15 @@ def run_live_task(
         if not isinstance(turn, ModelTurn):
             turn = ModelTurn(**turn)
         turn.tool_calls = [_normalise_tool_call(call) for call in turn.tool_calls]
+        model_id = turn.model_id or config.PARENT_MODEL_ID
         input_tokens = turn.input_tokens or expected_in
         output_tokens = turn.output_tokens or tools.estimate_tokens(turn.assistant_text + json.dumps([asdict(c) for c in turn.tool_calls], sort_keys=True))
-        cost = guard.record_model_call(config.PARENT_MODEL_ID, input_tokens, output_tokens)
+        cost = guard.record_model_call(model_id, input_tokens, output_tokens, cost_usd=turn.cost_usd)
         step_idx = guard.step_count
         recorder.emit(
             "assistant_step",
-            model=config.PARENT_MODEL_ID,
+            model=model_id,
+            model_id=model_id,
             step_idx=step_idx,
             tokens_in=input_tokens,
             tokens_out=output_tokens,
@@ -591,6 +597,7 @@ def _explore_auth(root: Path, recorder: TraceRecorder, policy: ApprovalPolicy | 
         agent_id=child_id,
         parent_id="parent",
         model=config.EXPLORER_MODEL_ID,
+        model_id=config.EXPLORER_MODEL_ID,
         step_idx=1,
         tokens_in=600,
         tokens_out=80,
@@ -639,6 +646,7 @@ def run_task(
         recorder.emit(
             "assistant_step",
             model=config.PARENT_MODEL_ID,
+            model_id=config.PARENT_MODEL_ID,
             step_idx=1,
             tokens_in=500,
             tokens_out=80,
@@ -668,6 +676,7 @@ def run_task(
         recorder.emit(
             "assistant_step",
             model=config.PARENT_MODEL_ID,
+            model_id=config.PARENT_MODEL_ID,
             step_idx=2,
             tokens_in=350,
             tokens_out=60,
@@ -685,6 +694,7 @@ def run_task(
             recorder.emit(
                 "assistant_step",
                 model=config.PARENT_MODEL_ID,
+                model_id=config.PARENT_MODEL_ID,
                 step_idx=step,
                 tokens_in=700,
                 tokens_out=80,
@@ -713,6 +723,7 @@ def run_task(
     recorder.emit(
         "assistant_step",
         model=config.PARENT_MODEL_ID,
+        model_id=config.PARENT_MODEL_ID,
         step_idx=1,
         tokens_in=900,
         tokens_out=90,
@@ -729,6 +740,7 @@ def run_task(
     recorder.emit(
         "assistant_step",
         model=config.PARENT_MODEL_ID,
+        model_id=config.PARENT_MODEL_ID,
         step_idx=2,
         tokens_in=1000,
         tokens_out=120,
@@ -753,6 +765,7 @@ def run_task(
     recorder.emit(
         "assistant_step",
         model=config.PARENT_MODEL_ID,
+        model_id=config.PARENT_MODEL_ID,
         step_idx=3,
         tokens_in=900,
         tokens_out=100,

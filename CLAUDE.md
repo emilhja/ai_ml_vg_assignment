@@ -9,7 +9,7 @@ The source of truth for runtime behavior is **markdown**, not Python:
 - `specs/*.md` — architecture, source-of-truth rules, CLI contract,
   packaging, observability, and demo assertions
 - `PROMPTS.md` — parent, sub-agent, and compaction system prompts
-- `MODEL_CONFIG.md` — Anthropic model IDs and pricing constants
+- `MODEL_CONFIG.md` — LiteLLM/OpenRouter model IDs and pricing constants
 
 `src/vg_agent/`, `fixtures/demo_repo/`, and the demo scripts are **generated
 artifacts**. `scripts/generate_project.py` reads the markdown above, computes a
@@ -52,8 +52,8 @@ docker compose run --rm vg-agent --task "read data/sample.log, then summarise au
 # Replay a previous run from its JSONL trace
 uv run python -m vg_agent --replay fixtures/demo_repo/traces/<run_id>.jsonl --trace --show-context 3
 
-# Optional live Anthropic-backed run (extension path)
-$env:ANTHROPIC_API_KEY="..."
+# Optional live OpenRouter-backed run (extension path)
+$env:OPENROUTER_API_KEY="..."
 uv run python -m vg_agent --task "add input validation to app.py" --live-model --trace --show-context 3
 ```
 
@@ -67,7 +67,7 @@ safety, cost control.
 **Runtime modules (`src/vg_agent/`, all generated):**
 
 - `agent.py` — `run_task` (deterministic demo routes) and `run_live_task`
-  (Anthropic-backed loop). Owns parent system prompt, tool dispatch,
+  (OpenRouter-backed loop via LiteLLM). Owns parent system prompt, tool dispatch,
   compaction, Explorer spawning, trace writing.
 - `tools.py` — `read_file`, `read_file_range`, `write_file`, `edit_file`,
   `run_bash`. `run_bash` is **deny-by-default**: an allowlist of read-only
@@ -84,9 +84,8 @@ safety, cost control.
   `traces/<run_id>.jsonl`. `show_context(events, step_idx)` reconstructs
   the parent-visible context at a given step (this is what `--show-context`
   prints and what `--replay` reads).
-- `anthropic_client.py` — minimal `urllib`-based Messages API client.
-  Used only in live mode; tests must inject a fake client and never hit
-  the network.
+- `live_model_client.py` — LiteLLM OpenRouter adapter. Used only in live
+  mode; tests must inject a fake client and never hit the network.
 - `config.py` — model IDs, pricing, and governance constants generated
   from `MODEL_CONFIG.md` + `specs/30_runtime_governance.md`.
 - `demo_fixture.py` — emits `fixtures/demo_repo/` including a
@@ -128,11 +127,10 @@ safety, cost control.
 - **No network in unit tests.** Live-mode tests use the `FakeClient`
   pattern from `tests/test_vg_agent.py` — they construct a list of
   `ModelTurn` objects and inject them.
-- **Model IDs are pinned in `MODEL_CONFIG.md`.** Marketing names like
-  "Sonnet 4.6" may appear in prose but executable selection must use the
-  exact IDs (`claude-sonnet-4-6`, `claude-haiku-4-5-20251001`). The doc
-  notes "Checked against official Anthropic documentation on 2026-05-10";
-  update that date when re-verifying.
+- **Model IDs are pinned in `MODEL_CONFIG.md`.** Marketing names may appear
+  in prose but executable selection must use LiteLLM OpenRouter IDs such as
+  `openrouter/anthropic/claude-haiku-4.5`. The doc notes the current
+  verification date; update it when re-verifying.
 - **Windows / Git Bash environment.** This repo is developed on Windows;
   demo scripts are `.ps1`. The `run_bash` tool still shells out via
   `bash -c` and normalizes paths at tool boundaries.

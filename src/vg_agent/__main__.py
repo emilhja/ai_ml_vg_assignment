@@ -9,7 +9,7 @@ from pathlib import Path
 
 from . import config
 from .agent import ApprovalOutcome, ApprovalPolicy, ApprovalRequest, run_live_task, run_task
-from .anthropic_client import AnthropicClient, MissingAnthropicKey
+from .live_model_client import LiveModelClient, MissingOpenRouterKey
 from .budget import BudgetGuard
 from .demo_fixture import write_fixture
 from .trace import TraceRecorder, load_trace, render_tree, show_context
@@ -70,6 +70,14 @@ def _print_budget(guard: BudgetGuard) -> None:
     )
 
 
+def _apply_model_overrides(args: argparse.Namespace) -> None:
+    if getattr(args, "parent_model", None):
+        config.PARENT_MODEL_ID = args.parent_model
+    if getattr(args, "subagent_model", None):
+        config.EXPLORER_MODEL_ID = args.subagent_model
+        config.COMPACTOR_MODEL_ID = args.subagent_model
+
+
 def _chat_loop(root: Path, args: argparse.Namespace) -> int:
     recorder = TraceRecorder(root, redact=not args.no_redact)
     policy = _make_policy(args)
@@ -112,8 +120,8 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             continue
         if args.live_model:
             try:
-                client = AnthropicClient.from_env()
-            except MissingAnthropicKey as exc:
+                client = LiveModelClient.from_env(recorder=recorder)
+            except MissingOpenRouterKey as exc:
                 sys.stderr.write(f"error: {exc}\n")
                 return 2
             run_live_task(root, prompt, recorder, client=client, guard=guard, policy=policy)
@@ -130,11 +138,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--show-context", type=int)
     parser.add_argument("--seed-fixture", action="store_true")
     parser.add_argument("--live-model", action="store_true")
+    parser.add_argument("--parent-model")
+    parser.add_argument("--subagent-model")
     parser.add_argument("--chat", action="store_true")
     parser.add_argument("--require-approval", choices=["off", "writes", "all"], default=config.REQUIRE_APPROVAL_DEFAULT)
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--no-redact", action="store_true")
     args = parser.parse_args(argv)
+    _apply_model_overrides(args)
 
     if args.no_redact:
         sys.stderr.write("warning: --no-redact disables trace secret redaction.\n")
@@ -163,8 +174,8 @@ def main(argv: list[str] | None = None) -> int:
     policy = _make_policy(args)
     if args.live_model:
         try:
-            client = AnthropicClient.from_env()
-        except MissingAnthropicKey as exc:
+            client = LiveModelClient.from_env(recorder=recorder)
+        except MissingOpenRouterKey as exc:
             parser.exit(2, f"error: {exc}\n")
         run_live_task(root, args.task, recorder, client=client, policy=policy)
     else:

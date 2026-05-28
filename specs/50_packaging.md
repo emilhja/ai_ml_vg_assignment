@@ -36,8 +36,8 @@ services:
 
   vg-agent-live:
     build: .
-    # bridged network for api.anthropic.com only — the agent's egress pin
-    # rejects any other host even if the network allows it.
+    # bridged network for OpenRouter only; the agent's egress pin rejects
+    # any non-openrouter.ai endpoint even if the network allows it.
     volumes:
       - ./workspace:/workspace
       - ./traces:/workspace/traces
@@ -50,7 +50,7 @@ services:
 ```
 
 - `vg-agent` is the default for replay, deterministic smoke tests, and any
-  run that does not need the Anthropic API.
+  run that does not need OpenRouter.
 - `vg-agent-live` is used for optional `--live-model` runs after the
   deterministic grading path passes.
 - Both services mount `./workspace` read-write so the agent can edit fixture
@@ -66,12 +66,12 @@ packaged configuration surface is the TOML schema below:
 
 ```toml
 [models]
-parent = "claude-haiku-4-5-20251001"
-grilling = "claude-haiku-4-5-20251001"
-explorer = "claude-haiku-4-5-20251001"
-coder = "claude-haiku-4-5-20251001"
-reviewer = "claude-haiku-4-5-20251001"
-compactor = "claude-haiku-4-5-20251001"
+parent = "openrouter/anthropic/claude-haiku-4.5"
+grilling = "openrouter/anthropic/claude-haiku-4.5"
+explorer = "openrouter/anthropic/claude-haiku-4.5"
+coder = "openrouter/anthropic/claude-haiku-4.5"
+reviewer = "openrouter/anthropic/claude-haiku-4.5"
+compactor = "openrouter/anthropic/claude-haiku-4.5"
 
 [budget]
 max_usd_per_run = 0.50
@@ -96,15 +96,19 @@ matching `*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD` with a parse error.
 
 ```ini
 # Required for --live-model runs only.
-ANTHROPIC_API_KEY=
+OPENROUTER_API_KEY=
+
+# Optional OpenRouter app attribution.
+OPENROUTER_SITE_URL=
+OPENROUTER_APP_NAME=
 
 # Optional overrides (see config.toml for the same keys).
-VG_PARENT_MODEL=claude-haiku-4-5-20251001
-VG_GRILLING_MODEL=claude-haiku-4-5-20251001
-VG_EXPLORER_MODEL=claude-haiku-4-5-20251001
-VG_CODER_MODEL=claude-haiku-4-5-20251001
-VG_REVIEWER_MODEL=claude-haiku-4-5-20251001
-VG_COMPACTOR_MODEL=claude-haiku-4-5-20251001
+VG_PARENT_MODEL=openrouter/anthropic/claude-haiku-4.5
+VG_GRILLING_MODEL=openrouter/anthropic/claude-haiku-4.5
+VG_EXPLORER_MODEL=openrouter/anthropic/claude-haiku-4.5
+VG_CODER_MODEL=openrouter/anthropic/claude-haiku-4.5
+VG_REVIEWER_MODEL=openrouter/anthropic/claude-haiku-4.5
+VG_COMPACTOR_MODEL=openrouter/anthropic/claude-haiku-4.5
 VG_MAX_USD_PER_RUN=0.50
 VG_MAX_USD_PER_DAY=5.00
 VG_MAX_TOKENS_PER_RUN=80000
@@ -113,7 +117,7 @@ VG_APPROVAL_MODE=writes
 
 - `.env` is optional at Compose-parse time so `docker compose config` works
   in a fresh checkout. Live mode still fails clearly if
-  `ANTHROPIC_API_KEY` is missing.
+  `OPENROUTER_API_KEY` is missing.
 - `.env` is gitignored. A pre-commit check fails CI if a staged file matches
   `^\.env$` or `^\.env\..+$` (the `.env.example` allowance lives in the
   sensitive-path denylist in `specs/20_tools.md`).
@@ -130,13 +134,13 @@ docker compose build
 # Default demo (network: none, replay or non-live runs)
 docker compose run --rm vg-agent --task "..." [--replay traces/<run_id>.jsonl]
 
-# Live demo (Anthropic API, default presentation path)
+# Live demo (OpenRouter through LiteLLM)
 docker compose run --rm vg-agent-live --task "..." --live-model --trace
 ```
 
 A grader who has Docker installed must reach a working demo with no other
 setup beyond copying `.env.example` to `.env` and (for live mode) filling in
-`ANTHROPIC_API_KEY`. This is VG.7's "idiot-proof packaging" anchor.
+`OPENROUTER_API_KEY`. This is VG.7's "idiot-proof packaging" anchor.
 
 ## Smoke test
 

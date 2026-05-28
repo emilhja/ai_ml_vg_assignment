@@ -122,13 +122,14 @@ Cost-ledger assertions (VG.3 persistence):
 
 Egress-slide assertions:
 
-- Constructing an `AnthropicClient` with
-  `endpoint="https://evil.example/v1/messages"` and calling `complete()`
-  raises `EndpointPinViolation` before any socket is opened.
+- Constructing a `LiveModelClient` with
+  `endpoint="https://evil.example/api/v1"` and calling `complete()`
+  emits `egress_blocked` and raises `EndpointPinViolation` before LiteLLM
+  can open a socket.
 
 Trace-redaction assertions:
 
-- A tool result containing `sk-ant-abc…` is redacted to `***REDACTED***` in
+- A tool result containing `sk-or-v1-abc...` is redacted to `***REDACTED***` in
   the trace and in `--show-context`.
 - A `redaction` event records the pattern and count.
 
@@ -150,7 +151,7 @@ Replay assertions (the deterministic / CI path):
 
 Live-mode test assertions (optional live path):
 
-- `--live-model` without `ANTHROPIC_API_KEY` exits non-zero with a clear
+- `--live-model` without `OPENROUTER_API_KEY` exits non-zero with a clear
   error.
 - A fake parent client can request a read and trigger a Coder spawn against
   a temp fixture.

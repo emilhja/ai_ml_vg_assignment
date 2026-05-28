@@ -25,7 +25,7 @@ Exactly one of these modes is required:
 |---|---:|---|
 | `--trace` | off | Print a human-readable trace tree and the JSONL path after the run. |
 | `--show-context N` | unset | Print parent-visible context at parent step `N`. |
-| `--live-model` | off | Use Anthropic Messages API. Requires `ANTHROPIC_API_KEY`. |
+| `--live-model` | off | Use OpenRouter through LiteLLM. Requires `OPENROUTER_API_KEY`. |
 | `--budget` | off | Print a machine-readable JSON budget summary at run end. |
 | `--require-approval off|writes|all` | config/default | Gate tools before execution. |
 | `--yes` | off | Auto-approve gated tools and record `approval{decision:"auto"}`. |

@@ -75,11 +75,11 @@ Replay:
 uv run python -m vg_agent --replay fixtures/demo_repo/traces/<run_id>.jsonl --trace --show-context 3
 ```
 
-Optional live Anthropic-backed extension run:
+Optional live OpenRouter-backed extension run:
 
 ```powershell
-$env:ANTHROPIC_API_KEY="..."
-uv run python -m vg_agent --task "add input validation to app.py" --live-model --trace --show-context 3
+$env:OPENROUTER_API_KEY="..."
+uv run python -m vg_agent --task "add input validation to app.py" --live-model --parent-model openrouter/anthropic/claude-haiku-4.5 --trace --show-context 3
 ```
 
 Without `--live-model`, commands use deterministic demo routes and do not call
@@ -87,14 +87,14 @@ external APIs.
 
 ## Model configuration
 
-The exact Anthropic API model IDs and pricing constants are declared once in
+The exact LiteLLM/OpenRouter model IDs and pricing constants are declared once in
 `MODEL_CONFIG.md`. Generated runtime code reads from generated constants, not
 from marketing names in prose.
 
-Official Anthropic docs checked on 2026-05-10:
+OpenRouter/LiteLLM docs checked on 2026-05-28:
 
-- Model IDs: https://platform.claude.com/docs/en/about-claude/models/overview
-- Pricing: https://platform.claude.com/docs/en/about-claude/pricing
+- OpenRouter provider: https://docs.litellm.ai/docs/providers/openrouter
+- OpenRouter docs: https://openrouter.ai/docs
 
 ## Command safety
 
@@ -125,7 +125,7 @@ Approval gate:
 
 Endpoint pin:
 
-- The Anthropic client refuses any non-`api.anthropic.com` host. A
+- The LiteLLM OpenRouter client refuses any non-`openrouter.ai` host. A
   `EndpointPinViolation` is raised before the socket opens.
 
 Daily spend:
@@ -136,7 +136,7 @@ Daily spend:
 
 Trace redaction:
 
-- Tool outputs are scanned for `sk-ant-*`, `AKIA*`, and `Bearer *` tokens
+- Tool outputs are scanned for `sk-or-v1-*`, `AKIA*`, and `Bearer *` tokens
   before being written to the JSONL trace. Each substitution produces a
   `redaction` event. `--no-redact` disables this for local debugging only.
 
@@ -145,7 +145,7 @@ behind every command, argument token, and path on the deny-list.
 
 Docker Compose is the canonical demo wrapper. The `vg-agent` service runs
 without networking; `vg-agent-live` is the only service intended for live
-Anthropic calls.
+OpenRouter calls.
 
 Docker is an outer safety layer, not the only safety layer. The Python
 `run_bash` gate still rejects dangerous commands before shell execution.

@@ -1,0 +1,227 @@
+"""Generated LiteLLM OpenRouter live-model client."""
+
+from __future__ import annotations
+
+import json
+import os
+import urllib.parse
+from dataclasses import dataclass, field
+from typing import Any
+
+from . import config
+
+
+class MissingOpenRouterKey(RuntimeError):
+    pass
+
+
+class EndpointPinViolation(RuntimeError):
+    pass
+
+
+@dataclass
+class ToolCall:
+    tool_use_id: str
+    name: str
+    args: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ModelTurn:
+    assistant_text: str
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    stop_reason: str = "end_turn"
+    input_tokens: int = 0
+    output_tokens: int = 0
+    raw_content: list[dict[str, Any]] = field(default_factory=list)
+    model_id: str = ""
+    cost_usd: float | None = None
+
+
+class LiveModelClient:
+    endpoint = "https://openrouter.ai/api/v1"
+
+    def __init__(self, api_key: str, endpoint: str | None = None, recorder: Any | None = None) -> None:
+        self.api_key = api_key
+        self.recorder = recorder
+        if endpoint is not None:
+            self.endpoint = endpoint
+
+    @classmethod
+    def from_env(cls, recorder: Any | None = None) -> "LiveModelClient":
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            raise MissingOpenRouterKey("OPENROUTER_API_KEY is required when --live-model is used")
+        return cls(api_key, recorder=recorder)
+
+    def _assert_endpoint_pinned(self) -> None:
+        parsed_url = urllib.parse.urlparse(self.endpoint)
+        if parsed_url.hostname != config.OPENROUTER_ENDPOINT_HOST:
+            if self.recorder is not None:
+                self.recorder.emit(
+                    "egress_blocked",
+                    host=parsed_url.hostname,
+                    expected_host=config.OPENROUTER_ENDPOINT_HOST,
+                    endpoint=self.endpoint,
+                )
+            raise EndpointPinViolation(
+                f"refusing to call non-pinned host {parsed_url.hostname!r}; "
+                f"endpoint must use {config.OPENROUTER_ENDPOINT_HOST!r}"
+            )
+
+    def complete(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        max_tokens: int = 4096,
+    ) -> ModelTurn:
+        self._assert_endpoint_pinned()
+        if not model.startswith("openrouter/"):
+            raise RuntimeError(f"live model id must use LiteLLM OpenRouter form 'openrouter/...': {model!r}")
+
+        try:
+            import litellm
+        except ImportError as exc:
+            raise RuntimeError("LiteLLM is required for --live-model runs; install the project dependencies") from exc
+
+        response = litellm.completion(
+            model=model,
+            messages=_to_litellm_messages(system_prompt, messages),
+            tools=_to_litellm_tools(tools) if tools else None,
+            max_tokens=max_tokens,
+            api_key=self.api_key,
+            api_base=self.endpoint,
+            extra_headers=_openrouter_headers(),
+        )
+        return _normalise_response(response, model)
+
+
+LiteLLMOpenRouterClient = LiveModelClient
+
+
+def _openrouter_headers() -> dict[str, str] | None:
+    headers: dict[str, str] = {}
+    site_url = os.environ.get("OPENROUTER_SITE_URL")
+    app_name = os.environ.get("OPENROUTER_APP_NAME")
+    if site_url:
+        headers["HTTP-Referer"] = site_url
+    if app_name:
+        headers["X-Title"] = app_name
+    return headers or None
+
+
+def _to_litellm_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        converted.append({
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
+            },
+        })
+    return converted
+
+
+def _to_litellm_messages(system_prompt: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    for message in messages:
+        role = str(message.get("role") or "user")
+        content = message.get("content", "")
+        if role == "assistant" and isinstance(content, list):
+            text_parts: list[str] = []
+            tool_calls: list[dict[str, Any]] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text":
+                    text_parts.append(str(block.get("text", "")))
+                elif block.get("type") == "tool_use":
+                    tool_calls.append({
+                        "id": str(block.get("id", "")),
+                        "type": "function",
+                        "function": {
+                            "name": str(block.get("name", "")),
+                            "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                        },
+                    })
+            converted_message: dict[str, Any] = {"role": "assistant", "content": "\n".join(text_parts) or None}
+            if tool_calls:
+                converted_message["tool_calls"] = tool_calls
+            converted.append(converted_message)
+        elif role == "user" and isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    converted.append({
+                        "role": "tool",
+                        "tool_call_id": str(block.get("tool_use_id", "")),
+                        "content": str(block.get("content", "")),
+                    })
+                else:
+                    converted.append({"role": "user", "content": str(block)})
+        else:
+            converted.append({"role": role, "content": content})
+    return converted
+
+
+def _value(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _normalise_response(response: Any, requested_model: str) -> ModelTurn:
+    choices = _value(response, "choices", []) or []
+    choice = choices[0] if choices else {}
+    message = _value(choice, "message", {}) or {}
+    content = _value(message, "content", "") or ""
+    stop_reason = str(_value(choice, "finish_reason", None) or "end_turn")
+    tool_calls: list[ToolCall] = []
+    raw_content: list[dict[str, Any]] = []
+    if content:
+        raw_content.append({"type": "text", "text": str(content)})
+    for call in _value(message, "tool_calls", []) or []:
+        function = _value(call, "function", {}) or {}
+        args_raw = _value(function, "arguments", "{}") or "{}"
+        try:
+            args = json.loads(args_raw) if isinstance(args_raw, str) else dict(args_raw)
+        except (TypeError, ValueError):
+            args = {"_raw_arguments": str(args_raw)}
+        tool_call = ToolCall(
+            tool_use_id=str(_value(call, "id", "")),
+            name=str(_value(function, "name", "")),
+            args=args,
+        )
+        tool_calls.append(tool_call)
+        raw_content.append({
+            "type": "tool_use",
+            "id": tool_call.tool_use_id,
+            "name": tool_call.name,
+            "input": tool_call.args,
+        })
+    usage = _value(response, "usage", {}) or {}
+    cost = _extract_cost_usd(response)
+    return ModelTurn(
+        assistant_text=str(content),
+        tool_calls=tool_calls,
+        stop_reason=stop_reason,
+        input_tokens=int(_value(usage, "prompt_tokens", _value(usage, "input_tokens", 0)) or 0),
+        output_tokens=int(_value(usage, "completion_tokens", _value(usage, "output_tokens", 0)) or 0),
+        raw_content=raw_content,
+        model_id=requested_model,
+        cost_usd=cost,
+    )
+
+
+def _extract_cost_usd(response: Any) -> float | None:
+    for key in ("response_cost", "cost", "cost_usd"):
+        value = _value(response, key, None)
+        if value is not None:
+            return float(value)
+    hidden = _value(response, "_hidden_params", {}) or {}
+    value = _value(hidden, "response_cost", None)
+    return float(value) if value is not None else None

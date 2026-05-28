@@ -13,7 +13,7 @@ Check that:
 
 - the trace includes a parent compaction event;
 - Explorer intermediate reads are absent from parent context;
-- the deterministic demo remains stable without `ANTHROPIC_API_KEY`.
+- the deterministic demo remains stable without `OPENROUTER_API_KEY`.
 
 ## 2. Optional Live API Smoke Test
 
@@ -21,7 +21,7 @@ Use this only as an extension after the deterministic VG demo passes. Use a
 disposable fixture copy or regenerated fixture before testing live edits.
 
 ```powershell
-$env:ANTHROPIC_API_KEY="..."
+$env:OPENROUTER_API_KEY="..."
 uv run python -m vg_agent --task "inspect app.py and suggest one small improvement" --live-model --require-approval writes --trace --show-context 3
 ```
 
@@ -46,7 +46,7 @@ of "yes-folder" grants across sessions (`--save-approvals`,
 
 `scripts/run_demo.ps1` now includes approval, denylist, and chat-mode
 segments alongside the deterministic VG slide. All segments run without
-`ANTHROPIC_API_KEY`.
+`OPENROUTER_API_KEY`.
 
 ## 5. Broaden Regression Coverage
 

@@ -10,6 +10,10 @@ from pathlib import Path
 from . import config
 
 
+class PricingUnavailable(RuntimeError):
+    pass
+
+
 @dataclass
 class BudgetDecision:
     allowed: bool
@@ -87,7 +91,7 @@ class BudgetGuard:
         return cls(**kwargs)  # type: ignore[arg-type]
 
     def estimate_cost(self, model: str, input_tokens: int, output_tokens: int) -> float:
-        price = config.PRICING_USD_PER_MTOK[model]
+        price = config.PRICING_USD_PER_MTOK.get(model, config.UNKNOWN_MODEL_ESTIMATE_USD_PER_MTOK)
         return (input_tokens / 1_000_000) * price["input"] + (output_tokens / 1_000_000) * price["output"]
 
     def before_model_call(self, model: str, worst_input_tokens: int, worst_output_tokens: int) -> BudgetDecision:
@@ -102,10 +106,17 @@ class BudgetGuard:
             return BudgetDecision(False, "daily_cap", {"running_usd": self.running_usd, "daily_remaining_usd": self.daily_remaining_usd})
         return BudgetDecision(True)
 
-    def record_model_call(self, model: str, input_tokens: int, output_tokens: int) -> float:
+    def record_model_call(self, model: str, input_tokens: int, output_tokens: int, cost_usd: float | None = None) -> float:
         self.step_count += 1
         self.running_tokens += input_tokens + output_tokens
-        cost = self.estimate_cost(model, input_tokens, output_tokens)
+        if cost_usd is not None:
+            cost = float(cost_usd)
+        elif model in config.PRICING_USD_PER_MTOK:
+            cost = self.estimate_cost(model, input_tokens, output_tokens)
+        else:
+            raise PricingUnavailable(
+                f"no local pricing for live model {model!r}; OpenRouter/LiteLLM must return explicit response cost"
+            )
         self.running_usd += cost
         if self.ledger is not None:
             self.ledger.add(cost)

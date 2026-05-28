@@ -18,7 +18,7 @@ Constants:
 - `MAX_TOOL_RESULT_BYTES = 1_048_576`
 - `DAILY_SPEND_FILE = ".vg_daily_spend.json"`
 - `REQUIRE_APPROVAL_DEFAULT = "off"`
-- `ANTHROPIC_ENDPOINT_HOST = "api.anthropic.com"`
+- `OPENROUTER_ENDPOINT_HOST = "openrouter.ai"`
 
 Model and pricing constants are imported from `MODEL_CONFIG.md`.
 
@@ -52,8 +52,12 @@ Budget events:
 - `parallel_aborted` is emitted when any per-slice budget is exceeded inside
   a parallel `spawn_subagents` call; remaining in-flight sub-agents are
   cancelled.
-- Live model calls must check budget before each Anthropic request using a
-  conservative token estimate and record actual returned usage afterward.
+- Live model calls must check budget before each LiteLLM/OpenRouter request
+  using a conservative token estimate and record actual returned usage
+  afterward. If OpenRouter/LiteLLM returns explicit USD cost, use it;
+  otherwise compute cost from the local pricing table for known configured
+  models. Unknown live model pricing fails closed unless explicit cost is
+  returned.
 
 Compaction events:
 
@@ -73,7 +77,7 @@ Redaction:
 
 - The trace recorder pattern-matches secret-looking substrings on every event
   write and replaces them with `***REDACTED***`. Patterns:
-  `sk-ant-[A-Za-z0-9_\-]+`, `AKIA[0-9A-Z]{16}`, `(?i)bearer\s+[a-z0-9._\-]+`,
+  `sk-or-v1-[A-Za-z0-9_\-]+`, `AKIA[0-9A-Z]{16}`, `(?i)bearer\s+[a-z0-9._\-]+`,
   and any line that contains a sensitive-path pattern from
   `specs/20_tools.md`.
 - A `redaction` event records `original_event_idx`, `pattern`, `count`. This
@@ -84,10 +88,10 @@ Redaction:
 Egress:
 
 - The agent has exactly two egress channels: `run_bash` (covered by the
-  command deny-list) and the Anthropic Messages client.
-- The Messages client parses `self.endpoint` with `urllib.parse.urlparse`
-  before every request and refuses to open the socket if
-  `host != ANTHROPIC_ENDPOINT_HOST`. The refusal raises
+  command deny-list) and the LiteLLM OpenRouter client.
+- The OpenRouter client parses `self.endpoint` with `urllib.parse.urlparse`
+  before every request and refuses to call LiteLLM if
+  `host != OPENROUTER_ENDPOINT_HOST`. The refusal raises
   `EndpointPinViolation` and emits an `egress_blocked` event when invoked
   from inside the agent loop.
 
@@ -113,8 +117,7 @@ Execution safety:
 - Docker is the **primary execution boundary** for demos
   (`specs/50_packaging.md`). `docker-compose.yml` defines two services:
   `vg-agent` with `network_mode: none` (replay and non-live runs) and
-  `vg-agent-live` with bridged network for the Anthropic API (the default
-  presentation path).
+  `vg-agent-live` with bridged network for OpenRouter live demos.
 - Mandatory container flags applied by `docker-compose.yml`:
   `cap_drop: [ALL]`, `security_opt: [no-new-privileges]`, `pids_limit: 128`,
   non-root user `vg`.
@@ -124,14 +127,14 @@ Execution safety:
   every in-process safety property.
 - `--network none` is incompatible with `--live-model`; the
   `vg-agent-live` service therefore allows bridged egress while the egress
-  pin (`ANTHROPIC_ENDPOINT_HOST`) refuses any non-Anthropic host. An HTTPS
+  pin (`OPENROUTER_ENDPOINT_HOST`) refuses any non-OpenRouter host. An HTTPS
   proxy bridge that would allow `--network none` + `--live-model`
   simultaneously is documented as future work in `dev_docs/dangerous_cli.md`.
 - The `./workspace` bind mount is read-write so the agent can edit fixture
   files; the host repo itself is never mounted into the container.
 - Live tests must use fake clients; unit tests must not call external APIs.
 - Deterministic replay/fake-client evidence is the primary grading proof for
-  hard caps, safety, and parallel trace shape. Live Anthropic runs are useful
+  hard caps, safety, and parallel trace shape. Live OpenRouter runs are useful
   presentation evidence but must not be the only proof of a critical rubric
   item.
 

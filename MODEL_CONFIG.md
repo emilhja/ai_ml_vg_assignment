@@ -1,68 +1,58 @@
 # Model Config
 
-Checked against official Anthropic documentation on 2026-05-28.
+Checked against the OpenRouter + LiteLLM live-model contract on 2026-05-28.
 
 Sources:
 
-- https://platform.claude.com/docs/en/about-claude/models/overview
-- https://platform.claude.com/docs/en/about-claude/pricing
+- https://docs.litellm.ai/docs/providers/openrouter
+- https://openrouter.ai/docs
 
-## Default profile — Haiku-only
+## Default Profile - Haiku-Class OpenRouter
 
-The default profile ships with Haiku 4.5 for parent and every sub-agent.
-This keeps demo cost low and is the configuration tested by the spec
-assertions in `specs/40_demo_and_eval.md`.
-
-```yaml
-PARENT_MODEL_ID: claude-haiku-4-5-20251001
-GRILLING_MODEL_ID: claude-haiku-4-5-20251001
-EXPLORER_MODEL_ID: claude-haiku-4-5-20251001
-CODER_MODEL_ID: claude-haiku-4-5-20251001
-REVIEWER_MODEL_ID: claude-haiku-4-5-20251001
-COMPACTOR_MODEL_ID: claude-haiku-4-5-20251001
-```
-
-## Beta profile — Sonnet parent + Haiku sub-agents
-
-Documented for future use. Flipping to this profile is a **config-only**
-change: set the override in `config.toml` or the corresponding env var, no
-code change required.
+The default profile uses LiteLLM executable OpenRouter model IDs for the
+parent and every sub-agent. This keeps demo cost low and is the configuration
+tested by the spec assertions in `specs/40_demo_and_eval.md`.
 
 ```yaml
-PARENT_MODEL_ID: claude-sonnet-4-6
-GRILLING_MODEL_ID: claude-haiku-4-5-20251001
-EXPLORER_MODEL_ID: claude-haiku-4-5-20251001
-CODER_MODEL_ID: claude-haiku-4-5-20251001
-REVIEWER_MODEL_ID: claude-haiku-4-5-20251001
-COMPACTOR_MODEL_ID: claude-haiku-4-5-20251001
+PARENT_MODEL_ID: openrouter/anthropic/claude-haiku-4.5
+GRILLING_MODEL_ID: openrouter/anthropic/claude-haiku-4.5
+EXPLORER_MODEL_ID: openrouter/anthropic/claude-haiku-4.5
+CODER_MODEL_ID: openrouter/anthropic/claude-haiku-4.5
+REVIEWER_MODEL_ID: openrouter/anthropic/claude-haiku-4.5
+COMPACTOR_MODEL_ID: openrouter/anthropic/claude-haiku-4.5
 ```
 
-Use the beta profile only after the default profile passes every assertion
-and the cost cap headroom has been measured for a representative demo run.
+Optional examples for manual demos include
+`openrouter/openai/gpt-5.2`, `openrouter/google/gemini-3.1-pro-preview`,
+and `openrouter/deepseek/deepseek-r1`. They are not test requirements.
 
-## Egress pin
+## Egress Pin
 
-The Anthropic Messages client refuses to open a socket to any other host. The
-endpoint is pinned and validated on every request.
+The LiteLLM OpenRouter client refuses to call any other host. The endpoint is
+pinned and validated before every live request.
 
 ```yaml
-ANTHROPIC_ENDPOINT_HOST: api.anthropic.com
+OPENROUTER_ENDPOINT_HOST: openrouter.ai
 ```
 
-## Pricing constants
+## Pricing Constants
 
-All values are USD per million tokens for first-party Claude API global routing.
+Local fallback pricing is available only for known configured models. If a
+manual demo uses an unknown live model, OpenRouter/LiteLLM must return an
+explicit response cost; otherwise live mode fails closed before the next step.
+Preflight budget checks use a conservative estimate for unknown models.
 
 ```yaml
 CLAUDE_SONNET_4_6_INPUT_PER_MTOK: 3.00
 CLAUDE_SONNET_4_6_OUTPUT_PER_MTOK: 15.00
 CLAUDE_HAIKU_4_5_INPUT_PER_MTOK: 1.00
 CLAUDE_HAIKU_4_5_OUTPUT_PER_MTOK: 5.00
+UNKNOWN_MODEL_INPUT_ESTIMATE_PER_MTOK: 30.00
+UNKNOWN_MODEL_OUTPUT_ESTIMATE_PER_MTOK: 120.00
 ```
 
-Marketing names may appear in prose. Executable model selection must use the
-exact IDs above.
+Executable model selection must use the exact `openrouter/...` IDs above or a
+compatible LiteLLM OpenRouter model string.
 
-Live mode uses these IDs through the Anthropic Messages API and reads
-`ANTHROPIC_API_KEY` from the environment. Tests use fake clients and must not
-make network calls.
+Live mode reads `OPENROUTER_API_KEY` from the environment. Tests use fake
+clients and must not import, initialize, or call LiteLLM.

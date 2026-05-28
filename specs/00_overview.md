@@ -38,16 +38,16 @@ Execution model:
 - The default grading demo path is deterministic replay/fake-client behavior:
   the parent loop still records model turns and tool decisions, but no
   external API is required for proof. Optional `--live-model` runs use a real
-  Anthropic-backed parent loop where the model decides each turn whether to
-  call a tool or yield (VG.9). Sub-agent dispatch is model-driven, guided by
-  the typed pipeline in `specs/12_subagent_pipeline.md`.
+  OpenRouter-backed parent loop via LiteLLM where the model decides each turn
+  whether to call a tool or yield (VG.9). Sub-agent dispatch is model-driven,
+  guided by the typed pipeline in `specs/12_subagent_pipeline.md`.
 - `--replay <trace.jsonl>` reproduces a previously recorded live run via
   `FakeClient` with no network call. This is the CI / deterministic path.
 - Docker is the primary execution boundary for demos
   (`specs/50_packaging.md`); in-process safety properties hold without it
   so unit tests run unsandboxed.
 - Primary grading evidence is deterministic first: replay/fake-client traces
-  prove caps, parallelism, safety, and context behavior. Live Anthropic runs
+  prove caps, parallelism, safety, and context behavior. Live OpenRouter runs
   are optional polish, not the only way to satisfy a rubric item.
 - Source-of-truth and CLI details live in
   `specs/05_source_of_truth_and_generation.md` and
