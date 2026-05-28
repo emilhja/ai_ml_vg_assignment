@@ -124,6 +124,7 @@ MAX_TOOL_RESULT_BYTES = 1_048_576
 DAILY_SPEND_FILE = ".vg_daily_spend.json"
 APPROVALS_FILE = ".vg_approvals.json"
 REQUIRE_APPROVAL_DEFAULT = "off"
+SQLITE_TRACE_DB = "traces/vg_agent.sqlite3"
 ''',
     "budget.py": '''"""Generated budget guard."""
 
@@ -734,11 +735,14 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
+
+from .sqlite_store import SQLiteTraceStore
 
 
 REDACTION_PATTERNS = [
@@ -784,6 +788,7 @@ class TraceRecorder:
     events: list[dict[str, object]] = field(default_factory=list)
     redact: bool = True
     event_sink: Callable[[dict[str, object]], None] | None = None
+    sqlite_enabled: bool = True
 
     def __post_init__(self) -> None:
         self.trace_dir = self.root / "traces"
@@ -791,8 +796,24 @@ class TraceRecorder:
         self.path = self.trace_dir / f"{self.run_id}.jsonl"
         if self.session_id is None:
             self.session_id = self.run_id
+        self.turn_counter = 0
+        self.current_turn_id: str | None = None
+        self.sqlite_store: SQLiteTraceStore | None = None
+        if self.sqlite_enabled:
+            try:
+                self.sqlite_store = SQLiteTraceStore(self.root, redaction_enabled=self.redact)
+            except Exception as exc:  # pragma: no cover - best-effort mirror
+                sys.stderr.write(f"warning: sqlite trace disabled: {exc}\\n")
 
     def emit(self, kind: str, agent_id: str = "parent", parent_id: str | None = None, **fields: object) -> dict[str, object]:
+        if kind == "user_prompt":
+            self.turn_counter += 1
+            self.current_turn_id = f"{self.session_id}:turn:{self.turn_counter}"
+            fields.setdefault("turn_id", self.current_turn_id)
+            fields.setdefault("turn_index", self.turn_counter)
+        elif self.current_turn_id is not None:
+            fields.setdefault("turn_id", self.current_turn_id)
+            fields.setdefault("turn_index", self.turn_counter)
         event: dict[str, object] = {
             "run_id": self.run_id,
             "session_id": self.session_id,
@@ -809,6 +830,12 @@ class TraceRecorder:
         self.events.append(event)
         with self.path.open("a", encoding="utf-8", newline="\\n") as fh:
             fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\\n")
+        if self.sqlite_store is not None:
+            try:
+                self.sqlite_store.record_event(event)
+            except Exception as exc:  # pragma: no cover - JSONL remains canonical
+                sys.stderr.write(f"warning: sqlite trace write failed: {exc}\\n")
+                self.sqlite_store = None
         if self.event_sink is not None:
             self.event_sink(event)
         if redaction_summary and kind != "redaction":
@@ -1180,6 +1207,20 @@ def _emit_approval(recorder: TraceRecorder, call: ToolCall, outcome: ApprovalOut
         reason=outcome.reason,
     )
 
+
+def _emit_tool_call(recorder: TraceRecorder, call: ToolCall, agent_id: str = "parent", parent_id: str | None = None) -> None:
+    recorder.emit(
+        "tool_call",
+        agent_id=agent_id,
+        parent_id=parent_id,
+        tool_use_id=call.tool_use_id,
+        tool=call.name,
+        args=call.args,
+        args_summary=_args_summary(call.name, call.args),
+        path=call.args.get("path") or call.args.get("rel_path"),
+        command=call.args.get("command"),
+    )
+
 PARENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "read_file",
@@ -1337,11 +1378,14 @@ def _execute_live_tool(
     allow_spawn: bool,
     started: float,
     policy: ApprovalPolicy,
+    agent_id: str = "parent",
+    parent_id: str | None = None,
 ) -> dict[str, object]:
     tool_name = call.name
     args = call.args
     tool_started = time.perf_counter()
     path = str(args.get("path") or args.get("rel_path") or "")
+    _emit_tool_call(recorder, call, agent_id=agent_id, parent_id=parent_id)
 
     if tool_name == "run_bash":
         command = str(args.get("command") or "")
@@ -1443,6 +1487,10 @@ def _run_live_explorer(
             step_idx=local_step,
             tokens_in=expected_in,
             max_tokens=2048,
+            endpoint_host=config.OPENROUTER_ENDPOINT_HOST,
+            system_prompt_sha256=hashlib.sha256(EXPLORER_SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
+            tool_schema_count=len(EXPLORER_TOOL_SCHEMAS),
+            tool_schema_names=[schema["name"] for schema in EXPLORER_TOOL_SCHEMAS],
         )
         turn = client.complete(
             model=config.EXPLORER_MODEL_ID,
@@ -1488,6 +1536,8 @@ def _run_live_explorer(
                 allow_spawn=False,
                 started=started,
                 policy=policy,
+                agent_id=child_id,
+                parent_id="parent",
             )
             recorder.emit("tool_result", agent_id=child_id, parent_id="parent", **result)
             tool_blocks.append({"type": "tool_result", "tool_use_id": call.tool_use_id, "content": str(result["result_full"]), "is_error": result["status"] != "ok"})
@@ -1545,6 +1595,10 @@ def run_live_task(
             step_idx=guard.step_count + 1,
             tokens_in=expected_in,
             max_tokens=4096,
+            endpoint_host=config.OPENROUTER_ENDPOINT_HOST,
+            system_prompt_sha256=hashlib.sha256(PARENT_SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
+            tool_schema_count=len(PARENT_TOOL_SCHEMAS),
+            tool_schema_names=[schema["name"] for schema in PARENT_TOOL_SCHEMAS],
         )
         turn = client.complete(
             model=config.PARENT_MODEL_ID,
@@ -1647,8 +1701,10 @@ def _explore_auth(root: Path, recorder: TraceRecorder, policy: ApprovalPolicy | 
         ],
         stop_reason="tool_use",
     )
+    _emit_tool_call(recorder, ToolCall("child-read-session", "read_file", {"path": "auth/session.py"}), agent_id=child_id, parent_id="parent")
     session = tools.read_file(root, "auth/session.py", "child-read-session")
     recorder.emit("tool_result", agent_id=child_id, parent_id="parent", **session)
+    _emit_tool_call(recorder, ToolCall("child-read-middleware", "read_file", {"path": "auth/middleware.py"}), agent_id=child_id, parent_id="parent")
     middleware = tools.read_file(root, "auth/middleware.py", "child-read-middleware")
     recorder.emit("tool_result", agent_id=child_id, parent_id="parent", **middleware)
     summary = (
@@ -1694,6 +1750,7 @@ def run_task(
             stop_reason="tool_use",
         )
         edit_call = ToolCall("parent-edit-app", "edit_file", {"path": "app.py", "old": "foo", "new": "bar"})
+        _emit_tool_call(recorder, edit_call)
         if edit_call.name in policy.gated_tools():
             outcome = policy.check(_request_for(edit_call))
             _emit_approval(recorder, edit_call, outcome)
@@ -1741,6 +1798,7 @@ def run_task(
                 tool_calls=[{"tool_use_id": f"search-{step}", "name": "run_bash", "args": {"command": "grep -R __VG_SENTINEL_NEVER_PRESENT__ ."}}],
                 stop_reason="tool_use",
             )
+            _emit_tool_call(recorder, ToolCall(f"search-{step}", "run_bash", {"command": "grep -R __VG_SENTINEL_NEVER_PRESENT__ ."}))
             decision = guard.record_tool_signature("run_bash", "grep -R __VG_SENTINEL_NEVER_PRESENT__ .")
             recorder.emit(
                 "tool_result",
@@ -1770,6 +1828,7 @@ def run_task(
         tool_calls=[{"tool_use_id": "parent-read-sample-log", "name": "read_file", "args": {"path": "data/sample.log"}}],
         stop_reason="tool_use",
     )
+    _emit_tool_call(recorder, ToolCall("parent-read-sample-log", "read_file", {"path": "data/sample.log"}))
     log_result = tools.read_file(root, "data/sample.log", "parent-read-sample-log")
     log_event = recorder.emit("tool_result", **log_result)
     _compact_if_needed(recorder, log_event, deterministic=True)
@@ -1787,6 +1846,7 @@ def run_task(
         tool_calls=[{"tool_use_id": "parent-spawn-explorer", "name": "spawn_subagent", "args": {"question": "inspect auth/"}}],
         stop_reason="tool_use",
     )
+    _emit_tool_call(recorder, ToolCall("parent-spawn-explorer", "spawn_subagent", {"question": "inspect auth/"}))
     summary = _explore_auth(root, recorder, policy)
     recorder.emit(
         "tool_result",
@@ -2139,11 +2199,20 @@ if __name__ == "__main__":
 }
 
 
+EXTRA_SOURCE_GENERATED_FILES = ["sqlite_store.py"]
+
+
 def write_generated(src_dir: Path, digest: str, cfg: dict[str, str], prompts: dict[str, str], clean: bool) -> None:
+    extra_files: dict[str, str] = {}
+    source_dir = ROOT / "src" / "vg_agent"
+    for rel_path in EXTRA_SOURCE_GENERATED_FILES:
+        source_path = source_dir / rel_path
+        if source_path.exists():
+            extra_files[rel_path] = source_path.read_text(encoding="utf-8")
     if clean and src_dir.exists():
         shutil.rmtree(src_dir)
     src_dir.mkdir(parents=True, exist_ok=True)
-    for rel_path, text in GENERATED_FILES.items():
+    for rel_path, text in {**GENERATED_FILES, **extra_files}.items():
         path = src_dir / rel_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(render(text, digest, cfg, prompts), encoding="utf-8", newline="\n")

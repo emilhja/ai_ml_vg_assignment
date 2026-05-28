@@ -3,7 +3,7 @@
 The agent emits a live statusline to stderr and records every piece of data a
 future FastAPI + Pydantic + React analysis frontend would need from the JSONL
 trace alone. The frontend itself is **deferred** — this spec mandates the data
-contract, statusline, and machine-readable budget summary.
+contract, statusline, machine-readable budget summary, and SQLite query mirror.
 
 ## Statusline
 
@@ -82,8 +82,8 @@ Surfaced via:
 ## FinOps data contract (frontend deferred)
 
 A future FastAPI + Pydantic + React frontend must be able to render the run
-from JSONL alone. Store rich structured data now; do not require the frontend
-for v1:
+from JSONL alone, while normal dashboard queries should use the SQLite mirror.
+Store rich structured data now; do not require the frontend for v1:
 
 - Per-step timeline with per-agent token usage.
 - Compaction events with `original_event_idx` and `original_sha256`.
@@ -91,6 +91,18 @@ for v1:
 - Statusline strings (already in the trace as `statusline` events).
 - Tool-call counts per agent / per type.
 - Wall-clock overlaps for parallel sub-agents.
+- Turn-level rows for prompt duration, model/tool counts, tokens, cost, status,
+  and normalized failure reason.
+- Model/tool rows for latency, token usage, cost, status, and error summaries.
+
+## SQLite mirror
+
+- Default path: `<workspace_root>/traces/vg_agent.sqlite3`.
+- JSONL remains canonical for replay. SQLite mirrors the same redacted events
+  and adds derived tables for dashboard queries.
+- The mirror stores sessions, runs, turns, model calls, tool calls, sub-agents,
+  approvals, redactions, and compactions.
+- SQLite write failures must not abort agent execution; JSONL tracing continues.
 
 A spec assertion in `40_demo_and_eval.md` checks that a representative trace
 contains every field listed above at least once.

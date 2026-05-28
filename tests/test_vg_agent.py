@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -138,6 +139,40 @@ def test_replay_round_trip_tree_and_context(tmp_path: Path) -> None:
     loaded = load_trace(recorder.path)
     assert render_tree(loaded) == render_tree(recorder.events)
     assert show_context(loaded, 3) == show_context(recorder.events, 3)
+
+
+def test_sqlite_trace_mirror_and_dashboard_rollups(tmp_path: Path) -> None:
+    write_fixture(tmp_path)
+    recorder = TraceRecorder(tmp_path)
+    run_task(tmp_path, "find all auth handling and summarise", recorder)
+    db_path = tmp_path / config.SQLITE_TRACE_DB
+    assert db_path.exists()
+
+    with sqlite3.connect(db_path) as conn:
+        event_rows = conn.execute(
+            "SELECT event_idx, payload_json FROM events WHERE run_id = ? ORDER BY event_idx",
+            (recorder.run_id,),
+        ).fetchall()
+        assert len(event_rows) == len(recorder.events)
+        mirrored = [json.loads(row[1]) for row in event_rows]
+        assert mirrored == recorder.events
+
+        turns = conn.execute(
+            "SELECT prompt, status, total_tokens, total_model_calls, total_tool_calls, duration_ms FROM turns WHERE run_id = ?",
+            (recorder.run_id,),
+        ).fetchall()
+        assert len(turns) == 1
+        assert turns[0][0] == "find all auth handling and summarise"
+        assert turns[0][1] == "ok"
+        assert int(turns[0][2]) > 0
+        assert int(turns[0][3]) > 0
+        assert int(turns[0][4]) > 0
+        assert int(turns[0][5]) >= 0
+
+        assert conn.execute("SELECT COUNT(*) FROM model_calls WHERE run_id = ?", (recorder.run_id,)).fetchone()[0] > 0
+        assert conn.execute("SELECT COUNT(*) FROM tool_calls WHERE run_id = ?", (recorder.run_id,)).fetchone()[0] > 0
+        assert conn.execute("SELECT COUNT(*) FROM subagents WHERE run_id = ?", (recorder.run_id,)).fetchone()[0] > 0
+        assert conn.execute("SELECT COUNT(*) FROM compactions WHERE run_id = ?", (recorder.run_id,)).fetchone()[0] > 0
 
 
 def test_cost_cap_run_uses_budget_reason(tmp_path: Path) -> None:
@@ -569,6 +604,10 @@ def test_trace_redacts_secrets(tmp_path: Path) -> None:
     assert not any("sk-or-v1-DEAD" in str(e.get("result_full", "")) for e in events)
     redaction_events = [e for e in events if e["kind"] == "redaction"]
     assert redaction_events
+    with sqlite3.connect(tmp_path / config.SQLITE_TRACE_DB) as conn:
+        payloads = "\n".join(row[0] for row in conn.execute("SELECT payload_json FROM events"))
+        assert "sk-or-v1-DEAD" not in payloads
+        assert conn.execute("SELECT COUNT(*) FROM redactions").fetchone()[0] == len(redaction_events)
 
 
 def test_prompts_match_prompts_md() -> None:

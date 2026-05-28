@@ -41,6 +41,8 @@ Exactly one of these modes is required:
 - Final user-facing answers go to stdout.
 - Statusline, approval prompts, warnings, and live progress go to stderr.
 - JSONL traces are written to `<workspace_root>/traces/<run_id>.jsonl`.
+- The redacted event stream is mirrored to
+  `<workspace_root>/traces/vg_agent.sqlite3` for dashboard/statistics queries.
 - `0`: successful run, replay, seed, or chat exit.
 - `1`: validation/config/tool-policy error.
 - `2`: missing live-model secret or refused live-model network setup.

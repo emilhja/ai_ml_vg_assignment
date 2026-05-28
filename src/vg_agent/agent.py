@@ -166,6 +166,20 @@ def _emit_approval(recorder: TraceRecorder, call: ToolCall, outcome: ApprovalOut
         reason=outcome.reason,
     )
 
+
+def _emit_tool_call(recorder: TraceRecorder, call: ToolCall, agent_id: str = "parent", parent_id: str | None = None) -> None:
+    recorder.emit(
+        "tool_call",
+        agent_id=agent_id,
+        parent_id=parent_id,
+        tool_use_id=call.tool_use_id,
+        tool=call.name,
+        args=call.args,
+        args_summary=_args_summary(call.name, call.args),
+        path=call.args.get("path") or call.args.get("rel_path"),
+        command=call.args.get("command"),
+    )
+
 PARENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "read_file",
@@ -323,11 +337,14 @@ def _execute_live_tool(
     allow_spawn: bool,
     started: float,
     policy: ApprovalPolicy,
+    agent_id: str = "parent",
+    parent_id: str | None = None,
 ) -> dict[str, object]:
     tool_name = call.name
     args = call.args
     tool_started = time.perf_counter()
     path = str(args.get("path") or args.get("rel_path") or "")
+    _emit_tool_call(recorder, call, agent_id=agent_id, parent_id=parent_id)
 
     if tool_name == "run_bash":
         command = str(args.get("command") or "")
@@ -429,6 +446,10 @@ def _run_live_explorer(
             step_idx=local_step,
             tokens_in=expected_in,
             max_tokens=2048,
+            endpoint_host=config.OPENROUTER_ENDPOINT_HOST,
+            system_prompt_sha256=hashlib.sha256(EXPLORER_SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
+            tool_schema_count=len(EXPLORER_TOOL_SCHEMAS),
+            tool_schema_names=[schema["name"] for schema in EXPLORER_TOOL_SCHEMAS],
         )
         turn = client.complete(
             model=config.EXPLORER_MODEL_ID,
@@ -474,6 +495,8 @@ def _run_live_explorer(
                 allow_spawn=False,
                 started=started,
                 policy=policy,
+                agent_id=child_id,
+                parent_id="parent",
             )
             recorder.emit("tool_result", agent_id=child_id, parent_id="parent", **result)
             tool_blocks.append({"type": "tool_result", "tool_use_id": call.tool_use_id, "content": str(result["result_full"]), "is_error": result["status"] != "ok"})
@@ -531,6 +554,10 @@ def run_live_task(
             step_idx=guard.step_count + 1,
             tokens_in=expected_in,
             max_tokens=4096,
+            endpoint_host=config.OPENROUTER_ENDPOINT_HOST,
+            system_prompt_sha256=hashlib.sha256(PARENT_SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
+            tool_schema_count=len(PARENT_TOOL_SCHEMAS),
+            tool_schema_names=[schema["name"] for schema in PARENT_TOOL_SCHEMAS],
         )
         turn = client.complete(
             model=config.PARENT_MODEL_ID,
@@ -633,8 +660,10 @@ def _explore_auth(root: Path, recorder: TraceRecorder, policy: ApprovalPolicy | 
         ],
         stop_reason="tool_use",
     )
+    _emit_tool_call(recorder, ToolCall("child-read-session", "read_file", {"path": "auth/session.py"}), agent_id=child_id, parent_id="parent")
     session = tools.read_file(root, "auth/session.py", "child-read-session")
     recorder.emit("tool_result", agent_id=child_id, parent_id="parent", **session)
+    _emit_tool_call(recorder, ToolCall("child-read-middleware", "read_file", {"path": "auth/middleware.py"}), agent_id=child_id, parent_id="parent")
     middleware = tools.read_file(root, "auth/middleware.py", "child-read-middleware")
     recorder.emit("tool_result", agent_id=child_id, parent_id="parent", **middleware)
     summary = (
@@ -680,6 +709,7 @@ def run_task(
             stop_reason="tool_use",
         )
         edit_call = ToolCall("parent-edit-app", "edit_file", {"path": "app.py", "old": "foo", "new": "bar"})
+        _emit_tool_call(recorder, edit_call)
         if edit_call.name in policy.gated_tools():
             outcome = policy.check(_request_for(edit_call))
             _emit_approval(recorder, edit_call, outcome)
@@ -727,6 +757,7 @@ def run_task(
                 tool_calls=[{"tool_use_id": f"search-{step}", "name": "run_bash", "args": {"command": "grep -R __VG_SENTINEL_NEVER_PRESENT__ ."}}],
                 stop_reason="tool_use",
             )
+            _emit_tool_call(recorder, ToolCall(f"search-{step}", "run_bash", {"command": "grep -R __VG_SENTINEL_NEVER_PRESENT__ ."}))
             decision = guard.record_tool_signature("run_bash", "grep -R __VG_SENTINEL_NEVER_PRESENT__ .")
             recorder.emit(
                 "tool_result",
@@ -756,6 +787,7 @@ def run_task(
         tool_calls=[{"tool_use_id": "parent-read-sample-log", "name": "read_file", "args": {"path": "data/sample.log"}}],
         stop_reason="tool_use",
     )
+    _emit_tool_call(recorder, ToolCall("parent-read-sample-log", "read_file", {"path": "data/sample.log"}))
     log_result = tools.read_file(root, "data/sample.log", "parent-read-sample-log")
     log_event = recorder.emit("tool_result", **log_result)
     _compact_if_needed(recorder, log_event, deterministic=True)
@@ -773,6 +805,7 @@ def run_task(
         tool_calls=[{"tool_use_id": "parent-spawn-explorer", "name": "spawn_subagent", "args": {"question": "inspect auth/"}}],
         stop_reason="tool_use",
     )
+    _emit_tool_call(recorder, ToolCall("parent-spawn-explorer", "spawn_subagent", {"question": "inspect auth/"}))
     summary = _explore_auth(root, recorder, policy)
     recorder.emit(
         "tool_result",

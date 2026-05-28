@@ -17,6 +17,7 @@ Constants:
 - `K_COMPACT = 4000`
 - `MAX_TOOL_RESULT_BYTES = 1_048_576`
 - `DAILY_SPEND_FILE = ".vg_daily_spend.json"`
+- `SQLITE_TRACE_DB = "traces/vg_agent.sqlite3"`
 - `REQUIRE_APPROVAL_DEFAULT = "off"`
 - `OPENROUTER_ENDPOINT_HOST = "openrouter.ai"`
 
@@ -105,6 +106,17 @@ Daily spend persistence:
   inspect or rewrite it through `read_file`/`write_file`. On parse error the
   ledger refuses to load and the guard treats today's spend as already at
   the daily cap (fail closed).
+
+SQLite observability persistence:
+
+- `TraceRecorder` mirrors every redacted JSONL event into
+  `SQLITE_TRACE_DB`. JSONL remains the replay source; SQLite is the dashboard
+  query store.
+- SQLite stores the lossless event payload and derived rollup tables for
+  sessions, runs, turns, model calls, tool calls, sub-agents, approvals,
+  redactions, and compactions.
+- SQLite failures are fail-open for execution: a warning is written to stderr
+  and JSONL tracing continues.
 
 Approval cache persistence (opt-in):
 

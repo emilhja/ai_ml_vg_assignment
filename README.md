@@ -156,6 +156,17 @@ Trace redaction:
   before being written to the JSONL trace. Each substitution produces a
   `redaction` event. `--no-redact` disables this for local debugging only.
 
+SQLite observability:
+
+- Every redacted JSONL event is also mirrored to
+  `traces/vg_agent.sqlite3`. JSONL remains the replay/audit source; SQLite is
+  the dashboard query store.
+- The SQLite database keeps the lossless event payloads plus rollup tables for
+  sessions, runs, turns, model calls, tool calls, sub-agents, approvals,
+  redactions, and compactions. This records prompt durations, response
+  latency, token and cost totals, tool latency/errors, and model usage without
+  requiring a frontend yet.
+
 See [`dev_docs/dangerous_cli.md`](dev_docs/dangerous_cli.md) for the *why*
 behind every command, argument token, and path on the deny-list.
 

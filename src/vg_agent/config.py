@@ -1,6 +1,6 @@
 """Generated runtime constants from MODEL_CONFIG.md."""
 
-SPEC_DIGEST = "c848b3c281b81e4a5f0593ff0d432184c96eef8835cb87466c72c1e9dbdbb900"
+SPEC_DIGEST = "2a91e807518775e7ee4dda52972006e8cce9fa190bc94aa6f6296092fd3666a8"
 
 PARENT_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
 EXPLORER_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
@@ -29,3 +29,4 @@ MAX_TOOL_RESULT_BYTES = 1_048_576
 DAILY_SPEND_FILE = ".vg_daily_spend.json"
 APPROVALS_FILE = ".vg_approvals.json"
 REQUIRE_APPROVAL_DEFAULT = "off"
+SQLITE_TRACE_DB = "traces/vg_agent.sqlite3"

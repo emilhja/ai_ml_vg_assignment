@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
+
+from .sqlite_store import SQLiteTraceStore
 
 
 REDACTION_PATTERNS = [
@@ -54,6 +57,7 @@ class TraceRecorder:
     events: list[dict[str, object]] = field(default_factory=list)
     redact: bool = True
     event_sink: Callable[[dict[str, object]], None] | None = None
+    sqlite_enabled: bool = True
 
     def __post_init__(self) -> None:
         self.trace_dir = self.root / "traces"
@@ -61,8 +65,24 @@ class TraceRecorder:
         self.path = self.trace_dir / f"{self.run_id}.jsonl"
         if self.session_id is None:
             self.session_id = self.run_id
+        self.turn_counter = 0
+        self.current_turn_id: str | None = None
+        self.sqlite_store: SQLiteTraceStore | None = None
+        if self.sqlite_enabled:
+            try:
+                self.sqlite_store = SQLiteTraceStore(self.root, redaction_enabled=self.redact)
+            except Exception as exc:  # pragma: no cover - best-effort mirror
+                sys.stderr.write(f"warning: sqlite trace disabled: {exc}\n")
 
     def emit(self, kind: str, agent_id: str = "parent", parent_id: str | None = None, **fields: object) -> dict[str, object]:
+        if kind == "user_prompt":
+            self.turn_counter += 1
+            self.current_turn_id = f"{self.session_id}:turn:{self.turn_counter}"
+            fields.setdefault("turn_id", self.current_turn_id)
+            fields.setdefault("turn_index", self.turn_counter)
+        elif self.current_turn_id is not None:
+            fields.setdefault("turn_id", self.current_turn_id)
+            fields.setdefault("turn_index", self.turn_counter)
         event: dict[str, object] = {
             "run_id": self.run_id,
             "session_id": self.session_id,
@@ -79,6 +99,12 @@ class TraceRecorder:
         self.events.append(event)
         with self.path.open("a", encoding="utf-8", newline="\n") as fh:
             fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+        if self.sqlite_store is not None:
+            try:
+                self.sqlite_store.record_event(event)
+            except Exception as exc:  # pragma: no cover - JSONL remains canonical
+                sys.stderr.write(f"warning: sqlite trace write failed: {exc}\n")
+                self.sqlite_store = None
         if self.event_sink is not None:
             self.event_sink(event)
         if redaction_summary and kind != "redaction":
