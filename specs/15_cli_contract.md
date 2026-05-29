@@ -30,11 +30,11 @@ model step.
 | `/exit` | End the chat process cleanly. |
 | `/quit` | Alias for `/exit`. |
 | `/budget` | Print the current session budget counters: steps, tokens, USD spend, and daily remaining USD. |
-| `/status` | In TTY chat, reprint the full session dashboard (welcome panel + status bar). In non-TTY chat, print the compact statusline plus budget counters. See `specs/16_chat_ui.md`. |
+| `/status` | In TTY chat, clear the terminal and reprint the full session dashboard (welcome panel + status bar). In non-TTY chat, print the compact statusline plus budget counters. See `specs/16_chat_ui.md`. |
 | `/finops` | Print a per-agent-type FinOps table for the session, including input/output/total tokens, model-call count, tool-call count, and USD spend. |
 | `/approvals` | Print the session approval history and any cached reusable approval scopes. |
-| `/reset` | Clear cached approval scopes, reset the session budget guard, clear conversation history, and emit a `session_reset` trace event. |
-| `/new` | Start a fresh chat session and trace inside the current REPL process; clear cached approval scopes, reset the budget guard, clear conversation history, and emit a `session_new` trace event in the new trace. |
+| `/reset` | Clear cached approval scopes, reset the session budget guard, clear conversation history, and emit a `session_reset` trace event. In TTY Rich chat, also clear the terminal before reprinting the dashboard. |
+| `/new` | Start a fresh chat session and trace inside the current REPL process; clear cached approval scopes, reset the budget guard, clear conversation history, and emit a `session_new` trace event in the new trace. In TTY Rich chat, clear the terminal before the welcome dashboard. |
 | `/show-context N` | Print the parent-visible context at parent step `N` as formatted JSON. If `N` is omitted, step `0` is used. |
 | `/help` | Print the available slash commands in their compact help form. |
 
@@ -49,6 +49,8 @@ When stdin and stderr are TTYs and `NO_COLOR` is unset, `--chat` renders a
 Claude Code-inspired layout defined in `specs/16_chat_ui.md`:
 
 - Welcome panel with `cwd` on session start; compact chrome after the first turn.
+- TTY screen clear before the welcome dashboard on start, `/new`, `/reset`, and
+  `/status` (disable with `VG_CHAT_NO_CLEAR=1`; see `specs/16_chat_ui.md`).
 - Framed `> ` prompt with a grey task placeholder.
 - Bottom status bar (model, parent-visible context, USD, steps, run state) below
   the input; refreshes during agent runs (`… running` while in flight).

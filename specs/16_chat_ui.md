@@ -45,9 +45,30 @@ unaffected.
 | After first turn | Compact chrome (label + status bar + hint) on idle prompts |
 | During agent run | Status bar refresh (throttled) on progress events; `… running` state |
 | After each agent turn | Status bar + hint (+ secondary if needed); `mark_turn_completed()` |
-| `/status` | Full dashboard |
-| `/reset`, `/new` | Full dashboard; `/new` also `reset_dashboard_mode()` |
+| `/status` | Full dashboard (after screen clear) |
+| `/reset`, `/new` | Full dashboard (after screen clear); `/new` also `reset_dashboard_mode()` |
 | Before each prompt | Top rule only; bottom rule + status bar after input |
+
+### Screen clear
+
+When Rich TTY UI is active, `clear_chat_screen()` runs **before** the full
+dashboard on:
+
+- `--chat` session start
+- `/status`, `/reset`, `/new`
+
+It does **not** run during agent turns, after each turn, or for other slash
+commands (`/budget`, `/help`, etc.) so in-flight progress and approvals stay
+visible.
+
+Implementation: Rich `Console.clear()` on stderr, then optional `\033[3J` for
+best-effort scrollback wipe on xterm-compatible terminals (Windows Terminal,
+iTerm). Scrollback clearing is not guaranteed on all emulators.
+
+Set `VG_CHAT_NO_CLEAR=1` to disable clearing while keeping Rich UI.
+
+After `/new`, an optional dim line may show the active trace path:
+`trace: {short_path}`.
 
 Idle chat does **not** repeat the compact one-line statusline before every
 prompt. That string is emitted as trace `statusline` events during agent runs
@@ -107,6 +128,7 @@ When `--require-approval` is not `off` and `use_rich_ui()` is true:
 |---|---|
 | `NO_COLOR` | Disable Rich UI (existing). |
 | `NO_EMOJI` | ASCII status prefixes (`dir:`, `mdl:`, `usd:`, `stp:`) instead of emoji. |
+| `VG_CHAT_NO_CLEAR` | Disable TTY screen clear before dashboard refresh. |
 
 ## Non-TTY fallback
 

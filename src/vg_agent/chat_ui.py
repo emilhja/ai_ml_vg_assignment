@@ -56,6 +56,22 @@ def reset_dashboard_mode() -> None:
     _compact_dashboard = False
 
 
+def clear_chat_screen(*, scrollback: bool = True) -> None:
+    """Clear the TTY before a full dashboard refresh; no-op when disabled or non-TTY."""
+    if os.environ.get("VG_CHAT_NO_CLEAR"):
+        return
+    if not use_rich_ui():
+        return
+    console = _console()
+    console.clear()
+    if scrollback:
+        try:
+            console.file.write("\033[3J")
+            console.file.flush()
+        except (AttributeError, OSError):
+            pass
+
+
 def short_cwd(path: Path) -> str:
     resolved = path.resolve()
     home = Path.home().resolve()
@@ -426,6 +442,30 @@ def print_chat_dashboard(
     )
     _write_hint(console)
     _write_secondary(console, recorder.events, since_event_idx=since_event_idx)
+
+
+def print_chat_dashboard_cleared(
+    *,
+    root: Path,
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    live_model: bool,
+    since_event_idx: int = 0,
+    compact: bool | None = None,
+    show_trace_path: bool = False,
+) -> None:
+    """Clear the TTY, then print the session dashboard."""
+    clear_chat_screen()
+    print_chat_dashboard(
+        root=root,
+        recorder=recorder,
+        guard=guard,
+        live_model=live_model,
+        since_event_idx=since_event_idx,
+        compact=compact,
+    )
+    if show_trace_path and use_rich_ui():
+        _console().print(f"[dim]trace: traces/{recorder.run_id}.jsonl[/dim]")
 
 
 def render_input_top_rule() -> None:

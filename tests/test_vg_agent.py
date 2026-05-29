@@ -1204,6 +1204,101 @@ def test_chat_ui_running_state(tmp_path: Path) -> None:
     assert "\u2026" in line
 
 
+def test_clear_chat_screen_noop_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vg_agent import chat_ui
+
+    cleared: list[bool] = []
+
+    class FakeConsole:
+        def clear(self) -> None:
+            cleared.append(True)
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    monkeypatch.setenv("VG_CHAT_NO_CLEAR", "1")
+    monkeypatch.setattr(chat_ui, "_console", lambda: FakeConsole())
+    chat_ui.clear_chat_screen()
+    assert cleared == []
+
+
+def test_clear_chat_screen_noop_when_not_rich(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vg_agent import chat_ui
+
+    cleared: list[bool] = []
+
+    class FakeConsole:
+        def clear(self) -> None:
+            cleared.append(True)
+
+    monkeypatch.delenv("VG_CHAT_NO_CLEAR", raising=False)
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: False)
+    monkeypatch.setattr(chat_ui, "_console", lambda: FakeConsole())
+    chat_ui.clear_chat_screen()
+    assert cleared == []
+
+
+def test_clear_chat_screen_clears_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    from vg_agent import chat_ui
+
+    cleared: list[bool] = []
+    scrollback: list[str] = []
+
+    class FakeFile(io.StringIO):
+        pass
+
+    class FakeConsole:
+        file = FakeFile()
+
+        def clear(self) -> None:
+            cleared.append(True)
+
+    monkeypatch.delenv("VG_CHAT_NO_CLEAR", raising=False)
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    monkeypatch.setattr(chat_ui, "_console", lambda: FakeConsole())
+    chat_ui.clear_chat_screen()
+    assert cleared == [True]
+    assert FakeConsole.file.getvalue() == "\033[3J"
+
+
+def test_print_chat_dashboard_cleared_shows_trace_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vg_agent import chat_ui
+    from vg_agent.budget import BudgetGuard
+    from vg_agent.trace import TraceRecorder
+
+    printed: list[str] = []
+
+    class FakeConsole:
+        def print(self, text: str = "", **kwargs: object) -> None:
+            printed.append(str(text))
+
+        def clear(self) -> None:
+            pass
+
+        file = type("F", (), {"write": lambda *_a, **_k: None, "flush": lambda *_a, **_k: None})()
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    monkeypatch.setattr(chat_ui, "_console", lambda: FakeConsole())
+    monkeypatch.setattr(chat_ui, "clear_chat_screen", lambda **_k: None)
+    monkeypatch.setattr(
+        chat_ui,
+        "print_chat_dashboard",
+        lambda **_k: printed.append("dashboard"),
+    )
+    recorder = TraceRecorder(tmp_path, run_id="abc123", sqlite_enabled=False)
+    chat_ui.print_chat_dashboard_cleared(
+        root=tmp_path,
+        recorder=recorder,
+        guard=BudgetGuard.for_workspace(tmp_path),
+        live_model=False,
+        show_trace_path=True,
+    )
+    assert "dashboard" in printed
+    assert any("traces/abc123.jsonl" in line for line in printed)
+
+
 def test_chat_ui_non_tty_skips_rich(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from vg_agent import __main__ as cli
 

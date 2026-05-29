@@ -2484,7 +2484,7 @@ from .chat_ui import (
     format_compaction_banner,
     format_statusline_compact,
     mark_turn_completed,
-    print_chat_dashboard,
+    print_chat_dashboard_cleared,
     print_turn_output,
     prompt_approval,
     refresh_chat_status_bar,
@@ -2604,6 +2604,7 @@ def _format_slash_command_help() -> str:
             "Notes:",
             "  Normal text is sent to the agent as the next task.",
             "  Interactive terminals autocomplete slash commands after typing /.",
+            "  TTY: /new, /reset, /status clear the screen and refresh the dashboard.",
         )
     )
     return "\\n".join(lines)
@@ -3209,7 +3210,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
     history_path = root / ".vg_chat_history"
     read_prompt, save_history = _make_chat_prompt(history_path)
     if use_rich_ui():
-        print_chat_dashboard(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
+        print_chat_dashboard_cleared(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
     else:
         sys.stderr.write("VG Agent chat mode. Type /help for commands.\\n")
     conversation: list[dict[str, Any]] = []
@@ -3236,7 +3237,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 continue
             if prompt == "/status":
                 if use_rich_ui():
-                    print_chat_dashboard(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since), compact=False)
+                    print_chat_dashboard_cleared(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since), compact=False)
                 else:
                     line = _format_chat_statusline(recorder, guard, live_model=bool(args.live_model))
                     sys.stdout.write(line + "\\n")
@@ -3254,7 +3255,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 reset_dashboard_mode()
                 recorder.emit("session_reset")
                 if use_rich_ui():
-                    print_chat_dashboard(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since), compact=False)
+                    print_chat_dashboard_cleared(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since), compact=False)
                 continue
             if prompt == "/new":
                 policy.cache.clear()
@@ -3271,7 +3272,10 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 )
                 recorder.emit("session_new")
                 if use_rich_ui():
-                    print_chat_dashboard(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
+                    print_chat_dashboard_cleared(
+                        **_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since),
+                        show_trace_path=True,
+                    )
                 continue
             if prompt == "/finops":
                 _print_finops(guard, recorder)
