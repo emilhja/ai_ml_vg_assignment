@@ -2479,19 +2479,24 @@ except ImportError:  # pragma: no cover - dependency is optional at runtime fall
 from . import config, tools
 from .chat_ui import (
     CHAT_PLACEHOLDER,
+    WRITE_EDIT_TOOLS,
     build_session_status,
+    capture_write_prior,
     emit_session_statusline,
     format_compaction_banner,
     format_statusline_compact,
     mark_turn_completed,
     print_chat_dashboard_cleared,
     print_turn_output,
+    progress_diff_lines,
     prompt_approval,
     refresh_chat_status_bar,
     render_input_bottom_and_footer,
     render_input_top_rule,
+    render_progress_file_diff,
     reset_dashboard_mode,
     use_rich_ui,
+    _console,
 )
 from .agent import BUDGET_CAP_TOOL, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, run_live_task, run_task
 from .live_model_client import LiveModelClient, MissingOpenRouterKey
@@ -2500,12 +2505,12 @@ from .demo_fixture import write_fixture
 from .trace import TraceRecorder, load_trace, render_tree, show_context
 
 
-def _stdin_prompt(stream: object | None = None) -> "callable":
+def _stdin_prompt(stream: object | None = None, *, workspace_root: Path | None = None) -> "callable":
     fh = stream if stream is not None else sys.stdin
 
     def ask(request: ApprovalRequest) -> ApprovalOutcome:
         if use_rich_ui():
-            return prompt_approval(request, input_stream=fh)
+            return prompt_approval(request, input_stream=fh, workspace_root=workspace_root)
         if request.tool == BUDGET_CAP_TOOL:
             sys.stderr.write(f"[approval] budget {request.path}  {request.summary}\\n")
         else:
@@ -2543,14 +2548,14 @@ def _stdin_prompt(stream: object | None = None) -> "callable":
     return ask
 
 
-def _make_policy(args: argparse.Namespace) -> ApprovalPolicy:
+def _make_policy(args: argparse.Namespace, workspace_root: Path | None = None) -> ApprovalPolicy:
     mode = args.require_approval
     if mode == "off":
         return ApprovalPolicy(mode="off")
     return ApprovalPolicy(
         mode=mode,
         auto_yes=bool(args.yes),
-        prompt=_stdin_prompt(),
+        prompt=_stdin_prompt(workspace_root=workspace_root),
     )
 
 
@@ -2996,11 +3001,14 @@ def _make_progress_sink(
     *,
     on_parent_status: Any = None,
     turn_state: dict[str, Any] | None = None,
+    workspace_root: Path | None = None,
 ) -> "callable":
     fh = stream if stream is not None else sys.stderr
     use_color = bool(getattr(fh, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
     reset = "\\x1b[0m" if use_color else ""
     state = turn_state if turn_state is not None else {}
+    pending_calls: dict[str, dict[str, object]] = {}
+    write_priors: dict[str, str] = state.setdefault("write_priors", {})
 
     def sink(event: dict[str, object]) -> None:
         kind = event.get("kind")
@@ -3008,10 +3016,20 @@ def _make_progress_sink(
             return
         if kind == "user_prompt":
             state["turn"] = int(state.get("turn", 0)) + 1
+            pending_calls.clear()
             if use_color:
                 fh.write(f"\\n\\x1b[90m── turn {state['turn']} ──\\x1b[0m\\n")
             else:
                 fh.write(f"\\n── turn {state['turn']} ──\\n")
+        if kind == "tool_call":
+            tool = str(event.get("tool") or "")
+            tool_use_id = str(event.get("tool_use_id") or "")
+            if tool in WRITE_EDIT_TOOLS and tool_use_id:
+                pending_calls[tool_use_id] = event
+                if tool == "write_file" and workspace_root is not None:
+                    prior = capture_write_prior(workspace_root, event)
+                    if prior is not None:
+                        write_priors[tool_use_id] = prior
         banner = format_compaction_banner(event)
         if banner:
             fh.write(f"{banner}\\n")
@@ -3021,6 +3039,21 @@ def _make_progress_sink(
             prefix = "  " if kind in {"subagent_spawn", "subagent_return"} else ""
             fh.write(f"{color}{prefix}{line}{reset}\\n")
             fh.flush()
+        if kind == "tool_result":
+            tool = str(event.get("tool") or "")
+            tool_use_id = str(event.get("tool_use_id") or "")
+            if tool in WRITE_EDIT_TOOLS and event.get("status") == "ok":
+                call = pending_calls.pop(tool_use_id, None)
+                if call is not None:
+                    prior = write_priors.get(tool_use_id)
+                    if use_rich_ui():
+                        render_progress_file_diff(
+                            _console(), call_event=call, prior_content=prior
+                        )
+                    else:
+                        for diff_line in progress_diff_lines(call, prior):
+                            fh.write(f"  {diff_line}\\n")
+                        fh.flush()
         if kind == "assistant_step" and event.get("agent_id") == "parent" and on_parent_status:
             on_parent_status()
         elif kind == "run_end" and on_parent_status:
@@ -3204,9 +3237,11 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
     recorder = TraceRecorder(
         root,
         redact=not args.no_redact,
-        event_sink=_make_progress_sink(on_parent_status=on_parent_status, turn_state=turn_state),
+        event_sink=_make_progress_sink(
+            on_parent_status=on_parent_status, turn_state=turn_state, workspace_root=root
+        ),
     )
-    policy = _make_policy(args)
+    policy = _make_policy(args, workspace_root=root)
     history_path = root / ".vg_chat_history"
     read_prompt, save_history = _make_chat_prompt(history_path)
     if use_rich_ui():
@@ -3268,7 +3303,11 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 recorder = TraceRecorder(
                     root,
                     redact=not args.no_redact,
-                    event_sink=_make_progress_sink(on_parent_status=on_parent_status, turn_state=turn_state),
+                    event_sink=_make_progress_sink(
+                        on_parent_status=on_parent_status,
+                        turn_state=turn_state,
+                        workspace_root=root,
+                    ),
                 )
                 recorder.emit("session_new")
                 if use_rich_ui():
@@ -3290,6 +3329,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 continue
             start_idx = len(recorder.events)
             turn_state["since_event_idx"] = start_idx
+            turn_state["write_priors"] = {}
             turn_state["force_state"] = "running"
             _report_parent_session_status(
                 root, recorder, guard, args, since_event_idx=start_idx, force_state="running"
@@ -3307,7 +3347,14 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             turn_state["force_state"] = None
             answer = _latest_parent_answer(recorder.events, start_idx)
             literal_outputs = _literal_tool_outputs(recorder.events, start_idx, literal_prompt, answer)
-            print_turn_output(answer=answer, literal_outputs=literal_outputs)
+            print_turn_output(
+                answer=answer,
+                literal_outputs=literal_outputs,
+                events=recorder.events,
+                start_idx=start_idx,
+                workspace_root=root,
+                pending_priors=turn_state.get("write_priors"),
+            )
             for notice in _turn_subagent_failure_notices(recorder.events, start_idx):
                 sys.stderr.write(notice + "\\n")
             mark_turn_completed()

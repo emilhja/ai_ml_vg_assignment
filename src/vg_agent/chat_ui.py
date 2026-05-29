@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+DIFF_MAX_LINES = 40
+DIFF_CONTEXT_LINES = 3
+WRITE_EDIT_TOOLS = frozenset({"edit_file", "write_file"})
 
 from . import config, tools
 from .budget import BudgetGuard
@@ -510,6 +515,242 @@ def _lines_already_in_answer(answer: str, content: str) -> bool:
     return all(line in answer_lines for line in content_lines)
 
 
+@dataclass(frozen=True)
+class FileChange:
+    path: str
+    tool: str
+    old: str
+    new: str
+
+
+def format_unified_diff(
+    old: str,
+    new: str,
+    *,
+    path: str,
+    context: int = DIFF_CONTEXT_LINES,
+    max_lines: int = DIFF_MAX_LINES,
+) -> tuple[list[str], bool]:
+    """Return unified diff lines and whether output was truncated."""
+    fromfile = f"a/{path}" if path else "a/file"
+    tofile = f"b/{path}" if path else "b/file"
+    lines = list(
+        difflib.unified_diff(
+            old.splitlines(),
+            new.splitlines(),
+            fromfile=fromfile,
+            tofile=tofile,
+            lineterm="",
+            n=context,
+        )
+    )
+    if not lines and old != new:
+        lines = [f"--- {fromfile}", f"+++ {tofile}", "@@", f"-{old}", f"+{new}"]
+    truncated = len(lines) > max_lines
+    if truncated:
+        extra = len(lines) - max_lines
+        lines = lines[:max_lines]
+        lines.append(f"... {extra} more lines (full edit in trace)")
+    return lines, truncated
+
+
+def _diff_line_style(line: str) -> str:
+    if line.startswith(("---", "+++", "@@")):
+        return "dim"
+    if line.startswith("-"):
+        return "red"
+    if line.startswith("+"):
+        return "green"
+    return ""
+
+
+def _diff_lines_plain(lines: list[str]) -> str:
+    return "\n".join(lines)
+
+
+def _diff_lines_rich(lines: list[str]) -> Any:
+    from rich.console import Group
+    from rich.text import Text
+
+    parts: list[Text] = []
+    for index, line in enumerate(lines):
+        style = _diff_line_style(line)
+        parts.append(Text(line + ("\n" if index < len(lines) - 1 else ""), style=style or None))
+    return Group(*parts) if parts else Text("")
+
+
+def render_diff_to_console(
+    console: Any,
+    *,
+    path: str,
+    old: str,
+    new: str,
+    title: str,
+    border_style: str = "dim",
+) -> None:
+    lines, _ = format_unified_diff(old, new, path=path)
+    if not lines:
+        return
+    from rich.panel import Panel
+
+    if os.environ.get("NO_COLOR"):
+        console.print(Panel(_diff_lines_plain(lines), title=title, border_style=border_style))
+    else:
+        console.print(Panel(_diff_lines_rich(lines), title=title, border_style=border_style))
+
+
+def read_prior_workspace_file(workspace_root: Path, rel_path: str) -> str:
+    try:
+        return tools.resolve_workspace_path(workspace_root, rel_path).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return ""
+
+
+def old_new_for_write_request(workspace_root: Path, args: dict[str, Any]) -> tuple[str, str]:
+    path = str(args.get("path") or args.get("rel_path") or "")
+    new = str(args.get("content") or "")
+    old = read_prior_workspace_file(workspace_root, path) if path else ""
+    return old, new
+
+
+def old_new_for_edit_request(args: dict[str, Any]) -> tuple[str, str]:
+    return str(args.get("old") or ""), str(args.get("new") or "")
+
+
+def _path_from_call(call: dict[str, object]) -> str:
+    args = call.get("args")
+    if not isinstance(args, dict):
+        return str(call.get("path") or "")
+    return str(args.get("path") or args.get("rel_path") or call.get("path") or "")
+
+
+def _old_new_from_pending(call: dict[str, object], prior_content: str | None = None) -> tuple[str, str]:
+    tool = str(call.get("tool") or "")
+    args = call.get("args")
+    if not isinstance(args, dict):
+        return "", ""
+    if tool == "edit_file":
+        return old_new_for_edit_request(args)
+    if tool == "write_file":
+        new = str(args.get("content") or "")
+        old = prior_content if prior_content is not None else ""
+        return old, new
+    return "", ""
+
+
+def collect_file_changes(
+    events: list[dict[str, object]],
+    start_idx: int,
+    *,
+    workspace_root: Path,
+    pending_priors: dict[str, str] | None = None,
+) -> list[FileChange]:
+    """Collect successful write/edit changes in event order; last per path wins."""
+    calls: dict[str, dict[str, object]] = {}
+    for event in events[start_idx:]:
+        if event.get("kind") == "tool_call":
+            tool_use_id = str(event.get("tool_use_id") or "")
+            if tool_use_id:
+                calls[tool_use_id] = event
+
+    by_path: dict[str, FileChange] = {}
+    priors = pending_priors or {}
+    for event in events[start_idx:]:
+        if event.get("kind") != "tool_result":
+            continue
+        tool = str(event.get("tool") or "")
+        if tool not in WRITE_EDIT_TOOLS or event.get("status") != "ok":
+            continue
+        tool_use_id = str(event.get("tool_use_id") or "")
+        call = calls.get(tool_use_id, {})
+        path = _path_from_call(call)
+        if not path:
+            continue
+        prior = priors.get(tool_use_id)
+        old, new = _old_new_from_pending(call, prior)
+        if tool == "write_file" and prior is None and not old:
+            old = read_prior_workspace_file(workspace_root, path)
+        by_path[path] = FileChange(path=path, tool=tool, old=old, new=new)
+    return list(by_path.values())
+
+
+def _render_changes_to_console(console: Any, changes: list[FileChange]) -> None:
+    from rich.panel import Panel
+
+    for change in changes:
+        lines, _ = format_unified_diff(change.old, change.new, path=change.path)
+        if not lines:
+            continue
+        body = _diff_lines_plain(lines) if os.environ.get("NO_COLOR") else _diff_lines_rich(lines)
+        console.print(Panel(body, title=change.path, border_style="dim"))
+
+
+def print_turn_changes(
+    events: list[dict[str, object]],
+    start_idx: int,
+    workspace_root: Path,
+    *,
+    pending_priors: dict[str, str] | None = None,
+) -> bool:
+    changes = collect_file_changes(
+        events, start_idx, workspace_root=workspace_root, pending_priors=pending_priors
+    )
+    if not changes:
+        return False
+    if use_rich_ui():
+        from rich.console import Console
+
+        console = Console(file=sys.stdout, highlight=False)
+        _render_changes_to_console(console, changes)
+    else:
+        parts: list[str] = ["Changes:"]
+        for change in changes:
+            lines, _ = format_unified_diff(change.old, change.new, path=change.path)
+            parts.append(f"--- {change.path} ---")
+            parts.extend(lines)
+        sys.stdout.write("\n".join(parts) + "\n")
+    sys.stdout.flush()
+    return True
+
+
+def capture_write_prior(workspace_root: Path, call_event: dict[str, object]) -> str | None:
+    if str(call_event.get("tool") or "") != "write_file":
+        return None
+    path = _path_from_call(call_event)
+    if not path:
+        return None
+    try:
+        resolved = tools.resolve_workspace_path(workspace_root, path)
+        if resolved.is_file():
+            return resolved.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def progress_diff_lines(call_event: dict[str, object], prior_content: str | None = None) -> list[str]:
+    path = _path_from_call(call_event)
+    if str(call_event.get("tool") or "") not in WRITE_EDIT_TOOLS or not path:
+        return []
+    old, new = _old_new_from_pending(call_event, prior_content)
+    lines, _ = format_unified_diff(old, new, path=path)
+    return lines
+
+
+def render_progress_file_diff(
+    console: Any,
+    *,
+    call_event: dict[str, object],
+    prior_content: str | None,
+) -> None:
+    path = _path_from_call(call_event)
+    tool = str(call_event.get("tool") or "")
+    if tool not in WRITE_EDIT_TOOLS or not path:
+        return
+    old, new = _old_new_from_pending(call_event, prior_content)
+    render_diff_to_console(console, path=path, old=old, new=new, title=f"{tool} {path}")
+
+
 def _render_directory_tree(text: str) -> Any | None:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines or not all(line.startswith("./") or line in {".", "./"} for line in lines[:20]):
@@ -533,8 +774,16 @@ def _render_directory_tree(text: str) -> Any | None:
     return root
 
 
-def print_turn_output(*, answer: str, literal_outputs: list[str]) -> bool:
-    """Frame agent answer + literal tool outputs. Returns True if anything printed."""
+def print_turn_output(
+    *,
+    answer: str,
+    literal_outputs: list[str],
+    events: list[dict[str, object]] | None = None,
+    start_idx: int = 0,
+    workspace_root: Path | None = None,
+    pending_priors: dict[str, str] | None = None,
+) -> bool:
+    """Frame agent answer + literal tool outputs + optional Changes diffs. Returns True if anything printed."""
     answer_text = answer.strip()
     filtered_outputs: list[str] = []
     for output in literal_outputs:
@@ -544,7 +793,12 @@ def print_turn_output(*, answer: str, literal_outputs: list[str]) -> bool:
         if answer_text and _lines_already_in_answer(answer_text, body):
             continue
         filtered_outputs.append(output)
-    if not answer_text and not filtered_outputs:
+    changes: list[FileChange] = []
+    if events is not None and workspace_root is not None:
+        changes = collect_file_changes(
+            events, start_idx, workspace_root=workspace_root, pending_priors=pending_priors
+        )
+    if not answer_text and not filtered_outputs and not changes:
         return False
     if use_rich_ui():
         from rich.console import Console
@@ -568,12 +822,20 @@ def print_turn_output(*, answer: str, literal_outputs: list[str]) -> bool:
                     console.print(Panel(body, title=title or "Tool output", border_style="dim"))
             else:
                 console.print(output)
+        if changes:
+            _render_changes_to_console(console, changes)
         console.print(Rule(style="dim"))
     else:
         parts: list[str] = []
         if answer_text:
             parts.append(answer_text)
         parts.extend(filtered_outputs)
+        if changes:
+            parts.append("Changes:")
+            for change in changes:
+                lines, _ = format_unified_diff(change.old, change.new, path=change.path)
+                parts.append(f"--- {change.path} ---")
+                parts.extend(lines)
         sys.stdout.write("\n".join(parts) + "\n")
     sys.stdout.flush()
     return True
@@ -653,11 +915,18 @@ def _parse_approval_choice(line: str, request: Any) -> Any:
     return ApprovalOutcome(decision="denied", reason="user no")
 
 
-def prompt_approval(request: Any, *, input_stream: object | None = None) -> Any:
+def prompt_approval(
+    request: Any,
+    *,
+    input_stream: object | None = None,
+    workspace_root: Path | None = None,
+) -> Any:
     from .agent import BUDGET_CAP_TOOL
 
     if use_rich_ui():
+        from rich.console import Group
         from rich.panel import Panel
+        from rich.text import Text
 
         console = _console()
         if request.tool == BUDGET_CAP_TOOL:
@@ -666,7 +935,27 @@ def prompt_approval(request: Any, *, input_stream: object | None = None) -> Any:
         else:
             title = f"Approve {request.tool}"
             options = "1/y yes  2 yes (scoped)  3/a always  4/n no  5 abort"
-        console.print(Panel(f"{request.summary}\n[dim]{options}[/dim]", title=title, border_style="cyan"))
+        panel_body: Any
+        if request.tool in WRITE_EDIT_TOOLS and isinstance(request.args, dict) and workspace_root is not None:
+            if request.tool == "edit_file":
+                old, new = old_new_for_edit_request(request.args)
+            else:
+                old, new = old_new_for_write_request(workspace_root, request.args)
+            path = str(request.path or request.args.get("path") or "")
+            lines, _ = format_unified_diff(old, new, path=path)
+            if lines and not os.environ.get("NO_COLOR"):
+                panel_body = Group(
+                    Text(request.summary),
+                    _diff_lines_rich(lines),
+                    Text(options, style="dim"),
+                )
+            elif lines:
+                panel_body = f"{request.summary}\n{_diff_lines_plain(lines)}\n{options}"
+            else:
+                panel_body = f"{request.summary}\n[dim]{options}[/dim]"
+        else:
+            panel_body = f"{request.summary}\n[dim]{options}[/dim]"
+        console.print(Panel(panel_body, title=title, border_style="cyan"))
         if PromptSession is not None:
             session = PromptSession()
             line = session.prompt("> ")

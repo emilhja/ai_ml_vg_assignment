@@ -1348,6 +1348,113 @@ def test_chat_ui_turn_output_plain_when_non_tty(monkeypatch: pytest.MonkeyPatch)
     assert "\u2500" not in out
 
 
+def test_format_unified_diff_includes_plus_minus_lines() -> None:
+    from vg_agent.chat_ui import format_unified_diff
+
+    lines, truncated = format_unified_diff("foo\nbar", "foo\nbaz", path="app.py")
+    assert any(line.startswith("-bar") for line in lines)
+    assert any(line.startswith("+baz") for line in lines)
+    assert not truncated
+
+
+def test_format_unified_diff_truncates_large_hunks() -> None:
+    from vg_agent.chat_ui import DIFF_MAX_LINES, format_unified_diff
+
+    old = "\n".join(f"line-{index}" for index in range(80))
+    new = "\n".join(f"line-{index}" for index in range(80, 160))
+    lines, truncated = format_unified_diff(old, new, path="big.txt", max_lines=DIFF_MAX_LINES)
+    assert truncated
+    assert any("more lines" in line for line in lines)
+    assert len(lines) == DIFF_MAX_LINES + 1
+
+
+def test_collect_file_changes_edit_and_write(tmp_path: Path) -> None:
+    from vg_agent.chat_ui import collect_file_changes
+
+    target = tmp_path / "app.py"
+    target.write_text("before\n", encoding="utf-8")
+    events = [
+        {
+            "kind": "tool_call",
+            "tool_use_id": "e1",
+            "tool": "edit_file",
+            "args": {"path": "app.py", "old": "before", "new": "after"},
+        },
+        {"kind": "tool_result", "tool_use_id": "e1", "tool": "edit_file", "status": "ok"},
+        {
+            "kind": "tool_call",
+            "tool_use_id": "w1",
+            "tool": "write_file",
+            "args": {"path": "new.txt", "content": "fresh\n"},
+        },
+        {"kind": "tool_result", "tool_use_id": "w1", "tool": "write_file", "status": "ok"},
+    ]
+    changes = collect_file_changes(events, 0, workspace_root=tmp_path, pending_priors={"w1": ""})
+    paths = {change.path for change in changes}
+    assert paths == {"app.py", "new.txt"}
+    edit = next(change for change in changes if change.path == "app.py")
+    assert edit.old == "before" and edit.new == "after"
+
+
+def test_chat_ui_turn_output_includes_edit_diff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    from vg_agent import chat_ui
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    buffer = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+    events = [
+        {
+            "kind": "tool_call",
+            "tool_use_id": "e1",
+            "tool": "edit_file",
+            "args": {"path": "app.py", "old": "foo", "new": "bar"},
+        },
+        {"kind": "tool_result", "tool_use_id": "e1", "tool": "edit_file", "status": "ok"},
+    ]
+    assert (
+        chat_ui.print_turn_output(
+            answer="Done.",
+            literal_outputs=[],
+            events=events,
+            start_idx=0,
+            workspace_root=tmp_path,
+        )
+        is True
+    )
+    out = buffer.getvalue()
+    assert "-foo" in out or "-foo\n" in out
+    assert "+bar" in out or "+bar\n" in out
+    assert "app.py" in out
+
+
+def test_progress_sink_prints_edit_diff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vg_agent import __main__ as cli
+
+    captured: list[str] = []
+
+    class FakeConsole:
+        def print(self, *args: object, **kwargs: object) -> None:
+            captured.append(str(args))
+
+    from vg_agent import chat_ui
+
+    monkeypatch.setattr(cli, "use_rich_ui", lambda: True)
+    monkeypatch.setattr(cli, "_console", lambda: FakeConsole())
+    sink = cli._make_progress_sink(turn_state={}, workspace_root=tmp_path)
+    sink(
+        {
+            "kind": "tool_call",
+            "tool_use_id": "e1",
+            "tool": "edit_file",
+            "args": {"path": "x.py", "old": "a", "new": "b"},
+        }
+    )
+    sink({"kind": "tool_result", "tool_use_id": "e1", "tool": "edit_file", "status": "ok"})
+    assert captured
+
+
 def test_chat_slash_new_starts_fresh_trace_and_live_history(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

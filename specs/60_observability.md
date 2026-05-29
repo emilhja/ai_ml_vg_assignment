@@ -30,7 +30,9 @@ Concrete example:
   TTYs: green for normal state, yellow for budget/cap warnings, and red for
   error/abort states. The progress stream uses distinct colors for approvals,
   sub-agent activity, compaction, warnings, and failures; non-TTY output remains
-  plain text.
+  plain text. Rich TTY `--chat` may also print unified-diff panels for successful
+  `edit_file` / `write_file` tools (`specs/16_chat_ui.md`); this is presentation
+  only and does not add JSONL event kinds.
 - Idle TTY chat (`specs/16_chat_ui.md`) does **not** repeat the compact
   statusline before every prompt. Instead a bottom status bar below the input
   shows session counters (updated during runs via throttled progress callbacks);
