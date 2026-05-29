@@ -12,7 +12,9 @@ from typing import Any
 
 DIFF_MAX_LINES = 40
 DIFF_CONTEXT_LINES = 3
-WRITE_EDIT_TOOLS = frozenset({"edit_file", "write_file"})
+_DIFF_PANEL_STYLE = "on black"
+_WRITE_EDIT_TOOLS = frozenset({"edit_file", "write_file"})
+WRITE_EDIT_TOOLS = _WRITE_EDIT_TOOLS
 
 from . import config, tools
 from .budget import BudgetGuard
@@ -554,29 +556,32 @@ def format_unified_diff(
     return lines, truncated
 
 
-def _diff_line_style(line: str) -> str:
-    if line.startswith(("---", "+++", "@@")):
-        return "dim"
-    if line.startswith("-"):
-        return "red"
-    if line.startswith("+"):
-        return "green"
-    return ""
-
-
 def _diff_lines_plain(lines: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _diff_lines_rich(lines: list[str]) -> Any:
-    from rich.console import Group
-    from rich.text import Text
+def _diff_syntax(lines: list[str]) -> Any:
+    """Black-background diff block matching read_file ``Syntax`` tool output."""
+    from rich.syntax import Syntax
 
-    parts: list[Text] = []
-    for index, line in enumerate(lines):
-        style = _diff_line_style(line)
-        parts.append(Text(line + ("\n" if index < len(lines) - 1 else ""), style=style or None))
-    return Group(*parts) if parts else Text("")
+    return Syntax(
+        "\n".join(lines),
+        "diff",
+        word_wrap=True,
+        background_color="black",
+    )
+
+
+def _print_diff_panel(console: Any, lines: list[str], title: str, *, border_style: str = "dim") -> None:
+    if not lines:
+        return
+    from rich.panel import Panel
+
+    if os.environ.get("NO_COLOR"):
+        body: Any = _diff_lines_plain(lines)
+    else:
+        body = _diff_syntax(lines)
+    console.print(Panel(body, title=title, border_style=border_style, style=_DIFF_PANEL_STYLE))
 
 
 def render_diff_to_console(
@@ -591,12 +596,7 @@ def render_diff_to_console(
     lines, _ = format_unified_diff(old, new, path=path)
     if not lines:
         return
-    from rich.panel import Panel
-
-    if os.environ.get("NO_COLOR"):
-        console.print(Panel(_diff_lines_plain(lines), title=title, border_style=border_style))
-    else:
-        console.print(Panel(_diff_lines_rich(lines), title=title, border_style=border_style))
+    _print_diff_panel(console, lines, title, border_style=border_style)
 
 
 def read_prior_workspace_file(workspace_root: Path, rel_path: str) -> str:
@@ -675,14 +675,9 @@ def collect_file_changes(
 
 
 def _render_changes_to_console(console: Any, changes: list[FileChange]) -> None:
-    from rich.panel import Panel
-
     for change in changes:
         lines, _ = format_unified_diff(change.old, change.new, path=change.path)
-        if not lines:
-            continue
-        body = _diff_lines_plain(lines) if os.environ.get("NO_COLOR") else _diff_lines_rich(lines)
-        console.print(Panel(body, title=change.path, border_style="dim"))
+        _print_diff_panel(console, lines, change.path)
 
 
 def print_turn_changes(
@@ -944,9 +939,11 @@ def prompt_approval(
             path = str(request.path or request.args.get("path") or "")
             lines, _ = format_unified_diff(old, new, path=path)
             if lines and not os.environ.get("NO_COLOR"):
+                from rich.panel import Panel
+
                 panel_body = Group(
                     Text(request.summary),
-                    _diff_lines_rich(lines),
+                    Panel(_diff_syntax(lines), border_style="dim", style=_DIFF_PANEL_STYLE),
                     Text(options, style="dim"),
                 )
             elif lines:

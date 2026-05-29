@@ -106,7 +106,9 @@ before the write runs). `tool_result.result_full` stays a short status string.
 
 - `difflib.unified_diff` hunks; default 3 lines of context per hunk.
 - Rich styles when `NO_COLOR` is unset: `-` lines **red**, `+` lines **green**,
-  `---` / `+++` / `@@` headers **dim**.
+  `---` / `+++` / `@@` headers **dim**. Diff content uses a **black** background
+  (`Syntax` with `background_color="black"`, same as multi-line `read_file` tool
+  output) inside a dim-bordered panel.
 - Truncate to **40** diff lines per panel; append a dim footer
   `… N more lines (full edit in trace)` when truncated.
 - Non-TTY / `NO_COLOR`: plain `+`/`-` prefixed lines, no Rich styles.
@@ -155,6 +157,7 @@ When `--require-approval` is not `off` and `use_rich_ui()` is true:
 | Status segments | default white; status token green/yellow/red |
 | Hint line | dim |
 | Approval panel border | cyan |
+| Diff panel background | black (matches `Syntax` tool output) |
 | Diff removals (`-` lines) | red |
 | Diff additions (`+` lines) | green |
 | Diff headers (`@@`, `---`, `+++`) | dim |
