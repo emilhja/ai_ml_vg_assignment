@@ -33,9 +33,13 @@ Concrete example:
   plain text.
 - Idle TTY chat (`specs/16_chat_ui.md`) does **not** repeat the compact
   statusline before every prompt. Instead a bottom status bar below the input
-  shows session counters; `/status` reprints the full dashboard. The compact
-  `_format_chat_statusline` string is still emitted as trace `statusline` events
-  during agent runs.
+  shows session counters (updated during runs via throttled progress callbacks);
+  `/status` reprints the full dashboard. Rich TTY chat does **not** also rewrite
+  a `\r` compact statusline during runs — the bottom bar is the sole live HUD.
+  The compact `format_statusline_compact` string is still emitted as trace
+  `statusline` events during agent runs.
+- `statusline` events include `ctx_tokens` from parent-visible `show_context`
+  and, when configured, `ctx_window` / percentage of model context window.
 - Statusline is also written as a `statusline` JSONL event at every parent
   step boundary so replays can reconstruct the user-visible UI.
 - A non-TTY stderr (CI, piped) writes one line per step with a trailing

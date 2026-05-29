@@ -12,41 +12,81 @@ unaffected.
 ## Layout (top to bottom)
 
 1. **Product label** — `vg-agent` in dim text, left-aligned.
-2. **Welcome panel** — Rich `Panel` with thin accent border:
+2. **Welcome panel** — Rich `Panel` with thin accent border (full dashboard only):
    - Line 1: `* Welcome to VG Agent!` (accent asterisk, bold title).
-   - Line 2: italic dim `/help for commands · /status for your current setup`.
-   - Line 3: `cwd: {short_cwd}` where `short_cwd` tilde-expands `$HOME`.
+   - Line 2: `cwd: {short_cwd}` where `short_cwd` tilde-expands `$HOME`.
+   - After the first completed agent turn, the welcome panel is **not** shown
+     again until `/status`, `/reset`, or `/new` (compact idle chrome).
 3. **Input section** — dim `Rule`, then prompt, then dim `Rule`:
    - Prompt character: `> ` (not `vg>`).
    - Placeholder (empty buffer): `Try "read data/sample.log and summarise auth/"`.
    - Slash-command autocomplete unchanged (`prompt_toolkit` completer).
-4. **Status bar** — one line **below** the bottom rule, pipe-separated segments:
-   - `📁 {workspace_dir_name}` — basename of workspace root.
-   - `🤖 {short_model}` — from latest parent `llm_start` or config default.
+4. **Status bar** — one line **below** the bottom rule, pipe-separated segments
+   built from `SessionStatus` (shared with trace `statusline` events):
+   - `📁 {workspace_dir_name}` or `dir:` when `NO_EMOJI` is set.
+   - `🤖 {short_model}` or `mdl:` — from latest parent `llm_start` or config default.
    - `{mode}` — `live` or `deterministic`.
-   - `ctx {compact} in` — latest parent context token estimate.
+   - `ctx {tokens}` or `ctx {tokens}/{window} ({pct}%)` — parent-visible context
+     token estimate from `show_context`, not raw `llm_start.tokens_in`.
    - `🪙 ${running_usd:.4f}/${max_usd:.2f}` — session spend vs cap.
    - `📊 {steps}/{max_steps} steps`.
-   - `{status_icon} {status}` — `✓ ready` | `⚠ warn` | `✗ error` from
-     `_latest_run_state` and tool-error count.
-5. **Hint line** — dim: `/help for commands · /status to refresh session`.
+   - `{status_icon} {status}` — `✓ ready` | `… running` | `⚠ warn` | `✗ error`.
+5. **Hint line** — dim: `/help for commands · /status to refresh session` (once
+   per screen; not duplicated in the welcome panel).
 6. **Secondary status** (conditional) — only when `final_status ∉ {ok, ready}`
    or `tool_errors > 0`:
-   - `!! {reason} — see progress above` in yellow/cyan accent.
+   - `!! {reason} — see progress above` in yellow accent.
 
 ## Refresh rules
 
 | Event | What reprints |
 |---|---|
-| Session start | Full dashboard (welcome + rules + status bar + hint) |
-| After each agent turn | Status bar + hint (+ secondary if needed) |
+| Session start | Full dashboard (welcome + status bar + hint) |
+| After first turn | Compact chrome (label + status bar + hint) on idle prompts |
+| During agent run | Status bar refresh (throttled) on progress events; `… running` state |
+| After each agent turn | Status bar + hint (+ secondary if needed); `mark_turn_completed()` |
 | `/status` | Full dashboard |
-| `/reset`, `/new` | Full dashboard (new `session_id` on `/new`) |
-| Before each prompt | Top rule only (avoids flicker); bottom rule + status bar after input |
+| `/reset`, `/new` | Full dashboard; `/new` also `reset_dashboard_mode()` |
+| Before each prompt | Top rule only; bottom rule + status bar after input |
 
 Idle chat does **not** repeat the compact one-line statusline before every
-prompt. That string remains the trace `statusline` event payload during agent
-runs only (`specs/60_observability.md`).
+prompt. That string is emitted as trace `statusline` events during agent runs
+(`specs/60_observability.md`). Rich TTY chat does **not** also print a `\r`
+compact statusline during runs (bottom bar is the live HUD).
+
+## Turn output
+
+After each agent turn (not slash commands), when `use_rich_ui()` is true and
+the turn produces a parent answer and/or literal tool outputs:
+
+1. Top dim `Rule` on **stdout**.
+2. **Response** — Rich `Panel` when the parent answer is non-empty.
+3. **Tool output** — optional `Panel` with `Tree` for directory listings or
+   `Syntax` for multi-line file content; skip a literal block when every line
+   already appears in the answer.
+4. Bottom dim `Rule` on **stdout**.
+
+The status bar refresh on stderr follows immediately after the framed block.
+
+Non-TTY chat keeps the current plain single-block stdout write with no rules.
+Slash-command output is never framed.
+
+## Approvals (TTY)
+
+When `--require-approval` is not `off` and `use_rich_ui()` is true:
+
+- Show a cyan-bordered Rich `Panel` on stderr with tool summary and shortcuts:
+  `1/y yes`, `2 yes (scoped)`, `3/a always`, `4/n no`, `5 abort`.
+- Use `prompt_toolkit` for input when available; otherwise numbered menu on stderr.
+- Record `approval` events unchanged; progress stream still logs
+  `[approval] decision=…` after the choice.
+
+## Progress stream
+
+- Optional dim header `── turn N ──` at the start of each user dispatch.
+- `[agent]` lines indented under the header when grouping is enabled.
+- `compaction` and `context_compaction` events may print an extra dim banner
+  (`format_compaction_banner`).
 
 ## Colors (TTY, `NO_COLOR` unset)
 
@@ -54,12 +94,19 @@ runs only (`specs/60_observability.md`).
 |---|---|
 | Welcome border | `rgb(224,122,95)` |
 | Welcome title | bold white |
-| Welcome hints | italic dim |
 | Product label | dim |
 | Rules | dim |
 | Status segments | default white; status token green/yellow/red |
 | Hint line | dim |
-| Progress stream (`[llm]`, `[tool]`) | unchanged from `specs/60_observability.md` |
+| Approval panel border | cyan |
+| Progress stream | unchanged from `specs/60_observability.md` |
+
+## Environment
+
+| Variable | Effect |
+|---|---|
+| `NO_COLOR` | Disable Rich UI (existing). |
+| `NO_EMOJI` | ASCII status prefixes (`dir:`, `mdl:`, `usd:`, `stp:`) instead of emoji. |
 
 ## Non-TTY fallback
 
@@ -67,21 +114,23 @@ runs only (`specs/60_observability.md`).
 - Single line: `VG Agent chat mode. Type /help for commands.`
 - Prompt: `> ` via `input()`; readline history when available.
 - `/status` prints the compact statusline text plus budget counters (no panel).
+- During agent runs, one compact statusline per parent step (newline-terminated).
 
-## Machine-readable statusline (unchanged)
+## Machine-readable statusline
 
-The compact string from `_format_chat_statusline` remains the trace
-`statusline` event payload during agent runs. The TTY status bar is a
-**presentation layer** only; it must not change JSONL schema.
+`build_session_status` + `format_statusline_compact` produce the trace
+`statusline` event `text` field and structured counters (`ctx_tokens`,
+`steps`, `running_tokens`, etc.). The TTY status bar is a **presentation layer**
+only; JSONL schema additions are limited to optional fields on `statusline` events.
 
 ## Dependencies
 
-- `rich>=13` for panels, rules, and styled stderr console.
-- `prompt-toolkit>=3.0` for prompt, history, autocomplete, placeholder.
+- `rich>=13` for panels, rules, tree, syntax, and styled stderr console.
+- `prompt-toolkit>=3.0` for prompt, history, autocomplete, placeholder, approvals.
 
 ## Out of scope
 
-- Git branch / version emoji in status bar (no git integration in v1).
-- Plan-mode indicator (`!! plan mode on`).
+- Git branch / version emoji in status bar.
+- Plan-mode indicator.
 - Streaming partial assistant text into the input area.
 - Vegvisir-style full-width metadata box at startup.

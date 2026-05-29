@@ -1174,6 +1174,37 @@ def test_chat_ui_non_tty_skips_rich(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert cli.use_rich_ui() is False
     assert cli._chat_loop(tmp_path, args) == 0
 
+
+def test_chat_ui_turn_output_framed_on_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    from vg_agent import chat_ui
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    buffer = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+    assert chat_ui.print_turn_output(answer="Hello", literal_outputs=["./auth"]) is True
+    out = buffer.getvalue()
+    assert "Hello" in out
+    assert "./auth" in out
+    assert out.index("\u2500") < out.index("Hello")
+    assert out.index("Hello") < out.rindex("\u2500")
+
+
+def test_chat_ui_turn_output_plain_when_non_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    from vg_agent import chat_ui
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: False)
+    buffer = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+    assert chat_ui.print_turn_output(answer="Hello", literal_outputs=["./auth"]) is True
+    out = buffer.getvalue()
+    assert out == "Hello\n./auth\n"
+    assert "\u2500" not in out
+
+
 def test_chat_slash_new_starts_fresh_trace_and_live_history(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

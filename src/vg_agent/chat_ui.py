@@ -249,6 +249,30 @@ def render_input_bottom_and_footer(
     _write_secondary(console, recorder.events, since_event_idx=since_event_idx)
 
 
+def print_turn_output(*, answer: str, literal_outputs: list[str]) -> bool:
+    """Frame agent answer + literal tool outputs. Returns True if anything printed."""
+    parts: list[str] = []
+    answer_text = answer.strip()
+    if answer_text:
+        parts.append(answer_text)
+    parts.extend(output for output in literal_outputs if output)
+    if not parts:
+        return False
+    text = "\n".join(parts)
+    if use_rich_ui():
+        from rich.console import Console
+        from rich.rule import Rule
+
+        console = Console(file=sys.stdout, highlight=False)
+        console.print(Rule(style="dim"))
+        console.print(text)
+        console.print(Rule(style="dim"))
+    else:
+        sys.stdout.write(text + "\n")
+    sys.stdout.flush()
+    return True
+
+
 def refresh_chat_status_bar(
     *,
     root: Path,

@@ -48,10 +48,15 @@ Non-TTY chat keeps the newline-driven input path used by scripted demos.
 When stdin and stderr are TTYs and `NO_COLOR` is unset, `--chat` renders a
 Claude Code-inspired layout defined in `specs/16_chat_ui.md`:
 
-- Welcome panel with `cwd`, `/help`, and `/status` hints.
+- Welcome panel with `cwd` on session start; compact chrome after the first turn.
 - Framed `> ` prompt with a grey task placeholder.
-- Bottom status bar (model, context, USD, steps, run state) below the input.
-- No repeating compact statusline before every idle prompt.
+- Bottom status bar (model, parent-visible context, USD, steps, run state) below
+  the input; refreshes during agent runs (`… running` while in flight).
+- Rich approval panel on stderr when `--require-approval` is not `off` (see
+  `specs/16_chat_ui.md`); shortcuts `y`/`n`/`a` alias numbered choices.
+- Agent turn answers in a Response panel; directory listings may use a `Tree`.
+- No repeating compact statusline before every idle prompt; trace still records
+  `statusline` events each parent step.
 
 Piped or scripted chat keeps the plain one-line startup message and `> `
 prompt via `input()`.

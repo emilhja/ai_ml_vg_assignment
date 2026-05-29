@@ -32,6 +32,7 @@ from . import config, tools
 from .chat_ui import (
     CHAT_PLACEHOLDER,
     print_chat_dashboard,
+    print_turn_output,
     refresh_chat_status_bar,
     render_input_bottom_and_footer,
     render_input_top_rule,
@@ -773,15 +774,10 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             else:
                 run_task(root, prompt, recorder, policy=policy)
             answer = _latest_parent_answer(recorder.events, start_idx)
-            if answer:
-                sys.stdout.write(answer + "\n")
             literal_outputs = _literal_tool_outputs(recorder.events, start_idx, literal_prompt, answer)
-            for output in literal_outputs:
-                sys.stdout.write(output + "\n")
+            print_turn_output(answer=answer, literal_outputs=literal_outputs)
             for notice in _turn_subagent_failure_notices(recorder.events, start_idx):
                 sys.stderr.write(notice + "\n")
-            if answer or literal_outputs:
-                sys.stdout.flush()
             refresh_chat_status_bar(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=start_idx))
             if not _is_ack_prompt(prompt):
                 last_intent_prompt = prompt
