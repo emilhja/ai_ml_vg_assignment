@@ -184,7 +184,7 @@ def show_context(events: list[dict[str, object]], step_idx: int) -> list[dict[st
         if kind == "user_prompt":
             context.append({"role": "user", "content": event["prompt"]})
         elif kind == "assistant_step":
-            if int(event["step_idx"]) > step_idx:
+            if int(event.get("step_idx") or 0) > step_idx:
                 break
             context.append({
                 "role": "assistant",

@@ -31,11 +31,18 @@ except ImportError:  # pragma: no cover - dependency is optional at runtime fall
 from . import config, tools
 from .chat_ui import (
     CHAT_PLACEHOLDER,
+    build_session_status,
+    emit_session_statusline,
+    format_compaction_banner,
+    format_statusline_compact,
+    mark_turn_completed,
     print_chat_dashboard,
     print_turn_output,
+    prompt_approval,
     refresh_chat_status_bar,
     render_input_bottom_and_footer,
     render_input_top_rule,
+    reset_dashboard_mode,
     use_rich_ui,
 )
 from .agent import BUDGET_CAP_TOOL, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, run_live_task, run_task
@@ -49,6 +56,8 @@ def _stdin_prompt(stream: object | None = None) -> "callable":
     fh = stream if stream is not None else sys.stdin
 
     def ask(request: ApprovalRequest) -> ApprovalOutcome:
+        if use_rich_ui():
+            return prompt_approval(request, input_stream=fh)
         if request.tool == BUDGET_CAP_TOOL:
             sys.stderr.write(f"[approval] budget {request.path}  {request.summary}\n")
         else:
@@ -62,7 +71,7 @@ def _stdin_prompt(stream: object | None = None) -> "callable":
         if not line:
             return ApprovalOutcome(decision="denied", reason="no input")
         choice = line.split()[0]
-        if choice == "1":
+        if choice in {"1", "y", "yes"}:
             return ApprovalOutcome(decision="approved", reason="user yes")
         if choice == "2":
             path = request.path or ""
@@ -77,9 +86,9 @@ def _stdin_prompt(stream: object | None = None) -> "callable":
             else:
                 scope = parent
             return ApprovalOutcome(decision="approved_scoped", scope_key=scope, reason="user yes-folder")
-        if choice == "3":
+        if choice in {"3", "a", "always"}:
             return ApprovalOutcome(decision="approved_always", scope_key="*", reason="user yes-always")
-        if choice == "5":
+        if choice in {"5", "abort"}:
             return ApprovalOutcome(decision="aborted", reason="user abort")
         return ApprovalOutcome(decision="denied", reason="user no")
 
@@ -369,33 +378,17 @@ def _format_chat_statusline(
     live_model: bool,
     since_event_idx: int = 0,
     width: int | None = None,
+    force_state: str | None = None,
 ) -> str:
-    mode = "live" if live_model else "deterministic"
-    latest_llm = _latest_parent_llm_start(recorder.events)
-    model = _short_model((latest_llm or {}).get("model") or config.PARENT_MODEL_ID)
-    context_tokens = int((latest_llm or {}).get("tokens_in") or 0)
-    status = _latest_run_state(recorder.events, since_event_idx=since_event_idx)
-    approval_events = sum(1 for event in recorder.events if event.get("kind") == "approval")
-    session_tool_errors = _tool_error_count(recorder.events)
-    turn_tool_errors = _tool_error_count(recorder.events[since_event_idx:])
-    token_bar = _bar(guard.running_tokens, guard.max_tokens)
-    err_segment = (
-        f"tool errs {turn_tool_errors} turn / {session_tool_errors} session"
-        if turn_tool_errors != session_tool_errors
-        else f"tool errs {session_tool_errors}"
+    status = build_session_status(
+        root=recorder.root,
+        recorder=recorder,
+        guard=guard,
+        live_model=live_model,
+        since_event_idx=since_event_idx,
+        force_state=force_state,
     )
-    line = (
-        f"[{mode}] {model} | ctx {_format_compact_number(context_tokens)} in | "
-        f"run {token_bar} {_format_compact_number(guard.running_tokens)}/{_format_compact_number(guard.max_tokens)} tok | "
-        f"steps {guard.step_count}/{guard.max_steps} | "
-        f"usd ${guard.running_usd:.4f}/${guard.max_usd:.2f} | "
-        f"approvals {approval_events} | {err_segment} | {status}"
-    )
-    if width is None:
-        width = shutil.get_terminal_size((120, 20)).columns
-    if width > 20 and len(line) > width:
-        return line[: max(0, width - 3)] + "..."
-    return line
+    return format_statusline_compact(status, width=width)
 
 
 def _chat_statusline_color(line: str, *, use_color: bool) -> str:
@@ -549,18 +542,40 @@ def _progress_event_color(event: dict[str, object], *, use_color: bool) -> str:
     return "\x1b[90m"
 
 
-def _make_progress_sink(stream: object | None = None) -> "callable":
+def _make_progress_sink(
+    stream: object | None = None,
+    *,
+    on_parent_status: Any = None,
+    turn_state: dict[str, Any] | None = None,
+) -> "callable":
     fh = stream if stream is not None else sys.stderr
     use_color = bool(getattr(fh, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
     reset = "\x1b[0m" if use_color else ""
+    state = turn_state if turn_state is not None else {}
 
     def sink(event: dict[str, object]) -> None:
-        line = _format_progress_event(event)
-        if line is None:
+        kind = event.get("kind")
+        if kind == "statusline":
             return
-        color = _progress_event_color(event, use_color=use_color)
-        fh.write(f"{color}{line}{reset}\n")
-        fh.flush()
+        if kind == "user_prompt":
+            state["turn"] = int(state.get("turn", 0)) + 1
+            if use_color:
+                fh.write(f"\n\x1b[90m── turn {state['turn']} ──\x1b[0m\n")
+            else:
+                fh.write(f"\n── turn {state['turn']} ──\n")
+        banner = format_compaction_banner(event)
+        if banner:
+            fh.write(f"{banner}\n")
+        line = _format_progress_event(event)
+        if line is not None:
+            color = _progress_event_color(event, use_color=use_color)
+            prefix = "  " if kind in {"subagent_spawn", "subagent_return"} else ""
+            fh.write(f"{color}{prefix}{line}{reset}\n")
+            fh.flush()
+        if kind == "assistant_step" and event.get("agent_id") == "parent" and on_parent_status:
+            on_parent_status()
+        elif kind == "run_end" and on_parent_status:
+            on_parent_status()
 
     return sink
 
@@ -686,13 +701,65 @@ def _chat_ui_kwargs(
     }
 
 
+def _report_parent_session_status(
+    root: Path,
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    args: argparse.Namespace,
+    *,
+    since_event_idx: int,
+    force_state: str | None = None,
+) -> None:
+    status = build_session_status(
+        root=root,
+        recorder=recorder,
+        guard=guard,
+        live_model=bool(args.live_model),
+        since_event_idx=since_event_idx,
+        force_state=force_state,
+    )
+    emit_session_statusline(recorder, status)
+    if use_rich_ui():
+        refresh_chat_status_bar(
+            root=root,
+            recorder=recorder,
+            guard=guard,
+            live_model=bool(args.live_model),
+            since_event_idx=since_event_idx,
+            force_state=force_state,
+        )
+    elif bool(getattr(sys.stderr, "isatty", lambda: False)()):
+        line = _chat_statusline_color(
+            format_statusline_compact(status),
+            use_color=not os.environ.get("NO_COLOR"),
+        )
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
+
 def _chat_loop(root: Path, args: argparse.Namespace) -> int:
-    recorder = TraceRecorder(root, redact=not args.no_redact, event_sink=_make_progress_sink())
-    policy = _make_policy(args)
     guard = BudgetGuard.for_workspace(root)
+    turn_state: dict[str, Any] = {"turn": 0}
+    ui_since = 0
+
+    def on_parent_status() -> None:
+        _report_parent_session_status(
+            root,
+            recorder,
+            guard,
+            args,
+            since_event_idx=turn_state.get("since_event_idx", ui_since),
+            force_state=turn_state.get("force_state"),
+        )
+
+    recorder = TraceRecorder(
+        root,
+        redact=not args.no_redact,
+        event_sink=_make_progress_sink(on_parent_status=on_parent_status, turn_state=turn_state),
+    )
+    policy = _make_policy(args)
     history_path = root / ".vg_chat_history"
     read_prompt, save_history = _make_chat_prompt(history_path)
-    ui_since = 0
     if use_rich_ui():
         print_chat_dashboard(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
     else:
@@ -721,7 +788,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 continue
             if prompt == "/status":
                 if use_rich_ui():
-                    print_chat_dashboard(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
+                    print_chat_dashboard(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since), compact=False)
                 else:
                     line = _format_chat_statusline(recorder, guard, live_model=bool(args.live_model))
                     sys.stdout.write(line + "\n")
@@ -736,17 +803,24 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 conversation.clear()
                 last_intent_prompt = ""
                 ui_since = len(recorder.events)
+                reset_dashboard_mode()
                 recorder.emit("session_reset")
                 if use_rich_ui():
-                    print_chat_dashboard(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
+                    print_chat_dashboard(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since), compact=False)
                 continue
             if prompt == "/new":
                 policy.cache.clear()
                 guard = BudgetGuard.for_workspace(root)
                 conversation.clear()
                 last_intent_prompt = ""
-                recorder = TraceRecorder(root, redact=not args.no_redact, event_sink=_make_progress_sink())
                 ui_since = 0
+                reset_dashboard_mode()
+                turn_state["turn"] = 0
+                recorder = TraceRecorder(
+                    root,
+                    redact=not args.no_redact,
+                    event_sink=_make_progress_sink(on_parent_status=on_parent_status, turn_state=turn_state),
+                )
                 recorder.emit("session_new")
                 if use_rich_ui():
                     print_chat_dashboard(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
@@ -763,6 +837,11 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 sys.stdout.write(SLASH_COMMAND_HELP + "\n")
                 continue
             start_idx = len(recorder.events)
+            turn_state["since_event_idx"] = start_idx
+            turn_state["force_state"] = "running"
+            _report_parent_session_status(
+                root, recorder, guard, args, since_event_idx=start_idx, force_state="running"
+            )
             literal_prompt = last_intent_prompt if _is_ack_prompt(prompt) and last_intent_prompt else prompt
             if args.live_model:
                 try:
@@ -773,11 +852,13 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 run_live_task(root, prompt, recorder, client=client, guard=guard, policy=policy, history=conversation)
             else:
                 run_task(root, prompt, recorder, policy=policy)
+            turn_state["force_state"] = None
             answer = _latest_parent_answer(recorder.events, start_idx)
             literal_outputs = _literal_tool_outputs(recorder.events, start_idx, literal_prompt, answer)
             print_turn_output(answer=answer, literal_outputs=literal_outputs)
             for notice in _turn_subagent_failure_notices(recorder.events, start_idx):
                 sys.stderr.write(notice + "\n")
+            mark_turn_completed()
             refresh_chat_status_bar(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=start_idx))
             if not _is_ack_prompt(prompt):
                 last_intent_prompt = prompt

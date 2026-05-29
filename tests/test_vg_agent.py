@@ -482,7 +482,7 @@ def test_live_chat_statusline_shows_context_and_budget(tmp_path: Path) -> None:
 
     line = _format_chat_statusline(recorder, guard, live_model=True, width=200)
     assert "[live]" in line
-    assert "ctx 1.2k in" in line
+    assert "ctx 1.2k" in line
     assert "run #---------" in line
     assert "1.3k/10.0k tok" in line
     assert "steps 1/5" in line
@@ -1118,8 +1118,11 @@ def test_chat_slash_reset_emits_event(tmp_path: Path) -> None:
 
 
 
-def test_chat_ui_status_bar_segments(tmp_path: Path) -> None:
+def test_chat_ui_status_bar_segments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vg_agent import chat_ui
     from vg_agent.chat_ui import build_status_bar_text
+
+    monkeypatch.setattr(chat_ui, "use_emoji", lambda: True)
 
     recorder = TraceRecorder(tmp_path)
     guard = BudgetGuard.for_workspace(tmp_path)
@@ -1140,7 +1143,7 @@ def test_chat_ui_status_bar_segments(tmp_path: Path) -> None:
     assert "\U0001f4c1" in line
     assert "claude-haiku-4.5" in line
     assert "live" in line
-    assert "ctx 4.2k in" in line
+    assert "ctx 4.2k" in line
     assert "\u2713 ready" in line
 
     recorder.emit("tool_result", agent_id="parent", tool="read_file", status="error", result_full="nope")
@@ -1154,6 +1157,51 @@ def test_chat_ui_status_bar_segments(tmp_path: Path) -> None:
     )
     assert "\u2717" in turn_line
     assert "tool_error" in turn_line
+
+
+def test_chat_ui_session_status_emits_statusline(tmp_path: Path) -> None:
+    from vg_agent.chat_ui import build_session_status, emit_session_statusline
+
+    recorder = TraceRecorder(tmp_path)
+    guard = BudgetGuard.for_workspace(tmp_path)
+    recorder.emit("user_prompt", prompt="hello")
+    recorder.emit(
+        "assistant_step",
+        agent_id="parent",
+        step_idx=1,
+        model=config.PARENT_MODEL_ID,
+        tokens_in=100,
+        tokens_out=20,
+        assistant_text="hi",
+        tool_calls=[],
+    )
+    guard.record_model_call(config.PARENT_MODEL_ID, 100, 20)
+    status = build_session_status(
+        root=tmp_path,
+        recorder=recorder,
+        guard=guard,
+        live_model=True,
+    )
+    emit_session_statusline(recorder, status)
+    statuslines = [event for event in recorder.events if event.get("kind") == "statusline"]
+    assert len(statuslines) == 1
+    assert statuslines[0]["text"].startswith("[live]")
+
+
+def test_chat_ui_running_state(tmp_path: Path) -> None:
+    from vg_agent.chat_ui import build_status_bar_text
+
+    recorder = TraceRecorder(tmp_path)
+    guard = BudgetGuard.for_workspace(tmp_path)
+    line = build_status_bar_text(
+        root=tmp_path,
+        recorder=recorder,
+        guard=guard,
+        live_model=True,
+        force_state="running",
+    )
+    assert "running" in line
+    assert "\u2026" in line
 
 
 def test_chat_ui_non_tty_skips_rich(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1232,10 +1280,13 @@ def test_chat_slash_new_starts_fresh_trace_and_live_history(
         recorder.emit("user_prompt", prompt=prompt)
         recorder.emit(
             "assistant_step",
+            agent_id="parent",
+            step_idx=1,
             assistant_text=f"ack {prompt}",
             tool_calls=[],
             stop_reason="end_turn",
         )
+        recorder.emit("run_end", final_status="ok", total_tokens=0, total_cost_usd=0.0, duration_s=0.1)
         return recorder
 
     monkeypatch.setattr(cli, "_make_chat_prompt", lambda _history_path: (read_prompt, lambda: None))
