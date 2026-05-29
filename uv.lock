@@ -2147,6 +2147,7 @@ source = { editable = "." }
 dependencies = [
     { name = "litellm" },
     { name = "prompt-toolkit" },
+    { name = "rich" },
 ]
 
 [package.optional-dependencies]
@@ -2159,6 +2160,7 @@ requires-dist = [
     { name = "litellm", specifier = ">=1.0" },
     { name = "prompt-toolkit", specifier = ">=3.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
+    { name = "rich", specifier = ">=13" },
 ]
 provides-extras = ["dev"]
 

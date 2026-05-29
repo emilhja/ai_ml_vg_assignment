@@ -76,8 +76,9 @@ Sensitive-path denylist (applies to `read_file`, `read_file_range`,
 - `(^|/)\.aws/`, `(^|/)\.ssh/` — credential directories.
 - `(^|/)\.netrc$`, `(^|/)credentials(\.json)?$` — common credential files.
 
-Rejected reads/writes return `tool_result.status = "error"` with reason
-`"sensitive path"` and never touch the filesystem.
+Rejected reads/writes return `tool_result.status = "error"` with a message
+starting with `"sensitive path:"`, a short explanation, and a path-specific
+hint (for example `.env` → use `.env.example`). The filesystem is never touched.
 
 Tool-result size cap:
 

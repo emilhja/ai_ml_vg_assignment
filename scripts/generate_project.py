@@ -240,6 +240,7 @@ class BudgetGuard:
     per_agent_type_model_calls: dict[str, int] = field(default_factory=dict)
     per_agent_type_usd: dict[str, float] = field(default_factory=dict)
     warned: set[str] = field(default_factory=set)
+    wall_clock_extra_s: float = 0.0
     lock: object = field(default_factory=threading.RLock, compare=False, repr=False)
 
     @classmethod
@@ -319,6 +320,26 @@ class BudgetGuard:
             if self.repeat_count >= 3:
                 return BudgetDecision(False, "repetition_abort", {"tool": tool, "args_key": args_key, "repeat_count": self.repeat_count})
             return BudgetDecision(True)
+
+    def extend_cap(self, reason: str, *, once: bool) -> None:
+        """Raise a hard cap after interactive approval."""
+        with self.lock:
+            if reason == "step_cap":
+                self.max_steps = (self.step_count + 1) if once else (self.max_steps + max(5, self.max_steps // 4))
+            elif reason == "token_cap":
+                bump = max(10_000, self.max_tokens // 4)
+                self.max_tokens = (self.running_tokens + bump) if once else (self.max_tokens + bump)
+            elif reason == "usd_cap":
+                bump = max(0.05, self.max_usd * 0.25)
+                self.max_usd = (self.running_usd + bump) if once else (self.max_usd + bump)
+            elif reason == "daily_cap":
+                bump = max(0.25, self.daily_remaining_usd * 0.25) if self.daily_remaining_usd > 0 else 0.5
+                self.daily_remaining_usd += bump
+            elif reason == "timeout":
+                self.wall_clock_extra_s += 60.0 if once else float(config.WALL_CLOCK_TIMEOUT)
+            elif reason == "repetition_abort":
+                self.repeat_count = 0
+                self.last_tool_signature = None
 ''',
     "live_model_client.py": '''"""Generated LiteLLM OpenRouter live-model client."""
 
@@ -686,13 +707,38 @@ def resolve_workspace_path(root: Path, rel_path: str) -> Path:
     return resolved
 
 
+def _sensitive_path_hint(normalized: str) -> str:
+    if re.search(r"(?:^|/)\\.env(?:$|\\.(?!example))", normalized):
+        return "Use '.env.example' for variable names without secret values."
+    if re.search(r"(?:^|/)id_rsa(?:\\..*)?$", normalized) or re.search(
+        r"(?:^|/)id_ed25519(?:\\..*)?$", normalized
+    ):
+        return "SSH private keys cannot be read or written by the agent."
+    if normalized.endswith((".pem", ".key", ".pfx", ".p12")):
+        return "Cryptographic key files are blocked."
+    if re.search(r"(?:^|/)\\.aws/", normalized) or re.search(
+        r"(?:^|/)credentials(?:\\.json)?$", normalized
+    ):
+        return "Cloud credential files are blocked."
+    if re.search(r"(?:^|/)\\.ssh/", normalized):
+        return "SSH credential directories are blocked."
+    if re.search(r"(?:^|/)\\.netrc$", normalized):
+        return "Netrc credential files are blocked."
+    if re.search(r"(?:^|/)\\.vg_daily_spend\\.json$", normalized) or re.search(
+        r"(?:^|/)\\.vg_approvals\\.json$", normalized
+    ):
+        return "Internal governance files are not accessible to the agent."
+    return "Secrets and credentials cannot be read or written by the agent."
+
+
 def validate_sensitive_path(rel_path: str) -> str | None:
     normalized = rel_path.replace("\\\\", "/")
     if normalized.endswith(".env.example") or normalized == ".env.example":
         return None
     for pattern in SENSITIVE_PATH_PATTERNS:
         if pattern.search(normalized):
-            return f"sensitive path {rel_path!r} is on the read/write denylist"
+            hint = _sensitive_path_hint(normalized)
+            return f"sensitive path: cannot access {rel_path!r} - blocked for safety. {hint}"
     return None
 
 
@@ -870,7 +916,7 @@ def run_bash(root: Path, command: str, tool_use_id: str) -> dict[str, object]:
     started = time.perf_counter()
     safety_error = validate_shell_command_for_workspace(root, command)
     if safety_error:
-        return _result(tool_use_id, "run_bash", f"refused unsafe command: {safety_error}", "error", started)
+        return _result(tool_use_id, "run_bash", f"run_bash blocked: {safety_error}", "error", started)
     completed = subprocess.run(["bash", "-c", command], cwd=root, text=True, capture_output=True, timeout=30)
     content = completed.stdout + completed.stderr
     status = "ok" if completed.returncode == 0 else "error"
@@ -1256,6 +1302,7 @@ def _normalise_agent_type(value: object) -> str:
 
 GATED_WRITES = {"write_file", "edit_file", "run_bash", "spawn_subagent", "spawn_subagents"}
 GATED_ALL = {"read_file", "read_file_range"} | GATED_WRITES
+BUDGET_CAP_TOOL = "budget_cap"
 
 
 @dataclass
@@ -1361,6 +1408,24 @@ class ApprovalPolicy:
             self.cache.grant(request.tool, outcome.scope_key)
         elif outcome.decision == "approved_always":
             self.cache.grant(request.tool, "*")
+            outcome.scope_key = "*"
+        return outcome
+
+    def check_budget_cap(self, reason: str, details: dict[str, Any], summary: str) -> ApprovalOutcome:
+        if self.auto_yes:
+            return ApprovalOutcome(decision="auto", reason="auto_yes")
+        if self.prompt is None:
+            return ApprovalOutcome(decision="denied", reason="no interactive prompt available")
+        candidates = [reason, "*"]
+        cached = self.cache.lookup(BUDGET_CAP_TOOL, candidates)
+        if cached is not None:
+            return ApprovalOutcome(decision="approved_scoped", scope_key=cached, reason="budget scope cache hit")
+        request = ApprovalRequest(tool=BUDGET_CAP_TOOL, path=reason, args=details, summary=summary)
+        outcome = self.prompt(request)
+        if outcome.decision == "approved_scoped" and outcome.scope_key is not None:
+            self.cache.grant(BUDGET_CAP_TOOL, outcome.scope_key)
+        elif outcome.decision == "approved_always":
+            self.cache.grant(BUDGET_CAP_TOOL, "*")
             outcome.scope_key = "*"
         return outcome
 
@@ -1600,6 +1665,88 @@ def _record_budget_abort(recorder: TraceRecorder, guard: BudgetGuard, decision: 
     )
 
 
+def _budget_cap_summary(decision: Any) -> str:
+    reason = str(getattr(decision, "budget_reason", None) or "budget")
+    details = dict(getattr(decision, "details", None) or {})
+    if reason == "step_cap":
+        return f"{reason} steps {details.get('steps')}/{details.get('max_steps')}"
+    if reason == "token_cap":
+        return f"{reason} tokens {details.get('tokens')}/{details.get('max_tokens')}"
+    if reason == "usd_cap":
+        return f"{reason} usd {details.get('running_usd')}/{details.get('max_usd', config.MAX_USD_PER_RUN)}"
+    if reason == "daily_cap":
+        return f"{reason} daily_remaining {details.get('daily_remaining_usd')}"
+    if reason == "timeout":
+        return f"{reason} after {details.get('timeout_s', config.WALL_CLOCK_TIMEOUT)}s"
+    if reason == "repetition_abort":
+        return f"{reason} tool={details.get('tool')} repeats={details.get('repeat_count')}"
+    return reason
+
+
+def _emit_budget_approval(recorder: TraceRecorder, decision: Any, outcome: ApprovalOutcome) -> None:
+    reason = str(getattr(decision, "budget_reason", None) or "budget")
+    recorder.emit(
+        "approval",
+        tool_use_id=f"budget-{reason}",
+        tool=BUDGET_CAP_TOOL,
+        args_summary=_budget_cap_summary(decision),
+        decision=outcome.decision,
+        scope_key=outcome.scope_key,
+        reason=outcome.reason,
+        budget_reason=reason,
+    )
+
+
+def _wall_clock_exceeded(started: float, guard: BudgetGuard) -> bool:
+    return time.perf_counter() - started > float(config.WALL_CLOCK_TIMEOUT) + guard.wall_clock_extra_s
+
+
+def _handle_budget_cap(
+    *,
+    policy: ApprovalPolicy,
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    decision: Any,
+    started: float,
+    agent_id: str = "parent",
+    parent_id: str | None = None,
+    agent_type: str = "parent",
+) -> bool:
+    """Return True when the caller should retry after extending a hard cap."""
+    if getattr(decision, "allowed", True):
+        return True
+    reason = str(getattr(decision, "budget_reason", None) or "")
+    if reason.startswith("warn_"):
+        return False
+    summary = _budget_cap_summary(decision)
+    outcome = policy.check_budget_cap(reason, dict(getattr(decision, "details", None) or {}), summary)
+    _emit_budget_approval(recorder, decision, outcome)
+    if outcome.decision in {"approved", "approved_scoped", "approved_always", "auto"}:
+        once = outcome.decision in {"approved", "auto"}
+        guard.extend_cap(reason, once=once)
+        recorder.emit(
+            "budget_event",
+            agent_id=agent_id,
+            parent_id=parent_id,
+            agent_type=agent_type,
+            budget_reason=reason,
+            details={**dict(getattr(decision, "details", None) or {}), "extended": True},
+        )
+        return True
+    if agent_id == "parent":
+        _record_budget_abort(recorder, guard, decision, started)
+    else:
+        recorder.emit(
+            "budget_event",
+            agent_id=agent_id,
+            parent_id=parent_id,
+            agent_type=agent_type,
+            budget_reason=reason,
+            details=getattr(decision, "details", None) or {},
+        )
+    return False
+
+
 def _record_model_error(
     recorder: TraceRecorder,
     guard: BudgetGuard,
@@ -1664,7 +1811,7 @@ def _execute_live_tool(
         command = str(args.get("command") or "")
         safety_error = tools.validate_shell_command_for_workspace(root, command)
         if safety_error:
-            return _result(call.tool_use_id, "run_bash", f"refused unsafe command: {safety_error}", "error", tool_started)
+            return _result(call.tool_use_id, "run_bash", f"run_bash blocked: {safety_error}", "error", tool_started)
 
     if tool_name in policy.gated_tools():
         outcome = policy.check(_request_for(call))
@@ -1682,8 +1829,18 @@ def _execute_live_tool(
         command = str(args.get("command") or "")
         repeat = guard.record_tool_signature("run_bash", command)
         if not repeat.allowed:
-            recorder.emit("budget_event", agent_id=agent_id, parent_id=parent_id, agent_type=agent_type, budget_reason=repeat.budget_reason, details=repeat.details)
-            return _result(call.tool_use_id, "run_bash", f"budget abort: {repeat.budget_reason}", "error", tool_started)
+            if not _handle_budget_cap(
+                policy=policy,
+                recorder=recorder,
+                guard=guard,
+                decision=repeat,
+                started=started,
+                agent_id=agent_id,
+                parent_id=parent_id,
+                agent_type=agent_type,
+            ):
+                return _result(call.tool_use_id, "run_bash", f"budget abort: {repeat.budget_reason}", "error", tool_started)
+            guard.record_tool_signature("run_bash", command)
         return tools.run_bash(root, command, call.tool_use_id)
     if tool_name == "write_file":
         return tools.write_file(root, path, str(args.get("content") or ""), call.tool_use_id)
@@ -1733,16 +1890,37 @@ def _run_live_subagent(
     status = "ok"
 
     for local_step in range(1, config.MAX_SUBAGENT_STEPS + 1):
-        if time.perf_counter() - started > config.WALL_CLOCK_TIMEOUT:
-            recorder.emit("budget_event", agent_id=child_id, parent_id="parent", agent_type=agent_type, budget_reason="timeout", details={"timeout_s": config.WALL_CLOCK_TIMEOUT})
-            status = "timeout"
-            break
+        if _wall_clock_exceeded(started, guard):
+            timeout = type("Decision", (), {"budget_reason": "timeout", "details": {"timeout_s": config.WALL_CLOCK_TIMEOUT}})()
+            if not _handle_budget_cap(
+                policy=policy,
+                recorder=recorder,
+                guard=guard,
+                decision=timeout,
+                started=started,
+                agent_id=child_id,
+                parent_id="parent",
+                agent_type=agent_type,
+            ):
+                status = "timeout"
+                break
+            continue
         expected_in = _estimate_message_tokens(system_prompt, messages)
         decision = guard.before_model_call(model, expected_in, 2048)
         if not decision.allowed:
-            recorder.emit("budget_event", agent_id=child_id, parent_id="parent", agent_type=agent_type, budget_reason=decision.budget_reason, details=decision.details)
-            status = "tool_error"
-            break
+            if not _handle_budget_cap(
+                policy=policy,
+                recorder=recorder,
+                guard=guard,
+                decision=decision,
+                started=started,
+                agent_id=child_id,
+                parent_id="parent",
+                agent_type=agent_type,
+            ):
+                status = "tool_error"
+                break
+            continue
         recorder.emit(
             "llm_start",
             agent_id=child_id,
@@ -1957,15 +2135,17 @@ def run_live_task(
     recorder.emit("user_prompt", prompt=task, live_model=True)
 
     while True:
-        if time.perf_counter() - started > config.WALL_CLOCK_TIMEOUT:
-            decision = type("Decision", (), {"budget_reason": "timeout", "details": {"timeout_s": config.WALL_CLOCK_TIMEOUT}})()
-            _record_budget_abort(recorder, guard, decision, started)
-            return recorder
+        if _wall_clock_exceeded(started, guard):
+            timeout = type("Decision", (), {"budget_reason": "timeout", "details": {"timeout_s": config.WALL_CLOCK_TIMEOUT}})()
+            if not _handle_budget_cap(policy=policy, recorder=recorder, guard=guard, decision=timeout, started=started):
+                return recorder
+            continue
         expected_in = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
         decision = guard.before_model_call(config.PARENT_MODEL_ID, expected_in, 4096)
         if not decision.allowed:
-            _record_budget_abort(recorder, guard, decision, started)
-            return recorder
+            if not _handle_budget_cap(policy=policy, recorder=recorder, guard=guard, decision=decision, started=started):
+                return recorder
+            continue
         recorder.emit(
             "llm_start",
             model=config.PARENT_MODEL_ID,
@@ -2273,6 +2453,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -2293,8 +2474,8 @@ except ImportError:  # pragma: no cover - dependency is optional at runtime fall
     Completion = None
     FileHistory = None
 
-from . import config
-from .agent import ApprovalOutcome, ApprovalPolicy, ApprovalRequest, run_live_task, run_task
+from . import config, tools
+from .agent import BUDGET_CAP_TOOL, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, run_live_task, run_task
 from .live_model_client import LiveModelClient, MissingOpenRouterKey
 from .budget import BudgetGuard
 from .demo_fixture import write_fixture
@@ -2305,8 +2486,14 @@ def _stdin_prompt(stream: object | None = None) -> "callable":
     fh = stream if stream is not None else sys.stdin
 
     def ask(request: ApprovalRequest) -> ApprovalOutcome:
-        sys.stderr.write(f"[approval] {request.tool}  {request.summary}\\n")
-        sys.stderr.write("  1) yes  2) yes (this folder)  3) yes (always)  4) no  5) abort\\n> ")
+        if request.tool == BUDGET_CAP_TOOL:
+            sys.stderr.write(f"[approval] budget {request.path}  {request.summary}\\n")
+        else:
+            sys.stderr.write(f"[approval] {request.tool}  {request.summary}\\n")
+        if request.tool == BUDGET_CAP_TOOL:
+            sys.stderr.write("  1) yes  2) yes (this cap)  3) yes (always)  4) no  5) abort\\n> ")
+        else:
+            sys.stderr.write("  1) yes  2) yes (this folder)  3) yes (always)  4) no  5) abort\\n> ")
         sys.stderr.flush()
         line = fh.readline().strip()
         if not line:
@@ -2368,7 +2555,9 @@ SLASH_COMMANDS = (
     "/show-context",
     "/help",
 )
-SLASH_COMMAND_HELP = " ".join((*SLASH_COMMANDS[:-2], "/show-context N", SLASH_COMMANDS[-1]))
+SLASH_COMMAND_USAGE = {
+    "/show-context": "/show-context N",
+}
 SLASH_COMMAND_META = {
     "/exit": "End chat cleanly",
     "/quit": "Alias for /exit",
@@ -2381,6 +2570,26 @@ SLASH_COMMAND_META = {
     "/show-context": "N: parent step index; default 0",
     "/help": "Show slash command help",
 }
+
+
+def _format_slash_command_help() -> str:
+    lines = ["Slash commands:"]
+    usages = {command: SLASH_COMMAND_USAGE.get(command, command) for command in SLASH_COMMANDS}
+    usage_width = max(len(usage) for usage in usages.values())
+    for command in SLASH_COMMANDS:
+        lines.append(f"  {usages[command]:<{usage_width}}  {SLASH_COMMAND_META[command]}")
+    lines.extend(
+        (
+            "",
+            "Notes:",
+            "  Normal text is sent to the agent as the next task.",
+            "  Interactive terminals autocomplete slash commands after typing /.",
+        )
+    )
+    return "\\n".join(lines)
+
+
+SLASH_COMMAND_HELP = _format_slash_command_help()
 
 
 def _slash_command_completer() -> Any:
@@ -2541,11 +2750,14 @@ def _latest_parent_llm_start(events: list[dict[str, object]]) -> dict[str, objec
     return None
 
 
-def _latest_run_state(events: list[dict[str, object]]) -> str:
-    for event in reversed(events):
+def _latest_run_state(events: list[dict[str, object]], *, since_event_idx: int = 0) -> str:
+    for event in reversed(events[since_event_idx:]):
         kind = event.get("kind")
         if kind == "run_end":
-            return str(event.get("final_status") or "done")
+            final_status = str(event.get("final_status") or "done")
+            if final_status == "tool_error":
+                return "tool_error (turn failed)"
+            return final_status
         if kind == "budget_event":
             return str(event.get("budget_reason") or "budget")
     return "ready"
@@ -2559,27 +2771,56 @@ def _tool_error_count(events: list[dict[str, object]]) -> int:
     )
 
 
+def clarify_tool_error(tool: str, message: str) -> str:
+    """Expand terse tool refusals for CLI display (trace keeps the same text)."""
+    text = str(message or "").strip()
+    if not text:
+        return text
+    if "denylist" in text and "sensitive path" in text:
+        match = re.search(r"'([^']+)'", text)
+        if match:
+            refreshed = tools.validate_sensitive_path(match.group(1))
+            if refreshed:
+                return refreshed
+    if text.startswith("refused unsafe command:"):
+        return "run_bash blocked:" + text[len("refused unsafe command:") :]
+    if text.startswith("approval denied:"):
+        return f"{tool} denied by approval policy:" + text[len("approval denied:") :]
+    if text == "approval aborted by user":
+        return f"{tool} cancelled - approval prompt returned abort"
+    if text.startswith("path ") and "escapes the workspace root" in text:
+        return text.replace("path ", "blocked path ", 1)
+    return text
+
+
 def _format_chat_statusline(
     recorder: TraceRecorder,
     guard: BudgetGuard,
     *,
     live_model: bool,
+    since_event_idx: int = 0,
     width: int | None = None,
 ) -> str:
     mode = "live" if live_model else "deterministic"
     latest_llm = _latest_parent_llm_start(recorder.events)
     model = _short_model((latest_llm or {}).get("model") or config.PARENT_MODEL_ID)
     context_tokens = int((latest_llm or {}).get("tokens_in") or 0)
-    status = _latest_run_state(recorder.events)
+    status = _latest_run_state(recorder.events, since_event_idx=since_event_idx)
     approval_events = sum(1 for event in recorder.events if event.get("kind") == "approval")
-    tool_errors = _tool_error_count(recorder.events)
+    session_tool_errors = _tool_error_count(recorder.events)
+    turn_tool_errors = _tool_error_count(recorder.events[since_event_idx:])
     token_bar = _bar(guard.running_tokens, guard.max_tokens)
+    err_segment = (
+        f"tool errs {turn_tool_errors} turn / {session_tool_errors} session"
+        if turn_tool_errors != session_tool_errors
+        else f"tool errs {session_tool_errors}"
+    )
     line = (
         f"[{mode}] {model} | ctx {_format_compact_number(context_tokens)} in | "
         f"run {token_bar} {_format_compact_number(guard.running_tokens)}/{_format_compact_number(guard.max_tokens)} tok | "
         f"steps {guard.step_count}/{guard.max_steps} | "
         f"usd ${guard.running_usd:.4f}/${guard.max_usd:.2f} | "
-        f"approvals {approval_events} | errors {tool_errors} | {status}"
+        f"approvals {approval_events} | {err_segment} | {status}"
     )
     if width is None:
         width = shutil.get_terminal_size((120, 20)).columns
@@ -2592,7 +2833,7 @@ def _chat_statusline_color(line: str, *, use_color: bool) -> str:
     if not use_color:
         return line
     lowered = line.lower()
-    has_tool_errors = "errors " in lowered and "errors 0" not in lowered
+    has_tool_errors = "tool errs " in lowered and "tool errs 0" not in lowered and "/ 0 session" not in lowered
     if any(marker in lowered for marker in ("tool_error", "model_error", "aborted")) or has_tool_errors:
         color = "\\x1b[31m"
     elif any(marker in lowered for marker in ("warn_", "cap")):
@@ -2602,10 +2843,18 @@ def _chat_statusline_color(line: str, *, use_color: bool) -> str:
     return f"{color}{line}\\x1b[0m"
 
 
-def _print_chat_statusline(recorder: TraceRecorder, guard: BudgetGuard, *, live_model: bool) -> None:
+def _print_chat_statusline(
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    *,
+    live_model: bool,
+    since_event_idx: int = 0,
+) -> None:
     if not live_model:
         return
-    line = _format_chat_statusline(recorder, guard, live_model=live_model)
+    line = _format_chat_statusline(
+        recorder, guard, live_model=live_model, since_event_idx=since_event_idx
+    )
     use_color = bool(getattr(sys.stderr, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
     line = _chat_statusline_color(line, use_color=use_color)
     sys.stderr.write(line + "\\n")
@@ -2656,17 +2905,40 @@ def _format_progress_event(event: dict[str, object]) -> str | None:
             f"[tool] {agent} {event.get('tool')} {event.get('status')} "
             f"tokens={event.get('tokens')} {event.get('latency_ms')}ms"
         )
+        tool_name = str(event.get("tool") or "")
         if event.get("status") != "ok":
-            detail = str(event.get("result_full") or "").strip().replace("\\n", " ")
+            detail = clarify_tool_error(tool_name, str(event.get("result_full") or "")).replace("\\n", " ")
             if detail:
-                line += f": {detail[:180]}"
+                line += f": {detail[:220]}"
+        elif tool_name == "spawn_subagent":
+            try:
+                outcome = json.loads(str(event.get("result_full") or ""))
+            except json.JSONDecodeError:
+                outcome = None
+            if isinstance(outcome, dict) and outcome.get("status") == "tool_error":
+                child = outcome.get("agent_id") or "sub-agent"
+                payload = clarify_tool_error(
+                    tool_name, str(outcome.get("payload") or "sub-agent failed")
+                ).replace("\\n", " ")
+                line += f" (sub-agent {child} failed: {payload[:160]})"
         return line
     if kind == "approval":
         return f"[approval] {event.get('tool')} decision={event.get('decision')} scope={event.get('scope_key')}"
     if kind == "subagent_spawn":
         return f"[agent] spawn {event.get('child_agent_id')} {_short_model(event.get('model'))}"
     if kind == "subagent_return":
-        return f"[agent] return {event.get('child_agent_id')} tokens={event.get('child_total_tokens')} usd={event.get('child_total_cost_usd')}"
+        child = event.get("child_agent_id")
+        line = (
+            f"[agent] return {child} tokens={event.get('child_total_tokens')} "
+            f"usd={event.get('child_total_cost_usd')}"
+        )
+        child_status = str(event.get("status") or "ok")
+        if child_status != "ok":
+            summary = clarify_tool_error(
+                "subagent", str(event.get("summary") or child_status)
+            ).replace("\\n", " ")
+            line += f" status={child_status}: {summary[:180]}"
+        return line
     if kind == "compaction":
         return f"[context] compacted {event.get('before_tokens')} -> {event.get('after_tokens')} tokens"
     if kind == "budget_event":
@@ -2677,7 +2949,13 @@ def _format_progress_event(event: dict[str, object]) -> str | None:
     if kind == "egress_blocked":
         return f"[network] blocked host={event.get('host')}"
     if kind == "run_end":
-        return f"[run] {event.get('final_status')} tokens={event.get('total_tokens')} usd={event.get('total_cost_usd')}"
+        final_status = str(event.get("final_status") or "done")
+        line = f"[run] {final_status} tokens={event.get('total_tokens')} usd={event.get('total_cost_usd')}"
+        if final_status == "tool_error":
+            line += " - a tool was blocked or failed; see [tool] lines above"
+        elif final_status not in {"ok", "done"}:
+            line += f" - run ended with status {final_status}"
+        return line
     return None
 
 
@@ -2780,15 +3058,29 @@ def _literal_tool_outputs(events: list[dict[str, object]], start_idx: int, promp
             continue
         if event.get("tool") not in LITERAL_OUTPUT_TOOLS:
             continue
-        content = str(event.get("result_full") or "").strip()
+        content = clarify_tool_error(str(event.get("tool") or ""), str(event.get("result_full") or "")).strip()
         if not content or (answer_text and content in answer_text):
             continue
         call = calls.get(str(event.get("tool_use_id") or ""), {})
         command = str(call.get("command") or "").strip()
-        label = "Tool output" if event.get("status") == "ok" else "Tool error"
+        label = "Tool output" if event.get("status") == "ok" else "Blocked"
         title = f"{label} ({command}):" if command else f"{label} ({event.get('tool')}):"
         outputs.append(f"{title}\\n{content}")
     return outputs
+
+
+def _turn_subagent_failure_notices(events: list[dict[str, object]], start_idx: int) -> list[str]:
+    notices: list[str] = []
+    for event in events[start_idx:]:
+        if event.get("kind") != "subagent_return":
+            continue
+        child_status = str(event.get("status") or "ok")
+        if child_status == "ok":
+            continue
+        child = event.get("child_agent_id") or "sub-agent"
+        summary = clarify_tool_error("subagent", str(event.get("summary") or child_status))
+        notices.append(f"Sub-agent {child} failed: {summary}")
+    return notices
 
 
 def _latest_run_end_status(events: list[dict[str, object]]) -> str | None:
@@ -2818,7 +3110,12 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
     try:
         while True:
             try:
-                _print_chat_statusline(recorder, guard, live_model=bool(args.live_model))
+                _print_chat_statusline(
+                    recorder,
+                    guard,
+                    live_model=bool(args.live_model),
+                    since_event_idx=len(recorder.events),
+                )
                 prompt = read_prompt().strip()
             except KeyboardInterrupt:
                 recorder.emit("budget_event", budget_reason="user_abort", details={})
@@ -2885,6 +3182,8 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             literal_outputs = _literal_tool_outputs(recorder.events, start_idx, literal_prompt, answer)
             for output in literal_outputs:
                 sys.stdout.write(output + "\\n")
+            for notice in _turn_subagent_failure_notices(recorder.events, start_idx):
+                sys.stderr.write(notice + "\\n")
             if answer or literal_outputs:
                 sys.stdout.flush()
             if not _is_ack_prompt(prompt):

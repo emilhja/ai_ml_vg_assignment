@@ -275,7 +275,7 @@ def test_run_bash_rejects_dangerous_commands(tmp_path: Path) -> None:
 
     result = run_bash(tmp_path, "rm -rf .", "unsafe-rm")
     assert result["status"] == "error"
-    assert "refused unsafe command" in str(result["result_full"])
+    assert "run_bash blocked" in str(result["result_full"])
     assert victim.exists()
 
     delete_me = tmp_path / "delete-me.txt"
@@ -334,7 +334,9 @@ def test_file_tools_reject_path_traversal(tmp_path: Path) -> None:
     (tmp_path / ".aws" / "credentials").write_text("creds", encoding="utf-8")
 
     assert read_file(tmp_path, ".env", "r1")["status"] == "error"
-    assert "sensitive path" in str(read_file(tmp_path, ".env", "r1")["result_full"])
+    env_error = str(read_file(tmp_path, ".env", "r1")["result_full"])
+    assert "sensitive path" in env_error
+    assert ".env.example" in env_error
     assert read_file(tmp_path, "secrets/id_rsa", "r2")["status"] == "error"
     assert read_file(tmp_path, "app.pem", "r3")["status"] == "error"
     assert read_file(tmp_path, ".aws/credentials", "r4")["status"] == "error"
@@ -363,6 +365,30 @@ def test_live_loop_budget_abort_before_client_call(tmp_path: Path) -> None:
     assert events[-2]["kind"] == "budget_event"
     assert events[-2]["budget_reason"] == "step_cap"
     assert events[-1]["final_status"] == "aborted"
+
+
+def test_live_loop_budget_cap_approval_extends_steps(tmp_path: Path) -> None:
+    client = FakeClient(
+        [
+            ModelTurn("done", input_tokens=10, output_tokens=5),
+        ]
+    )
+    recorder = TraceRecorder(tmp_path)
+
+    def approve_once(request: ApprovalRequest) -> ApprovalOutcome:
+        assert request.tool == "budget_cap"
+        assert request.path == "step_cap"
+        return ApprovalOutcome(decision="approved", reason="test yes")
+
+    policy = ApprovalPolicy(mode="writes", prompt=approve_once)
+    guard = BudgetGuard(max_steps=0)
+    run_live_task(tmp_path, "do work", recorder, client=client, guard=guard, policy=policy)
+    events = read_events(recorder.path)
+    assert len(client.calls) == 1
+    approvals = [e for e in events if e.get("kind") == "approval" and e.get("tool") == "budget_cap"]
+    assert len(approvals) == 1
+    assert approvals[0]["decision"] == "approved"
+    assert events[-1]["final_status"] == "ok"
 
 
 def test_parent_has_no_write_tools_and_coder_is_sole_mutation_path(tmp_path: Path) -> None:
@@ -461,7 +487,7 @@ def test_live_chat_statusline_shows_context_and_budget(tmp_path: Path) -> None:
     assert "1.3k/10.0k tok" in line
     assert "steps 1/5" in line
     assert "usd $" in line
-    assert "errors 0" in line
+    assert "tool errs 0" in line
     assert _chat_statusline_color(line, use_color=True).startswith("\x1b[32m[live]")
     assert _chat_statusline_color(line, use_color=True).endswith("\x1b[0m")
 
@@ -473,7 +499,7 @@ def test_live_chat_statusline_shows_context_and_budget(tmp_path: Path) -> None:
         status="error",
     )
     error_line = _format_chat_statusline(recorder, guard, live_model=True, width=200)
-    assert "errors 1" in error_line
+    assert "tool errs 1" in error_line
     assert _chat_statusline_color(error_line, use_color=True).startswith("\x1b[31m[live]")
 
 
@@ -499,7 +525,10 @@ def test_chat_slash_command_completer_matches_prefixes() -> None:
     assert list(completer.get_completions(Document(" "), CompleteEvent())) == []
     assert list(completer.get_completions(Document("hello "), CompleteEvent())) == []
     assert list(completer.get_completions(Document("/show-context "), CompleteEvent())) == []
+    assert SLASH_COMMAND_HELP.startswith("Slash commands:\n")
     assert "/show-context N" in SLASH_COMMAND_HELP
+    assert "Show steps, tokens, USD, and daily remaining" in SLASH_COMMAND_HELP
+    assert "Normal text is sent to the agent as the next task." in SLASH_COMMAND_HELP
 
 
 def test_live_explorer_context_excludes_child_intermediate_results(tmp_path: Path) -> None:
@@ -1019,9 +1048,13 @@ def test_literal_tool_output_includes_read_errors(tmp_path: Path) -> None:
     from vg_agent.__main__ import _format_progress_event, _literal_tool_outputs, _progress_event_color
 
     outputs = _literal_tool_outputs(recorder.events, 0, "read .env", "I could not read that file.")
-    assert outputs == ["Tool error (read_file):\nsensitive path '.env' is on the read/write denylist"]
+    assert outputs
+    assert outputs[0].startswith("Blocked (read_file):\n")
+    assert ".env.example" in outputs[0]
     tool_event = next(event for event in recorder.events if event["kind"] == "tool_result")
-    assert "sensitive path" in str(_format_progress_event(tool_event))
+    progress = str(_format_progress_event(tool_event))
+    assert "sensitive path" in progress
+    assert ".env.example" in progress
     assert _progress_event_color(tool_event, use_color=True) == "\x1b[31m"
 
 

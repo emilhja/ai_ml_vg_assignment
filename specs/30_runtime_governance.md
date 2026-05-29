@@ -67,10 +67,11 @@ Compaction events:
 
 Approval events:
 
-- `approval` events are emitted *before* a gated tool runs. Fields:
-  `tool_use_id`, `tool`, `args_summary`, `decision` ∈ {`approved`,
-  `approved_scoped`, `approved_always`, `denied`, `aborted`, `auto`},
-  `scope_key` (resolved cache key), `reason` (free text).
+- `approval` events are emitted *before* a gated tool runs, and also when a
+  hard budget cap would abort an interactive run (`tool="budget_cap"`,
+  optional `budget_reason`). Fields: `tool_use_id`, `tool`, `args_summary`,
+  `decision` ∈ {`approved`, `approved_scoped`, `approved_always`, `denied`,
+  `aborted`, `auto`}, `scope_key` (resolved cache key), `reason` (free text).
 - Approval decisions never bypass the deny-list or the sensitive-path
   denylist. A scoped grant for `edit_file` does not allow editing `.env`.
 

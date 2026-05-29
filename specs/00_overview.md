@@ -50,5 +50,6 @@ Execution model:
   prove caps, parallelism, safety, and context behavior. Live OpenRouter runs
   are optional polish, not the only way to satisfy a rubric item.
 - Source-of-truth and CLI details live in
-  `specs/05_source_of_truth_and_generation.md` and
-  `specs/15_cli_contract.md`.
+  `specs/05_source_of_truth_and_generation.md`,
+  `specs/15_cli_contract.md`, and
+  `specs/16_chat_ui.md` (interactive TTY chat layout).

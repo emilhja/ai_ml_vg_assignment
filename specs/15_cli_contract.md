@@ -30,7 +30,7 @@ model step.
 | `/exit` | End the chat process cleanly. |
 | `/quit` | Alias for `/exit`. |
 | `/budget` | Print the current session budget counters: steps, tokens, USD spend, and daily remaining USD. |
-| `/status` | Print the same compact chat statusline on demand, including mode, model, context estimate, token/step usage, USD spend, approval count, and latest run state. |
+| `/status` | In TTY chat, reprint the full session dashboard (welcome panel + status bar). In non-TTY chat, print the compact statusline plus budget counters. See `specs/16_chat_ui.md`. |
 | `/finops` | Print a per-agent-type FinOps table for the session, including input/output/total tokens, model-call count, tool-call count, and USD spend. |
 | `/approvals` | Print the session approval history and any cached reusable approval scopes. |
 | `/reset` | Clear cached approval scopes, reset the session budget guard, clear conversation history, and emit a `session_reset` trace event. |
@@ -42,6 +42,19 @@ Interactive TTY chat provides arrow-key autocomplete only while the current
 input starts with a slash command token, and completions include short command
 and parameter help.
 Non-TTY chat keeps the newline-driven input path used by scripted demos.
+
+## Interactive chat (TTY)
+
+When stdin and stderr are TTYs and `NO_COLOR` is unset, `--chat` renders a
+Claude Code-inspired layout defined in `specs/16_chat_ui.md`:
+
+- Welcome panel with `cwd`, `/help`, and `/status` hints.
+- Framed `> ` prompt with a grey task placeholder.
+- Bottom status bar (model, context, USD, steps, run state) below the input.
+- No repeating compact statusline before every idle prompt.
+
+Piped or scripted chat keeps the plain one-line startup message and `> `
+prompt via `input()`.
 
 For direct read-style prompts (`read`, `show`, `cat`, `list`, `pwd`, etc.),
 chat prints the parent tool output after the assistant answer when the answer

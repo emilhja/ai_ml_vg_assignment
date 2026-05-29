@@ -36,6 +36,13 @@ Approval policy:
 - Scoped grants never override the command deny-list or the sensitive-path
   denylist. Granting `edit_file` for the workspace root does not let
   `.env` through.
+- When an interactive approval prompt is configured (`--require-approval`
+  `writes|all` without `--yes`), hitting a **hard** budget cap (`step_cap`,
+  `token_cap`, `usd_cap`, `daily_cap`, `timeout`, `repetition_abort`) pauses
+  the run with the same five-choice menu as tool approval (`budget_cap` in
+  the trace). Approving extends the relevant cap for one more step or for
+  the session (scoped to that cap type or always). Deny/abort ends the run
+  with `run_end{final_status:"aborted"}`.
 
 Injection defense:
 
@@ -75,6 +82,8 @@ Replay mode:
 
 Interactive chat mode:
 
+- TTY presentation (welcome panel, framed `> ` prompt, bottom status bar) is
+  defined in `specs/16_chat_ui.md`.
 - `--chat` opens a REPL serving multiple user turns from one process. The
   `BudgetGuard`, `ApprovalScopeCache`, **conversation history**, and JSONL
   trace persist across turns for the life of the session under a single

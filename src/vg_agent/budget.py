@@ -91,6 +91,7 @@ class BudgetGuard:
     per_agent_type_model_calls: dict[str, int] = field(default_factory=dict)
     per_agent_type_usd: dict[str, float] = field(default_factory=dict)
     warned: set[str] = field(default_factory=set)
+    wall_clock_extra_s: float = 0.0
     lock: object = field(default_factory=threading.RLock, compare=False, repr=False)
 
     @classmethod
@@ -170,3 +171,23 @@ class BudgetGuard:
             if self.repeat_count >= 3:
                 return BudgetDecision(False, "repetition_abort", {"tool": tool, "args_key": args_key, "repeat_count": self.repeat_count})
             return BudgetDecision(True)
+
+    def extend_cap(self, reason: str, *, once: bool) -> None:
+        """Raise a hard cap after interactive approval."""
+        with self.lock:
+            if reason == "step_cap":
+                self.max_steps = (self.step_count + 1) if once else (self.max_steps + max(5, self.max_steps // 4))
+            elif reason == "token_cap":
+                bump = max(10_000, self.max_tokens // 4)
+                self.max_tokens = (self.running_tokens + bump) if once else (self.max_tokens + bump)
+            elif reason == "usd_cap":
+                bump = max(0.05, self.max_usd * 0.25)
+                self.max_usd = (self.running_usd + bump) if once else (self.max_usd + bump)
+            elif reason == "daily_cap":
+                bump = max(0.25, self.daily_remaining_usd * 0.25) if self.daily_remaining_usd > 0 else 0.5
+                self.daily_remaining_usd += bump
+            elif reason == "timeout":
+                self.wall_clock_extra_s += 60.0 if once else float(config.WALL_CLOCK_TIMEOUT)
+            elif reason == "repetition_abort":
+                self.repeat_count = 0
+                self.last_tool_signature = None

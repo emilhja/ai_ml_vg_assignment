@@ -31,6 +31,11 @@ Concrete example:
   error/abort states. The progress stream uses distinct colors for approvals,
   sub-agent activity, compaction, warnings, and failures; non-TTY output remains
   plain text.
+- Idle TTY chat (`specs/16_chat_ui.md`) does **not** repeat the compact
+  statusline before every prompt. Instead a bottom status bar below the input
+  shows session counters; `/status` reprints the full dashboard. The compact
+  `_format_chat_statusline` string is still emitted as trace `statusline` events
+  during agent runs.
 - Statusline is also written as a `statusline` JSONL event at every parent
   step boundary so replays can reconstruct the user-visible UI.
 - A non-TTY stderr (CI, piped) writes one line per step with a trailing

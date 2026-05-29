@@ -57,13 +57,38 @@ def resolve_workspace_path(root: Path, rel_path: str) -> Path:
     return resolved
 
 
+def _sensitive_path_hint(normalized: str) -> str:
+    if re.search(r"(?:^|/)\.env(?:$|\.(?!example))", normalized):
+        return "Use '.env.example' for variable names without secret values."
+    if re.search(r"(?:^|/)id_rsa(?:\..*)?$", normalized) or re.search(
+        r"(?:^|/)id_ed25519(?:\..*)?$", normalized
+    ):
+        return "SSH private keys cannot be read or written by the agent."
+    if normalized.endswith((".pem", ".key", ".pfx", ".p12")):
+        return "Cryptographic key files are blocked."
+    if re.search(r"(?:^|/)\.aws/", normalized) or re.search(
+        r"(?:^|/)credentials(?:\.json)?$", normalized
+    ):
+        return "Cloud credential files are blocked."
+    if re.search(r"(?:^|/)\.ssh/", normalized):
+        return "SSH credential directories are blocked."
+    if re.search(r"(?:^|/)\.netrc$", normalized):
+        return "Netrc credential files are blocked."
+    if re.search(r"(?:^|/)\.vg_daily_spend\.json$", normalized) or re.search(
+        r"(?:^|/)\.vg_approvals\.json$", normalized
+    ):
+        return "Internal governance files are not accessible to the agent."
+    return "Secrets and credentials cannot be read or written by the agent."
+
+
 def validate_sensitive_path(rel_path: str) -> str | None:
     normalized = rel_path.replace("\\", "/")
     if normalized.endswith(".env.example") or normalized == ".env.example":
         return None
     for pattern in SENSITIVE_PATH_PATTERNS:
         if pattern.search(normalized):
-            return f"sensitive path {rel_path!r} is on the read/write denylist"
+            hint = _sensitive_path_hint(normalized)
+            return f"sensitive path: cannot access {rel_path!r} - blocked for safety. {hint}"
     return None
 
 
@@ -241,7 +266,7 @@ def run_bash(root: Path, command: str, tool_use_id: str) -> dict[str, object]:
     started = time.perf_counter()
     safety_error = validate_shell_command_for_workspace(root, command)
     if safety_error:
-        return _result(tool_use_id, "run_bash", f"refused unsafe command: {safety_error}", "error", started)
+        return _result(tool_use_id, "run_bash", f"run_bash blocked: {safety_error}", "error", started)
     completed = subprocess.run(["bash", "-c", command], cwd=root, text=True, capture_output=True, timeout=30)
     content = completed.stdout + completed.stderr
     status = "ok" if completed.returncode == 0 else "error"

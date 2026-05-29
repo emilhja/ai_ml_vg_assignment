@@ -160,7 +160,7 @@ the customer hasn't built the image. The in-process gates are the contract.
 | Scenario | Command | What you should see |
 | --- | --- | --- |
 | Path escape | `python -m vg_agent --task "read ../../etc/passwd"` | tool error "path … escapes the workspace root" |
-| Sensitive read | `python -m vg_agent --task "read .env"` | tool error "sensitive path … is on the read/write denylist" |
+| Sensitive read | `python -m vg_agent --task "read .env"` | tool error starting with `sensitive path:` and hint to use `.env.example` |
 | Destructive shell | `python -m vg_agent --task "run rm -rf ."` | "destructive token 'rm' is not allowed" |
 | `find -delete` | `python -m vg_agent --task "run find . -delete"` | "forbidden argument token '-delete' is not allowed" |
 | Approval prompt | `--require-approval writes` on a rename task | five-choice menu before the edit |

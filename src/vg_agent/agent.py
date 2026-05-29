@@ -51,6 +51,7 @@ def _normalise_agent_type(value: object) -> str:
 
 GATED_WRITES = {"write_file", "edit_file", "run_bash", "spawn_subagent", "spawn_subagents"}
 GATED_ALL = {"read_file", "read_file_range"} | GATED_WRITES
+BUDGET_CAP_TOOL = "budget_cap"
 
 
 @dataclass
@@ -156,6 +157,24 @@ class ApprovalPolicy:
             self.cache.grant(request.tool, outcome.scope_key)
         elif outcome.decision == "approved_always":
             self.cache.grant(request.tool, "*")
+            outcome.scope_key = "*"
+        return outcome
+
+    def check_budget_cap(self, reason: str, details: dict[str, Any], summary: str) -> ApprovalOutcome:
+        if self.auto_yes:
+            return ApprovalOutcome(decision="auto", reason="auto_yes")
+        if self.prompt is None:
+            return ApprovalOutcome(decision="denied", reason="no interactive prompt available")
+        candidates = [reason, "*"]
+        cached = self.cache.lookup(BUDGET_CAP_TOOL, candidates)
+        if cached is not None:
+            return ApprovalOutcome(decision="approved_scoped", scope_key=cached, reason="budget scope cache hit")
+        request = ApprovalRequest(tool=BUDGET_CAP_TOOL, path=reason, args=details, summary=summary)
+        outcome = self.prompt(request)
+        if outcome.decision == "approved_scoped" and outcome.scope_key is not None:
+            self.cache.grant(BUDGET_CAP_TOOL, outcome.scope_key)
+        elif outcome.decision == "approved_always":
+            self.cache.grant(BUDGET_CAP_TOOL, "*")
             outcome.scope_key = "*"
         return outcome
 
@@ -395,6 +414,88 @@ def _record_budget_abort(recorder: TraceRecorder, guard: BudgetGuard, decision: 
     )
 
 
+def _budget_cap_summary(decision: Any) -> str:
+    reason = str(getattr(decision, "budget_reason", None) or "budget")
+    details = dict(getattr(decision, "details", None) or {})
+    if reason == "step_cap":
+        return f"{reason} steps {details.get('steps')}/{details.get('max_steps')}"
+    if reason == "token_cap":
+        return f"{reason} tokens {details.get('tokens')}/{details.get('max_tokens')}"
+    if reason == "usd_cap":
+        return f"{reason} usd {details.get('running_usd')}/{details.get('max_usd', config.MAX_USD_PER_RUN)}"
+    if reason == "daily_cap":
+        return f"{reason} daily_remaining {details.get('daily_remaining_usd')}"
+    if reason == "timeout":
+        return f"{reason} after {details.get('timeout_s', config.WALL_CLOCK_TIMEOUT)}s"
+    if reason == "repetition_abort":
+        return f"{reason} tool={details.get('tool')} repeats={details.get('repeat_count')}"
+    return reason
+
+
+def _emit_budget_approval(recorder: TraceRecorder, decision: Any, outcome: ApprovalOutcome) -> None:
+    reason = str(getattr(decision, "budget_reason", None) or "budget")
+    recorder.emit(
+        "approval",
+        tool_use_id=f"budget-{reason}",
+        tool=BUDGET_CAP_TOOL,
+        args_summary=_budget_cap_summary(decision),
+        decision=outcome.decision,
+        scope_key=outcome.scope_key,
+        reason=outcome.reason,
+        budget_reason=reason,
+    )
+
+
+def _wall_clock_exceeded(started: float, guard: BudgetGuard) -> bool:
+    return time.perf_counter() - started > float(config.WALL_CLOCK_TIMEOUT) + guard.wall_clock_extra_s
+
+
+def _handle_budget_cap(
+    *,
+    policy: ApprovalPolicy,
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    decision: Any,
+    started: float,
+    agent_id: str = "parent",
+    parent_id: str | None = None,
+    agent_type: str = "parent",
+) -> bool:
+    """Return True when the caller should retry after extending a hard cap."""
+    if getattr(decision, "allowed", True):
+        return True
+    reason = str(getattr(decision, "budget_reason", None) or "")
+    if reason.startswith("warn_"):
+        return False
+    summary = _budget_cap_summary(decision)
+    outcome = policy.check_budget_cap(reason, dict(getattr(decision, "details", None) or {}), summary)
+    _emit_budget_approval(recorder, decision, outcome)
+    if outcome.decision in {"approved", "approved_scoped", "approved_always", "auto"}:
+        once = outcome.decision in {"approved", "auto"}
+        guard.extend_cap(reason, once=once)
+        recorder.emit(
+            "budget_event",
+            agent_id=agent_id,
+            parent_id=parent_id,
+            agent_type=agent_type,
+            budget_reason=reason,
+            details={**dict(getattr(decision, "details", None) or {}), "extended": True},
+        )
+        return True
+    if agent_id == "parent":
+        _record_budget_abort(recorder, guard, decision, started)
+    else:
+        recorder.emit(
+            "budget_event",
+            agent_id=agent_id,
+            parent_id=parent_id,
+            agent_type=agent_type,
+            budget_reason=reason,
+            details=getattr(decision, "details", None) or {},
+        )
+    return False
+
+
 def _record_model_error(
     recorder: TraceRecorder,
     guard: BudgetGuard,
@@ -459,7 +560,7 @@ def _execute_live_tool(
         command = str(args.get("command") or "")
         safety_error = tools.validate_shell_command_for_workspace(root, command)
         if safety_error:
-            return _result(call.tool_use_id, "run_bash", f"refused unsafe command: {safety_error}", "error", tool_started)
+            return _result(call.tool_use_id, "run_bash", f"run_bash blocked: {safety_error}", "error", tool_started)
 
     if tool_name in policy.gated_tools():
         outcome = policy.check(_request_for(call))
@@ -477,8 +578,18 @@ def _execute_live_tool(
         command = str(args.get("command") or "")
         repeat = guard.record_tool_signature("run_bash", command)
         if not repeat.allowed:
-            recorder.emit("budget_event", agent_id=agent_id, parent_id=parent_id, agent_type=agent_type, budget_reason=repeat.budget_reason, details=repeat.details)
-            return _result(call.tool_use_id, "run_bash", f"budget abort: {repeat.budget_reason}", "error", tool_started)
+            if not _handle_budget_cap(
+                policy=policy,
+                recorder=recorder,
+                guard=guard,
+                decision=repeat,
+                started=started,
+                agent_id=agent_id,
+                parent_id=parent_id,
+                agent_type=agent_type,
+            ):
+                return _result(call.tool_use_id, "run_bash", f"budget abort: {repeat.budget_reason}", "error", tool_started)
+            guard.record_tool_signature("run_bash", command)
         return tools.run_bash(root, command, call.tool_use_id)
     if tool_name == "write_file":
         return tools.write_file(root, path, str(args.get("content") or ""), call.tool_use_id)
@@ -528,16 +639,37 @@ def _run_live_subagent(
     status = "ok"
 
     for local_step in range(1, config.MAX_SUBAGENT_STEPS + 1):
-        if time.perf_counter() - started > config.WALL_CLOCK_TIMEOUT:
-            recorder.emit("budget_event", agent_id=child_id, parent_id="parent", agent_type=agent_type, budget_reason="timeout", details={"timeout_s": config.WALL_CLOCK_TIMEOUT})
-            status = "timeout"
-            break
+        if _wall_clock_exceeded(started, guard):
+            timeout = type("Decision", (), {"budget_reason": "timeout", "details": {"timeout_s": config.WALL_CLOCK_TIMEOUT}})()
+            if not _handle_budget_cap(
+                policy=policy,
+                recorder=recorder,
+                guard=guard,
+                decision=timeout,
+                started=started,
+                agent_id=child_id,
+                parent_id="parent",
+                agent_type=agent_type,
+            ):
+                status = "timeout"
+                break
+            continue
         expected_in = _estimate_message_tokens(system_prompt, messages)
         decision = guard.before_model_call(model, expected_in, 2048)
         if not decision.allowed:
-            recorder.emit("budget_event", agent_id=child_id, parent_id="parent", agent_type=agent_type, budget_reason=decision.budget_reason, details=decision.details)
-            status = "tool_error"
-            break
+            if not _handle_budget_cap(
+                policy=policy,
+                recorder=recorder,
+                guard=guard,
+                decision=decision,
+                started=started,
+                agent_id=child_id,
+                parent_id="parent",
+                agent_type=agent_type,
+            ):
+                status = "tool_error"
+                break
+            continue
         recorder.emit(
             "llm_start",
             agent_id=child_id,
@@ -752,15 +884,17 @@ def run_live_task(
     recorder.emit("user_prompt", prompt=task, live_model=True)
 
     while True:
-        if time.perf_counter() - started > config.WALL_CLOCK_TIMEOUT:
-            decision = type("Decision", (), {"budget_reason": "timeout", "details": {"timeout_s": config.WALL_CLOCK_TIMEOUT}})()
-            _record_budget_abort(recorder, guard, decision, started)
-            return recorder
+        if _wall_clock_exceeded(started, guard):
+            timeout = type("Decision", (), {"budget_reason": "timeout", "details": {"timeout_s": config.WALL_CLOCK_TIMEOUT}})()
+            if not _handle_budget_cap(policy=policy, recorder=recorder, guard=guard, decision=timeout, started=started):
+                return recorder
+            continue
         expected_in = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
         decision = guard.before_model_call(config.PARENT_MODEL_ID, expected_in, 4096)
         if not decision.allowed:
-            _record_budget_abort(recorder, guard, decision, started)
-            return recorder
+            if not _handle_budget_cap(policy=policy, recorder=recorder, guard=guard, decision=decision, started=started):
+                return recorder
+            continue
         recorder.emit(
             "llm_start",
             model=config.PARENT_MODEL_ID,
