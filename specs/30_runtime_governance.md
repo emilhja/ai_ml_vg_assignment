@@ -111,8 +111,8 @@ Daily spend persistence:
 SQLite observability persistence:
 
 - `TraceRecorder` mirrors every redacted JSONL event into
-  `SQLITE_TRACE_DB`. JSONL remains the replay source; SQLite is the dashboard
-  query store.
+  `SQLITE_TRACE_DB`. JSONL remains the canonical audit source; SQLite is the
+  dashboard query store.
 - SQLite stores the lossless event payload and derived rollup tables for
   sessions, runs, turns, model calls, tool calls, sub-agents, approvals,
   redactions, and compactions.
@@ -128,9 +128,8 @@ Approval cache persistence (opt-in):
 Execution safety:
 
 - Docker is the **primary execution boundary** for demos
-  (`specs/50_packaging.md`). `docker-compose.yml` defines two services:
-  `vg-agent` with `network_mode: none` (replay and non-live runs) and
-  `vg-agent-live` with bridged network for OpenRouter live demos.
+  (`specs/50_packaging.md`). `docker-compose.yml` defines a single
+  `vg-agent` service with bridged network for OpenRouter live runs.
 - Mandatory container flags applied by `docker-compose.yml`:
   `cap_drop: [ALL]`, `security_opt: [no-new-privileges]`, `pids_limit: 128`,
   non-root user `vg`.
@@ -138,18 +137,15 @@ Execution safety:
   deny destructive commands before execution; the sensitive-path denylist
   must hold for every file tool. Unit tests run without Docker and assert
   every in-process safety property.
-- `--network none` is incompatible with `--live-model`; the
-  `vg-agent-live` service therefore allows bridged egress while the egress
-  pin (`OPENROUTER_ENDPOINT_HOST`) refuses any non-OpenRouter host. An HTTPS
-  proxy bridge that would allow `--network none` + `--live-model`
-  simultaneously is documented as future work in `dev_docs/dangerous_cli.md`.
+- The bridged egress is constrained by the in-process egress pin
+  (`OPENROUTER_ENDPOINT_HOST`), which refuses any non-OpenRouter host before a
+  socket opens.
 - The `./workspace` bind mount is read-write so the agent can edit fixture
   files; the host repo itself is never mounted into the container.
-- Live tests must use fake clients; unit tests must not call external APIs.
-- Deterministic replay/fake-client evidence is the primary grading proof for
-  hard caps, safety, and parallel trace shape. Live OpenRouter runs are useful
-  presentation evidence but must not be the only proof of a critical rubric
-  item.
+- Unit tests must use fake clients and must not call external APIs.
+- The live demo is the grading proof. Unit tests reproduce the same hard caps,
+  safety, and parallel trace shape against an injected fake client so the
+  behaviors are verifiable in CI without the network.
 
 Prompt injection:
 

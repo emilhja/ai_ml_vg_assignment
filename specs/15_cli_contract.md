@@ -9,15 +9,17 @@ python -m vg_agent
 Docker services use the same entrypoint through Compose. Local `uv run` is a
 developer convenience only; grading commands use `docker compose`.
 
+The agent always runs against the live OpenRouter model and requires
+`OPENROUTER_API_KEY`; it exits with code `2` if the key is missing.
+
 ## Commands and modes
 
 Exactly one of these modes is required:
 
 - `--task TEXT` — run one task against the current workspace.
 - `--chat` — start a multi-turn REPL using one trace/session.
-- `--replay TRACE.jsonl` — replay a recorded trace without network access.
-- `--seed-fixture` — write the deterministic fixture repository into the
-  current workspace, then exit.
+- `--seed-fixture` — write the fixture repository into the current workspace,
+  then exit.
 
 ## Live chat slash commands
 
@@ -75,9 +77,9 @@ not collapse into only a final `tool_error` run state.
 |---|---:|---|
 | `--trace` | off | Print a human-readable trace tree and the JSONL path after the run. |
 | `--show-context N` | unset | Print parent-visible context at parent step `N`. |
-| `--live-model` | off | Use OpenRouter through LiteLLM. Requires `OPENROUTER_API_KEY`. |
-| `--budget` | off | Print a budget summary (steps/tokens/USD/daily) at run end (live mode). |
-| `--finops` | off | Print a per-agent-type token/USD FinOps breakdown at run end (live mode). |
+| `--live-model` | off | Accepted no-op alias (the agent always runs live). Retained for backward compatibility with older docs. |
+| `--budget` | off | Print a budget summary (steps/tokens/USD/daily) at run end. |
+| `--finops` | off | Print a per-agent-type token/USD FinOps breakdown at run end. |
 | `--require-approval off|writes|all` | config/default | Gate tools before execution. |
 | `--yes` | off | Auto-approve gated tools and record `approval{decision:"auto"}`. |
 | `--no-redact` | off | Disable trace redaction and print a warning to stderr. |
@@ -85,7 +87,6 @@ not collapse into only a final `tool_error` run state.
 | `--max-tokens INT` | config/default | Override per-run token cap. |
 | `--parent-model MODEL_ID` | config/default | Override parent model. |
 | `--subagent-model MODEL_ID` | config/default | Override all sub-agent models unless type-specific env/config is set. |
-| `--no-grill` | off | Skip the Grilling ambiguity step for the current task. |
 
 ## Streams and exit codes
 
@@ -94,13 +95,14 @@ not collapse into only a final `tool_error` run state.
 - JSONL traces are written to `<workspace_root>/traces/<run_id>.jsonl`.
 - The redacted event stream is mirrored to
   `<workspace_root>/traces/vg_agent.sqlite3` for dashboard/statistics queries.
-- `0`: successful run, replay, seed, or chat exit.
+- `0`: successful run, seed, or chat exit.
 - `1`: validation/config/tool-policy error.
-- `2`: missing live-model secret or refused live-model network setup.
+- `2`: missing live-model secret (`OPENROUTER_API_KEY`).
 - `3`: budget, timeout, or user-abort termination.
 
-Replay mode must not open the network. `vg-agent` Compose service runs with
-`network_mode: none` and is the canonical replay/smoke-test path.
+All runs are live. The single `vg-agent` Compose service has bridged network
+access for OpenRouter; the in-process egress pin refuses any non-`openrouter.ai`
+host before a socket opens.
 
 ## Sub-agent tools
 

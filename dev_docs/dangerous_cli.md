@@ -112,8 +112,7 @@ appear inside files or command output. Mitigations, in order:
 
 Modes:
 
-- `off` — default for deterministic demo and tests. No prompting; tests
-  remain reproducible.
+- `off` — default for the unit tests. No prompting; tests remain reproducible.
 - `writes` — gate `write_file`, `edit_file`, `run_bash`, `spawn_subagent`.
   Recommended for live use.
 - `all` — gate every tool including reads. Use for demo recordings or

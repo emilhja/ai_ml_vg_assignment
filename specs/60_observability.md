@@ -43,7 +43,7 @@ Concrete example:
 - `statusline` events include `ctx_tokens` from parent-visible `show_context`
   and, when configured, `ctx_window` / percentage of model context window.
 - Statusline is also written as a `statusline` JSONL event at every parent
-  step boundary so replays can reconstruct the user-visible UI.
+  step boundary so the dashboard can reconstruct the user-visible UI.
 - A non-TTY stderr (CI, piped) writes one line per step with a trailing
   newline instead of carriage return.
 
@@ -114,7 +114,7 @@ Store rich structured data now; do not require the frontend for v1:
 ## SQLite mirror
 
 - Default path: `<workspace_root>/traces/vg_agent.sqlite3`.
-- JSONL remains canonical for replay. SQLite mirrors the same redacted events
+- JSONL remains canonical for audit. SQLite mirrors the same redacted events
   and adds derived tables for dashboard queries.
 - The mirror stores sessions, runs, turns, model calls, tool calls, sub-agents,
   approvals, redactions, and compactions.

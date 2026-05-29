@@ -50,11 +50,11 @@ from .chat_ui import (
     use_rich_ui,
     _console,
 )
-from .agent import BUDGET_CAP_TOOL, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, run_live_task, run_task
+from .agent import BUDGET_CAP_TOOL, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, run_live_task
 from .live_model_client import LiveModelClient, MissingOpenRouterKey
 from .budget import BudgetGuard
 from .demo_fixture import write_fixture
-from .trace import TraceRecorder, load_trace, render_tree, show_context
+from .trace import TraceRecorder, render_tree, show_context
 
 
 def _stdin_prompt(stream: object | None = None, *, workspace_root: Path | None = None) -> "callable":
@@ -771,8 +771,18 @@ def _report_parent_session_status(
         sys.stderr.flush()
 
 
+def _guard_overrides(args: argparse.Namespace) -> dict[str, object]:
+    """Per-run budget overrides from the CLI (unset flags fall back to config)."""
+    overrides: dict[str, object] = {}
+    if getattr(args, "max_usd", None) is not None:
+        overrides["max_usd"] = args.max_usd
+    if getattr(args, "max_tokens", None) is not None:
+        overrides["max_tokens"] = args.max_tokens
+    return overrides
+
+
 def _chat_loop(root: Path, args: argparse.Namespace) -> int:
-    guard = BudgetGuard.for_workspace(root)
+    guard = BudgetGuard.for_workspace(root, **_guard_overrides(args))
     turn_state: dict[str, Any] = {"turn": 0}
     ui_since = 0
 
@@ -835,7 +845,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 continue
             if prompt == "/reset":
                 policy.cache.clear()
-                guard = BudgetGuard.for_workspace(root)
+                guard = BudgetGuard.for_workspace(root, **_guard_overrides(args))
                 conversation.clear()
                 last_intent_prompt = ""
                 ui_since = len(recorder.events)
@@ -846,7 +856,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 continue
             if prompt == "/new":
                 policy.cache.clear()
-                guard = BudgetGuard.for_workspace(root)
+                guard = BudgetGuard.for_workspace(root, **_guard_overrides(args))
                 conversation.clear()
                 last_intent_prompt = ""
                 ui_since = 0
@@ -887,15 +897,12 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 root, recorder, guard, args, since_event_idx=start_idx, force_state="running"
             )
             literal_prompt = last_intent_prompt if _is_ack_prompt(prompt) and last_intent_prompt else prompt
-            if args.live_model:
-                try:
-                    client = LiveModelClient.from_env(recorder=recorder)
-                except MissingOpenRouterKey as exc:
-                    sys.stderr.write(f"error: {exc}\n")
-                    return 2
-                run_live_task(root, prompt, recorder, client=client, guard=guard, policy=policy, history=conversation)
-            else:
-                run_task(root, prompt, recorder, policy=policy)
+            try:
+                client = LiveModelClient.from_env(recorder=recorder)
+            except MissingOpenRouterKey as exc:
+                sys.stderr.write(f"error: {exc}\n")
+                return 2
+            run_live_task(root, prompt, recorder, client=client, guard=guard, policy=policy, history=conversation)
             turn_state["force_state"] = None
             answer = _latest_parent_answer(recorder.events, start_idx)
             literal_outputs = _literal_tool_outputs(recorder.events, start_idx, literal_prompt, answer)
@@ -922,9 +929,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="vg_agent")
     parser.add_argument("--task")
     parser.add_argument("--trace", action="store_true")
-    parser.add_argument("--replay")
     parser.add_argument("--show-context", type=int)
     parser.add_argument("--seed-fixture", action="store_true")
+    # The agent always runs against the live OpenRouter model; --live-model is
+    # accepted as a no-op alias for backwards compatibility with older docs.
     parser.add_argument("--live-model", action="store_true")
     parser.add_argument("--parent-model")
     parser.add_argument("--subagent-model")
@@ -934,7 +942,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-redact", action="store_true")
     parser.add_argument("--budget", action="store_true")
     parser.add_argument("--finops", action="store_true")
+    parser.add_argument("--max-usd", type=float)
+    parser.add_argument("--max-tokens", type=int)
     args = parser.parse_args(argv)
+    args.live_model = True
     _apply_model_overrides(args)
 
     if args.no_redact:
@@ -946,19 +957,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"seeded fixture at {root}")
         return 0
 
-    if args.replay:
-        events = load_trace(Path(args.replay))
-        if args.trace:
-            print(render_tree(events))
-        if args.show_context is not None:
-            print(json.dumps(show_context(events, args.show_context), indent=2, ensure_ascii=False))
-        return 0
-
     if args.chat:
         return _chat_loop(root, args)
 
     if not args.task:
-        parser.error("--task, --chat, --replay, or --seed-fixture is required")
+        parser.error("--task, --chat, or --seed-fixture is required")
 
     recorder = TraceRecorder(
         root,
@@ -966,16 +969,12 @@ def main(argv: list[str] | None = None) -> int:
         event_sink=_make_progress_sink() if args.live_model else None,
     )
     policy = _make_policy(args)
-    guard: BudgetGuard | None = None
-    if args.live_model:
-        try:
-            client = LiveModelClient.from_env(recorder=recorder)
-        except MissingOpenRouterKey as exc:
-            parser.exit(2, f"error: {exc}\n")
-        guard = BudgetGuard.for_workspace(root)
-        run_live_task(root, args.task, recorder, client=client, guard=guard, policy=policy)
-    else:
-        run_task(root, args.task, recorder, policy=policy)
+    try:
+        client = LiveModelClient.from_env(recorder=recorder)
+    except MissingOpenRouterKey as exc:
+        parser.exit(2, f"error: {exc}\n")
+    guard = BudgetGuard.for_workspace(root, **_guard_overrides(args))
+    run_live_task(root, args.task, recorder, client=client, guard=guard, policy=policy)
     answer = _latest_parent_answer(recorder.events)
     if answer:
         print(answer)

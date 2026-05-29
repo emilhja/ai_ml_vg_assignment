@@ -1,22 +1,6 @@
 services:
   vg-agent:
     build: .
-    network_mode: "none"
-    working_dir: /workspace
-    volumes:
-      - ./workspace:/workspace
-      - ./traces:/workspace/traces
-    env_file:
-      - path: .env
-        required: false
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges
-    pids_limit: 128
-
-  vg-agent-live:
-    build: .
     # Bridged network is for OpenRouter only; the in-process egress pin
     # refuses any non-openrouter.ai endpoint.
     working_dir: /workspace

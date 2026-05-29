@@ -332,24 +332,17 @@ def _subagent_tool_schemas(agent_type: str) -> list[dict[str, Any]]:
 EXPLORER_TOOL_SCHEMAS = _subagent_tool_schemas("explorer")
 
 
-def _compact_if_needed(recorder: TraceRecorder, event: dict[str, object], deterministic: bool = False) -> dict[str, object] | None:
+def _compact_if_needed(recorder: TraceRecorder, event: dict[str, object]) -> dict[str, object] | None:
     tokens = int(event["tokens"])
     if tokens <= config.K_COMPACT:
         return None
     full = str(event["result_full"])
-    if deterministic:
-        summary = (
-            "Large deterministic sample.log read for the compaction demo. "
-            f"It contains {full.count(chr(10))} log lines of health-check traffic; "
-            "the full content remains in the JSONL trace."
-        )
-    else:
-        lines = full.splitlines()
-        summary = (
-            f"Large {event['tool']} result with {len(lines)} lines and {event['bytes']} bytes. "
-            "The full content remains in the JSONL trace; use read_file_range or re-run "
-            "a targeted read to retrieve specific lines."
-        )
+    lines = full.splitlines()
+    summary = (
+        f"Large {event['tool']} result with {len(lines)} lines and {event['bytes']} bytes. "
+        "The full content remains in the JSONL trace; use read_file_range or re-run "
+        "a targeted read to retrieve specific lines."
+    )
     return recorder.emit(
         "compaction",
         tool_use_id=event["tool_use_id"],
@@ -973,7 +966,7 @@ def run_live_task(
             )
             event = recorder.emit("tool_result", **result)
             content = str(result["result_full"])
-            compaction = _compact_if_needed(recorder, event, deterministic=False)
+            compaction = _compact_if_needed(recorder, event)
             if compaction is not None:
                 content = compacted_marker(compaction)
             elif len(content.encode("utf-8")) > config.MAX_TOOL_RESULT_BYTES:
@@ -993,204 +986,3 @@ def run_live_task(
                 )
                 return recorder
         messages.append({"role": "user", "content": tool_blocks})
-
-
-def _explore_auth(root: Path, recorder: TraceRecorder, policy: ApprovalPolicy | None = None) -> str:
-    if policy is not None and "spawn_subagent" in policy.gated_tools():
-        spawn_call = ToolCall("parent-spawn-explorer", "spawn_subagent", {"question": "inspect auth/"})
-        outcome = policy.check(_request_for(spawn_call))
-        _emit_approval(recorder, spawn_call, outcome)
-        if outcome.decision in {"denied", "aborted"}:
-            return f"approval denied: {outcome.reason}"
-    child_id = "explorer-1"
-    recorder.emit("subagent_spawn", child_agent_id=child_id, question="inspect auth/", model=config.EXPLORER_MODEL_ID)
-    recorder.emit(
-        "assistant_step",
-        agent_id=child_id,
-        parent_id="parent",
-        model=config.EXPLORER_MODEL_ID,
-        model_id=config.EXPLORER_MODEL_ID,
-        step_idx=1,
-        tokens_in=600,
-        tokens_out=80,
-        cost_usd=0.0008,
-        assistant_text="Inspect auth/session.py and auth/middleware.py.",
-        tool_calls=[
-            {"tool_use_id": "child-read-session", "name": "read_file", "args": {"path": "auth/session.py"}},
-            {"tool_use_id": "child-read-middleware", "name": "read_file", "args": {"path": "auth/middleware.py"}},
-        ],
-        stop_reason="tool_use",
-    )
-    _emit_tool_call(recorder, ToolCall("child-read-session", "read_file", {"path": "auth/session.py"}), agent_id=child_id, parent_id="parent")
-    session = tools.read_file(root, "auth/session.py", "child-read-session")
-    recorder.emit("tool_result", agent_id=child_id, parent_id="parent", **session)
-    _emit_tool_call(recorder, ToolCall("child-read-middleware", "read_file", {"path": "auth/middleware.py"}), agent_id=child_id, parent_id="parent")
-    middleware = tools.read_file(root, "auth/middleware.py", "child-read-middleware")
-    recorder.emit("tool_result", agent_id=child_id, parent_id="parent", **middleware)
-    summary = (
-        "Auth is handled in auth/session.py and auth/middleware.py: session.py "
-        "issues token strings, validates the token shape and shared secret, and "
-        "loads a session dict; middleware.py wraps protected handlers with "
-        "require_auth and raises AuthError when request.token fails validation."
-    )
-    recorder.emit(
-        "subagent_return",
-        child_agent_id=child_id,
-        summary=summary,
-        child_total_cost_usd=0.001,
-        child_total_tokens=int(session["tokens"]) + int(middleware["tokens"]),
-    )
-    return summary
-
-
-def run_task(
-    root: Path,
-    task: str,
-    recorder: TraceRecorder | None = None,
-    policy: ApprovalPolicy | None = None,
-) -> TraceRecorder:
-    recorder = recorder or TraceRecorder(root)
-    guard = BudgetGuard()
-    policy = policy or ApprovalPolicy()
-    task_lower = task.lower()
-    recorder.emit("user_prompt", prompt=task)
-
-    if "rename" in task_lower and "foo" in task_lower and "bar" in task_lower:
-        cost = guard.record_model_call(config.PARENT_MODEL_ID, 500, 80)
-        recorder.emit(
-            "assistant_step",
-            model=config.PARENT_MODEL_ID,
-            model_id=config.PARENT_MODEL_ID,
-            step_idx=1,
-            tokens_in=500,
-            tokens_out=80,
-            cost_usd=cost,
-            assistant_text="I will replace foo with bar in app.py.",
-            tool_calls=[{"tool_use_id": "parent-edit-app", "name": "edit_file", "args": {"path": "app.py"}}],
-            stop_reason="tool_use",
-        )
-        edit_call = ToolCall("parent-edit-app", "edit_file", {"path": "app.py", "old": "foo", "new": "bar"})
-        _emit_tool_call(recorder, edit_call)
-        if edit_call.name in policy.gated_tools():
-            outcome = policy.check(_request_for(edit_call))
-            _emit_approval(recorder, edit_call, outcome)
-            if outcome.decision in {"denied", "aborted"}:
-                deny_result = _result("parent-edit-app", "edit_file", f"approval denied: {outcome.reason}", "error", time.perf_counter())
-                recorder.emit("tool_result", **deny_result)
-                recorder.emit(
-                    "run_end",
-                    final_status="tool_error",
-                    total_cost_usd=round(guard.running_usd, 6),
-                    total_tokens=guard.running_tokens,
-                    duration_s=0.1,
-                )
-                return recorder
-        result = tools.edit_file(root, "app.py", "foo", "bar", "parent-edit-app")
-        recorder.emit("tool_result", **result)
-        cost = guard.record_model_call(config.PARENT_MODEL_ID, 350, 60)
-        recorder.emit(
-            "assistant_step",
-            model=config.PARENT_MODEL_ID,
-            model_id=config.PARENT_MODEL_ID,
-            step_idx=2,
-            tokens_in=350,
-            tokens_out=60,
-            cost_usd=cost,
-            assistant_text="Renamed foo to bar in app.py.",
-            tool_calls=[],
-            stop_reason="end_turn",
-        )
-        recorder.emit("run_end", final_status="ok", total_cost_usd=round(guard.running_usd, 6), total_tokens=guard.running_tokens, duration_s=0.1)
-        return recorder
-
-    if "__vg_sentinel_never_present__" in task_lower or "don't stop" in task_lower or "dont stop" in task_lower:
-        for step in range(1, 4):
-            cost = guard.record_model_call(config.PARENT_MODEL_ID, 700, 80)
-            recorder.emit(
-                "assistant_step",
-                model=config.PARENT_MODEL_ID,
-                model_id=config.PARENT_MODEL_ID,
-                step_idx=step,
-                tokens_in=700,
-                tokens_out=80,
-                cost_usd=cost,
-                assistant_text="Searching for the sentinel.",
-                tool_calls=[{"tool_use_id": f"search-{step}", "name": "run_bash", "args": {"command": "grep -R __VG_SENTINEL_NEVER_PRESENT__ ."}}],
-                stop_reason="tool_use",
-            )
-            _emit_tool_call(recorder, ToolCall(f"search-{step}", "run_bash", {"command": "grep -R __VG_SENTINEL_NEVER_PRESENT__ ."}))
-            decision = guard.record_tool_signature("run_bash", "grep -R __VG_SENTINEL_NEVER_PRESENT__ .")
-            recorder.emit(
-                "tool_result",
-                tool_use_id=f"search-{step}",
-                tool="run_bash",
-                result_full="",
-                bytes=0,
-                tokens=1,
-                latency_ms=1,
-                status="ok",
-            )
-            if not decision.allowed:
-                recorder.emit("budget_event", budget_reason=decision.budget_reason, details=decision.details)
-                recorder.emit("run_end", final_status="aborted", total_cost_usd=round(guard.running_usd, 6), total_tokens=guard.running_tokens, duration_s=0.1)
-                return recorder
-
-    cost = guard.record_model_call(config.PARENT_MODEL_ID, 900, 90)
-    recorder.emit(
-        "assistant_step",
-        model=config.PARENT_MODEL_ID,
-        model_id=config.PARENT_MODEL_ID,
-        step_idx=1,
-        tokens_in=900,
-        tokens_out=90,
-        cost_usd=cost,
-        assistant_text="I will read the deterministic large log before delegating auth inspection.",
-        tool_calls=[{"tool_use_id": "parent-read-sample-log", "name": "read_file", "args": {"path": "data/sample.log"}}],
-        stop_reason="tool_use",
-    )
-    _emit_tool_call(recorder, ToolCall("parent-read-sample-log", "read_file", {"path": "data/sample.log"}))
-    log_result = tools.read_file(root, "data/sample.log", "parent-read-sample-log")
-    log_event = recorder.emit("tool_result", **log_result)
-    _compact_if_needed(recorder, log_event, deterministic=True)
-
-    cost = guard.record_model_call(config.PARENT_MODEL_ID, 1000, 120)
-    recorder.emit(
-        "assistant_step",
-        model=config.PARENT_MODEL_ID,
-        model_id=config.PARENT_MODEL_ID,
-        step_idx=2,
-        tokens_in=1000,
-        tokens_out=120,
-        cost_usd=cost,
-        assistant_text="The large parent result is compacted. I will spawn Explorer for auth/.",
-        tool_calls=[{"tool_use_id": "parent-spawn-explorer", "name": "spawn_subagent", "args": {"question": "inspect auth/"}}],
-        stop_reason="tool_use",
-    )
-    _emit_tool_call(recorder, ToolCall("parent-spawn-explorer", "spawn_subagent", {"question": "inspect auth/"}))
-    summary = _explore_auth(root, recorder, policy)
-    recorder.emit(
-        "tool_result",
-        tool_use_id="parent-spawn-explorer",
-        tool="spawn_subagent",
-        result_full=summary,
-        bytes=len(summary.encode("utf-8")),
-        tokens=tools.estimate_tokens(summary),
-        latency_ms=1,
-        status="ok",
-    )
-
-    cost = guard.record_model_call(config.PARENT_MODEL_ID, 900, 100)
-    recorder.emit(
-        "assistant_step",
-        model=config.PARENT_MODEL_ID,
-        model_id=config.PARENT_MODEL_ID,
-        step_idx=3,
-        tokens_in=900,
-        tokens_out=100,
-        cost_usd=cost,
-        assistant_text=summary,
-        tool_calls=[],
-        stop_reason="end_turn",
-    )
-    recorder.emit("run_end", final_status="ok", total_cost_usd=round(guard.running_usd, 6), total_tokens=guard.running_tokens, duration_s=0.2)
-    return recorder

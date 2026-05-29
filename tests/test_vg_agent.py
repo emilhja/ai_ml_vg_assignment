@@ -21,7 +21,6 @@ from vg_agent.agent import (
     PARENT_SYSTEM_PROMPT,
     PARENT_TOOL_SCHEMAS,
     run_live_task,
-    run_task,
 )
 from vg_agent.live_model_client import (
     EndpointPinViolation,
@@ -40,7 +39,7 @@ from vg_agent.tools import (
     validate_shell_command,
     write_file,
 )
-from vg_agent.trace import TraceRecorder, _redact, load_trace, render_tree, show_context
+from vg_agent.trace import TraceRecorder, _redact, show_context
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -148,21 +147,61 @@ def test_budget_guard_reasons_and_costs() -> None:
         guard.record_model_call("openrouter/example/unknown", 10, 10)
 
 
-def test_sanity_run_edits_app(tmp_path: Path) -> None:
-    write_fixture(tmp_path)
-    recorder = TraceRecorder(tmp_path)
-    run_task(tmp_path, "rename foo to bar in app.py", recorder)
-    app = (tmp_path / "app.py").read_text(encoding="utf-8")
-    assert "def bar(" in app
-    assert "def foo(" not in app
-    assert recorder.events[-1]["kind"] == "run_end"
-    assert recorder.events[-1]["final_status"] == "ok"
+def _log_then_explorer_client() -> PipelineClient:
+    """Parent reads the large log (forces compaction) then spawns one Explorer."""
+    return PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Read the large log before delegating.",
+                [ToolCall("parent-read-sample-log", "read_file", {"path": "data/sample.log"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=20,
+            ),
+            ModelTurn(
+                "Delegate auth inspection to an Explorer.",
+                [ToolCall("spawn-explorer", "spawn_subagent", {"type": "explorer", "question": "inspect auth/ SENTINEL_AUTH"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=20,
+            ),
+            ModelTurn("Auth summary integrated: SENTINEL_AUTH.", input_tokens=100, output_tokens=20),
+        ],
+    )
+
+
+def _rename_via_coder_client() -> PipelineClient:
+    """Parent delegates a foo->bar rename in app.py to a Coder sub-agent."""
+    return PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Delegate the rename to a Coder.",
+                [ToolCall("spawn-coder", "spawn_subagent", {"type": "coder", "question": "rename foo to bar in app.py"})],
+                stop_reason="tool_use",
+                input_tokens=50,
+                output_tokens=10,
+            ),
+            ModelTurn("Coder renamed foo to bar in app.py.", input_tokens=50, output_tokens=10),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn(
+                    "Applying the rename.",
+                    [ToolCall("coder-edit", "edit_file", {"path": "app.py", "old": "foo", "new": "bar"})],
+                    stop_reason="tool_use",
+                    input_tokens=40,
+                    output_tokens=10,
+                ),
+                ModelTurn("app.py: renamed foo to bar", input_tokens=20, output_tokens=5),
+            ],
+        },
+    )
 
 
 def test_parent_compaction_and_subagent_context(tmp_path: Path) -> None:
     write_fixture(tmp_path)
     recorder = TraceRecorder(tmp_path)
-    run_task(tmp_path, "find all auth handling and summarise", recorder)
+    run_live_task(tmp_path, "read data/sample.log then summarise auth", recorder, client=_log_then_explorer_client())
     events = read_events(recorder.path)
 
     parent_large_results = [
@@ -186,29 +225,22 @@ def test_parent_compaction_and_subagent_context(tmp_path: Path) -> None:
     expected_hash = hashlib.sha256(str(original["result_full"]).encode("utf-8")).hexdigest()
     assert compaction["original_sha256"] == expected_hash
 
-    context = show_context(events, 3)
-    context_text = json.dumps(context)
+    final_step = max(
+        int(e["step_idx"]) for e in events
+        if e["kind"] == "assistant_step" and e["agent_id"] == "parent"
+    )
+    context_text = json.dumps(show_context(events, final_step))
+    # Compacted parent read is a marker, not the raw log; the Explorer summary is present.
     assert "[COMPACTED tool_result for tool_use_id=parent-read-sample-log]" in context_text
     assert "req-00001" not in context_text
-    assert "SESSION_SECRET" not in context_text
-    assert "Auth is handled in auth/session.py and auth/middleware.py" in context_text
-    assert "child-read-session" not in context_text
-    assert "child-read-middleware" not in context_text
-
-
-def test_replay_round_trip_tree_and_context(tmp_path: Path) -> None:
-    write_fixture(tmp_path)
-    recorder = TraceRecorder(tmp_path)
-    run_task(tmp_path, "find all auth handling and summarise", recorder)
-    loaded = load_trace(recorder.path)
-    assert render_tree(loaded) == render_tree(recorder.events)
-    assert show_context(loaded, 3) == show_context(recorder.events, 3)
+    assert "SENTINEL_AUTH" in context_text
 
 
 def test_sqlite_trace_mirror_and_dashboard_rollups(tmp_path: Path) -> None:
     write_fixture(tmp_path)
     recorder = TraceRecorder(tmp_path)
-    run_task(tmp_path, "find all auth handling and summarise", recorder)
+    task = "read data/sample.log then summarise auth"
+    run_live_task(tmp_path, task, recorder, client=_log_then_explorer_client())
     db_path = tmp_path / config.SQLITE_TRACE_DB
     assert db_path.exists()
 
@@ -226,7 +258,7 @@ def test_sqlite_trace_mirror_and_dashboard_rollups(tmp_path: Path) -> None:
             (recorder.run_id,),
         ).fetchall()
         assert len(turns) == 1
-        assert turns[0][0] == "find all auth handling and summarise"
+        assert turns[0][0] == task
         assert turns[0][1] == "ok"
         assert int(turns[0][2]) > 0
         assert int(turns[0][3]) > 0
@@ -237,24 +269,6 @@ def test_sqlite_trace_mirror_and_dashboard_rollups(tmp_path: Path) -> None:
         assert conn.execute("SELECT COUNT(*) FROM tool_calls WHERE run_id = ?", (recorder.run_id,)).fetchone()[0] > 0
         assert conn.execute("SELECT COUNT(*) FROM subagents WHERE run_id = ?", (recorder.run_id,)).fetchone()[0] > 0
         assert conn.execute("SELECT COUNT(*) FROM compactions WHERE run_id = ?", (recorder.run_id,)).fetchone()[0] > 0
-
-
-def test_cost_cap_run_uses_budget_reason(tmp_path: Path) -> None:
-    write_fixture(tmp_path)
-    recorder = TraceRecorder(tmp_path)
-    run_task(
-        tmp_path,
-        "search this repo for the string __VG_SENTINEL_NEVER_PRESENT__ and don't stop until you find it",
-        recorder,
-    )
-    events = read_events(recorder.path)
-    assert events[-2]["kind"] == "budget_event"
-    assert events[-2]["budget_reason"] == "repetition_abort"
-    assert "kind" in events[-2]
-    assert events[-1]["kind"] == "run_end"
-    assert events[-1]["final_status"] == "aborted"
-    assert float(events[-1]["total_cost_usd"]) > 0
-    assert float(events[-1]["total_cost_usd"]) < config.MAX_USD_PER_RUN
 
 
 def test_run_bash_rejects_dangerous_commands(tmp_path: Path) -> None:
@@ -704,8 +718,9 @@ def test_approval_required_for_write_tools(tmp_path: Path) -> None:
 
     policy = ApprovalPolicy(mode="writes", prompt=deny_all)
     recorder = TraceRecorder(tmp_path)
-    run_task(tmp_path, "rename foo to bar in app.py", recorder, policy=policy)
+    run_live_task(tmp_path, "rename foo to bar in app.py", recorder, client=_rename_via_coder_client(), policy=policy)
     text = (tmp_path / "app.py").read_text(encoding="utf-8")
+    # The gated spawn is denied before any Coder edit runs, so the file is unchanged.
     assert "def foo(" in text
     assert "def bar(" not in text
     approvals = [e for e in recorder.events if e["kind"] == "approval"]
@@ -716,7 +731,7 @@ def test_approval_event_recorded_auto_yes(tmp_path: Path) -> None:
     write_fixture(tmp_path)
     policy = ApprovalPolicy(mode="writes", auto_yes=True)
     recorder = TraceRecorder(tmp_path)
-    run_task(tmp_path, "rename foo to bar in app.py", recorder, policy=policy)
+    run_live_task(tmp_path, "rename foo to bar in app.py", recorder, client=_rename_via_coder_client(), policy=policy)
     approvals = [e for e in recorder.events if e["kind"] == "approval"]
     assert approvals and approvals[0]["decision"] == "auto"
     assert "def bar(" in (tmp_path / "app.py").read_text(encoding="utf-8")
@@ -1058,33 +1073,38 @@ def test_literal_tool_output_includes_read_errors(tmp_path: Path) -> None:
     assert _progress_event_color(tool_event, use_color=True) == "\x1b[31m"
 
 
-def test_chat_persists_budget_and_approvals_across_turns(tmp_path: Path) -> None:
+def test_chat_persists_budget_and_approvals_across_turns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # In-process chat over the live loop with an injected fake client (no network):
+    # turn 1 renames foo to bar via a Coder (auto-yes), then /budget, /approvals, /exit.
+    from vg_agent import __main__ as cli
+
     write_fixture(tmp_path)
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(ROOT / "src")
-    # Two turns: first turn renames foo to bar in app.py (auto-yes), then /budget, then exit
-    stdin_text = (
-        "rename foo to bar in app.py\n"
-        "/budget\n"
-        "/approvals\n"
-        "/exit\n"
+    prompts = iter([
+        "rename foo to bar in app.py",
+        "/budget",
+        "/approvals",
+        "/exit",
+    ])
+    monkeypatch.setattr(cli, "use_rich_ui", lambda: False)
+    monkeypatch.setattr(cli, "_make_chat_prompt", lambda _history_path: (lambda: next(prompts), lambda: None))
+    monkeypatch.setattr(
+        cli, "LiveModelClient", SimpleNamespace(from_env=lambda recorder=None: _rename_via_coder_client())
     )
-    completed = subprocess.run(
-        [sys.executable, "-m", "vg_agent", "--chat", "--require-approval", "writes", "--yes"],
-        cwd=tmp_path,
-        env=env,
-        input=stdin_text,
-        text=True,
-        capture_output=True,
-    )
-    assert completed.returncode == 0, completed.stderr
-    # Budget output should be present in stdout
-    assert "steps" in completed.stdout
-    assert "Renamed foo to bar in app.py." in completed.stdout
-    assert "Approvals - session history" in completed.stdout
-    assert "edit_file" in completed.stdout
-    assert "app.py" in completed.stdout
-    # Trace should be a single JSONL with one session_id
+
+    args = SimpleNamespace(no_redact=False, require_approval="writes", yes=True, live_model=True)
+    assert cli._chat_loop(tmp_path, args) == 0
+
+    out = capsys.readouterr().out
+    assert "steps" in out  # /budget
+    assert "renamed foo to bar in app.py." in out  # parent final answer
+    assert "Approvals - session history" in out  # /approvals
+    assert "edit_file" in out
+    assert "app.py" in out
+
     trace_dir = tmp_path / "traces"
     traces = list(trace_dir.glob("*.jsonl"))
     assert len(traces) == 1

@@ -1,4 +1,4 @@
-"""Generated JSONL trace and replay helpers."""
+"""Generated JSONL trace and rendering helpers."""
 
 from __future__ import annotations
 

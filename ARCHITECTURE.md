@@ -52,8 +52,8 @@ Two mechanisms keep parent context bounded under load. First,
 **tool-result compaction**: any parent `tool_result` whose token estimate
 exceeds `K_COMPACT` (4000) is replaced by a compaction marker in the
 parent's next model turn; the full payload, its SHA-256, and a pointer
-remain in the JSONL trace and are retrievable via `read_file_range` or
-`--replay`. Second, **sub-agent context offloading**: a sub-agent's
+remain in the JSONL trace and are retrievable via `read_file_range`.
+Second, **sub-agent context offloading**: a sub-agent's
 intermediate `tool_call` and `tool_result` events live under its own
 `agent_id` and are filtered out of the parent's view; the parent sees only
 the ≤2 KB return summary. Combined, the parent stays small while

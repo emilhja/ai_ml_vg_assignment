@@ -36,7 +36,7 @@ docker compose run --rm vg-agent --seed-fixture
 Start the actual live chat:
 
 ```powershell
-docker compose run --rm vg-agent-live --chat --live-model --require-approval writes
+docker compose run --rm -it vg-agent --chat --require-approval writes
 ```
 
 Opening statement to examiner:
@@ -302,9 +302,9 @@ Say:
 
 ## Prompt 8 - Cost Warning And Hard Cap Proof
 
-Live chat should show running cost continuously, but a hard cap is safest to
-prove with the deterministic cap scene so the demo does not depend on wasting a
-real API budget. Exit chat first:
+Live chat shows running cost continuously. To make the hard cap fire on demand
+without wasting budget, run a task with a deliberately tiny `--max-usd` so the
+cap is crossed mid-run. Exit chat first:
 
 ```text
 /exit
@@ -313,7 +313,7 @@ real API budget. Exit chat first:
 Then run:
 
 ```powershell
-docker compose run --rm vg-agent --task "trigger deterministic budget cap proof" --max-usd 0.05 --trace
+docker compose run --rm vg-agent --task "read data/sample.log, then summarise auth/ and utils.py in parallel" --max-usd 0.02 --trace
 ```
 
 Expected visible proof:
@@ -329,35 +329,35 @@ Rubric proof:
 
 Say:
 
-> The live chat statusline shows cost during normal operation. This deterministic
-> cap scene proves the hard stop fires reliably without burning real budget.
+> The live chat statusline shows cost during normal operation. A tiny `--max-usd`
+> makes the hard stop fire on demand so I can prove it without burning budget.
 
-## Prompt 9 - Replay / Evidence For The Grader
+## Prompt 9 - Trace Evidence For The Grader
 
-Run:
+Every run writes a JSONL trace under `traces/`. Open the trace printed during the
+demo (the `--trace` runs print its path) and inspect it:
 
 ```powershell
-docker compose run --rm vg-agent --replay traces/<run_id>.jsonl --trace --show-context 5
+Get-Content traces/<run_id>.jsonl | Select-Object -First 40
 ```
-
-Use the run id from the trace printed during the demo.
 
 Expected visible proof:
 
-- The trace tree replays without a live model call.
 - Grader can inspect event order, tool calls, sub-agent spawns/returns,
   approval decisions, compaction events, budget events, and final status.
+- The same events are mirrored into `traces/vg_agent.sqlite3` for dashboard
+  queries.
 
 Rubric proof:
 
 - VG-HG-0: artifacts and demo evidence are inspectable.
-- VG-HG-4: shown working live or replayable from submitted recording/trace.
+- VG-HG-4: shown working live, with the trace as the durable record.
 - Substance gate S1/S2: demonstrated behavior is backed by trace evidence.
 
 Say:
 
-> This is the audit trail. If a claim is challenged, we can point to the JSONL
-> event and replay it.
+> This is the audit trail. If a claim is challenged, we point to the JSONL event
+> for that exact step.
 
 ## Oral Knowledge Check Answers
 
@@ -403,11 +403,11 @@ Before ending the demo, make sure the grader has seen:
 - Two Explorer sub-agents run in parallel.
 - Parent integrates sub-agent results.
 - Context compaction is visible through `/show-context`.
-- Cost warning and hard cap are shown through the deterministic cap scene.
+- Cost warning and hard cap are shown through the tiny `--max-usd` cap scene.
 - Config/secrets packaging story: `.env.example`, env secrets, config file,
   Docker run path.
 - Agent yields clarifying questions for an ambiguous prompt.
-- Trace/replay evidence is available.
+- Trace evidence is available.
 
 If all of the above is demonstrated and the architecture questions are answered
 clearly, the live demo covers VG-HG-0 through VG-HG-4, VG.1 through VG.9, and

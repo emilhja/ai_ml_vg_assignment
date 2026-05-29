@@ -17,24 +17,11 @@ approval policy) holds regardless of Docker.
 
 ## docker-compose.yml
 
-Two services share the same image and `.env`:
+A single live service runs every demo:
 
 ```yaml
 services:
   vg-agent:
-    build: .
-    network_mode: "none"
-    volumes:
-      - ./workspace:/workspace
-      - ./traces:/workspace/traces
-    env_file:
-      - path: .env
-        required: false
-    cap_drop: ["ALL"]
-    security_opt: ["no-new-privileges"]
-    pids_limit: 128
-
-  vg-agent-live:
     build: .
     # bridged network for OpenRouter only; the agent's egress pin rejects
     # any non-openrouter.ai endpoint even if the network allows it.
@@ -49,19 +36,20 @@ services:
     pids_limit: 128
 ```
 
-- `vg-agent` is the default for replay, deterministic smoke tests, and any
-  run that does not need OpenRouter.
-- `vg-agent-live` is used for optional `--live-model` runs after the
-  deterministic grading path passes.
-- Both services mount `./workspace` read-write so the agent can edit fixture
+- `vg-agent` runs the live agent against OpenRouter; every scene in
+  `specs/70_demo_runbook.md` uses it.
+- The service mounts `./workspace` read-write so the agent can edit fixture
   files. The host repo itself is never mounted — copy the demo fixture into
-  `./workspace` first.
+  `./workspace` first (`--seed-fixture`).
+- Network egress is constrained in-process by the `openrouter.ai` egress pin;
+  dropped capabilities and `no-new-privileges` remain the container-level
+  safety layer.
 
 ## Config file
 
 `config.example.toml` is tracked at the repo root and documents every
 non-secret config key. A user may copy it to `workspace/config.toml` for demo
-overrides. Runtime defaults still exist for deterministic tests, but the
+overrides. Runtime defaults still exist for the unit tests, but the
 packaged configuration surface is the TOML schema below:
 
 ```toml
@@ -95,7 +83,7 @@ matching `*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD` with a parse error.
 ## .env.example
 
 ```ini
-# Required for --live-model runs only.
+# Required: the agent always runs live against OpenRouter.
 OPENROUTER_API_KEY=
 
 # Optional OpenRouter app attribution.
@@ -124,22 +112,21 @@ VG_APPROVAL_MODE=writes
 
 ## README contract
 
-The repo root README documents three commands and nothing else for the
-grading-anchored install path:
+The repo root README documents this install path and nothing else:
 
 ```bash
 # Build
 docker compose build
 
-# Default demo (network: none, replay or non-live runs)
-docker compose run --rm vg-agent --task "..." [--replay traces/<run_id>.jsonl]
+# Seed the fixture into ./workspace
+docker compose run --rm vg-agent --seed-fixture
 
 # Live demo (OpenRouter through LiteLLM)
-docker compose run --rm vg-agent-live --task "..." --live-model --trace
+docker compose run --rm vg-agent --task "..." --trace
 ```
 
 A grader who has Docker installed must reach a working demo with no other
-setup beyond copying `.env.example` to `.env` and (for live mode) filling in
+setup beyond copying `.env.example` to `.env` and filling in
 `OPENROUTER_API_KEY`. This is VG.7's "idiot-proof packaging" anchor.
 
 ## Smoke test

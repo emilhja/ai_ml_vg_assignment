@@ -6,7 +6,7 @@ generated `chat_ui.py` and is wired from `__main__.py`.
 ## Scope
 
 Applies only to `--chat` when **both** stdin and stderr are TTYs and
-`NO_COLOR` is unset. All other modes (`--task`, `--replay`, piped chat) are
+`NO_COLOR` is unset. All other modes (`--task`, piped chat) are
 unaffected.
 
 ## Layout (top to bottom)
@@ -25,7 +25,7 @@ unaffected.
    built from `SessionStatus` (shared with trace `statusline` events):
    - `📁 {workspace_dir_name}` or `dir:` when `NO_EMOJI` is set.
    - `🤖 {short_model}` or `mdl:` — from latest parent `llm_start` or config default.
-   - `{mode}` — `live` or `deterministic`.
+   - `{mode}` — always `live` (the agent has a single live runtime path).
    - `ctx {tokens}` or `ctx {tokens}/{window} ({pct}%)` — parent-visible context
      token estimate from `show_context`, not raw `llm_start.tokens_in`.
    - `🪙 ${running_usd:.4f}/${max_usd:.2f}` — session spend vs cap.

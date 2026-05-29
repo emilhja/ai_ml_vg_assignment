@@ -5,22 +5,32 @@ The source of truth is the markdown spec set plus `PROMPTS.md` and
 `MODEL_CONFIG.md`; executable project code is generated from those files or
 from generated-code templates with traceable provenance.
 
+The agent has a single runtime path: a live OpenRouter-backed loop (via LiteLLM)
+where the parent model decides each turn whether to call a tool, spawn a typed
+sub-agent, or yield. It requires `OPENROUTER_API_KEY`.
+
 ## Recommended Run Path: Docker
 
-Use Docker Compose for demos and grading. The default `vg-agent` service runs
-with `network_mode: none`, so deterministic runs do not need an API key and
-cannot make network calls.
+Use Docker Compose for demos and grading. The single `vg-agent` service has
+bridged network access for OpenRouter only; the in-process egress pin refuses
+any non-`openrouter.ai` host before a socket opens.
 
-### 1. Build And Seed
+### 1. Build And Configure
 
 ```powershell
 Copy-Item .env.example .env
+# Edit .env and set OPENROUTER_API_KEY=<your-key>
 New-Item -ItemType Directory -Force workspace,traces
 docker compose build
+```
+
+### 2. Seed The Fixture Workspace
+
+```powershell
 docker compose run --rm vg-agent --seed-fixture
 ```
 
-### 2. Deterministic Demo, No API Key
+### 3. Run The Live Demo
 
 ```powershell
 docker compose run --rm vg-agent `
@@ -28,43 +38,22 @@ docker compose run --rm vg-agent `
   --trace --show-context 8
 ```
 
-This is the primary evidence path. It proves tracing, replayability,
-compaction, sub-agent isolation, budget guards, and safety behavior without
-using a live model.
+This exercises the full agent: parallel Explorer sub-agents, parent-scoped
+tool-result compaction, sub-agent context isolation, budget guards, and tracing.
+See `specs/70_demo_runbook.md` for the five graded scenes (autonomy + edit,
+parallel summarise, Grilling clarification, cost-cap abort, safety blocks).
 
-### 3. Optional Live OpenRouter Demo
-
-Edit `.env` and set:
-
-```ini
-OPENROUTER_API_KEY=your-key
-```
-
-Then run the live service:
+### Interactive Chat
 
 ```powershell
-docker compose run --rm vg-agent-live `
-  --task "inspect app.py and suggest one small improvement" `
-  --live-model --trace --show-context 3
+docker compose run --rm -it vg-agent --chat --require-approval writes
 ```
 
-`vg-agent-live` is the only Compose service intended for live model calls. The
-client still pins egress to `openrouter.ai` before calling LiteLLM.
-
-Live chat mode (`--chat --live-model`) prints a compact statusline before each
-prompt with the active model, latest parent context size, run token budget,
-step count, cost, approval events, and last run state. Use `/status` to print
-the same line on demand. In an interactive terminal, slash commands autocomplete
-after a leading `/`; for example `/fin` shows `/finops` with a short description
-and can be selected with the arrow keys and Enter.
-
-### 4. Replay A Trace
-
-After any traced run, replay it without network:
-
-```powershell
-docker compose run --rm vg-agent --replay traces/<run_id>.jsonl --trace --show-context 3
-```
+Chat prints a compact statusline before each prompt with the active model, latest
+parent context size, run token budget, step count, cost, approval events, and
+last run state. Use `/status` to print it on demand; `/budget`, `/finops`,
+`/approvals`, `/reset`, and `/new` are also available. In an interactive
+terminal, slash commands autocomplete after a leading `/`.
 
 ## Developer Commands
 
@@ -94,19 +83,12 @@ Presentation script for local development:
 .\scripts\run_demo.ps1 -SkipTests
 ```
 
-Test locally:
+Test locally (no network; live loop is exercised with an injected fake client):
 
 ```powershell
 python scripts/generate_project.py --clean
 uv run pytest
 ```
-
-Cost-cap demo: use the deterministic Docker scene in
-`specs/70_demo_runbook.md` so the hard cap proof does not depend on live
-model behavior.
-
-Without `--live-model`, commands use deterministic demo routes and do not call
-external APIs.
 
 ## Model configuration
 
@@ -140,11 +122,17 @@ Approval gate:
 
 - `--require-approval off|writes|all` controls whether mutating tools and
   sub-agent spawns prompt before execution. Default is `off` so the
-  deterministic demo and tests remain reproducible.
+  tests remain reproducible.
 - `--yes` auto-approves and still records an `approval` event with
   `decision="auto"` so the audit trail is preserved.
 - Scoped approvals (choice 2) reuse the grant for the same `(tool, folder)`
   in the rest of the session.
+
+Budget caps:
+
+- `--max-usd` / `--max-tokens` override the per-run caps from `MODEL_CONFIG.md`.
+  A soft warning fires at 80% of a cap; the hard cap aborts the run with
+  `run_end{final_status:"aborted"}` and a `budget_event` carrying the reason.
 
 Endpoint pin:
 
@@ -166,7 +154,7 @@ Trace redaction:
 SQLite observability:
 
 - Every redacted JSONL event is also mirrored to
-  `traces/vg_agent.sqlite3`. JSONL remains the replay/audit source; SQLite is
+  `traces/vg_agent.sqlite3`. JSONL remains the audit source; SQLite is
   the dashboard query store.
 - The SQLite database keeps the lossless event payloads plus rollup tables for
   sessions, runs, turns, model calls, tool calls, sub-agents, approvals,
@@ -177,10 +165,8 @@ SQLite observability:
 See [`dev_docs/dangerous_cli.md`](dev_docs/dangerous_cli.md) for the *why*
 behind every command, argument token, and path on the deny-list.
 
-Docker Compose is the canonical demo wrapper. The `vg-agent` service runs
-without networking; `vg-agent-live` is the only service intended for live
-OpenRouter calls.
+Docker Compose is the canonical demo wrapper. The `vg-agent` service is the only
+service and is the live OpenRouter path.
 
 Docker is an outer safety layer, not the only safety layer. The Python
 `run_bash` gate still rejects dangerous commands before shell execution.
-# ai_ml_vg_assignment

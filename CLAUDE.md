@@ -36,39 +36,33 @@ python scripts/generate_project.py --clean
 uv run pytest
 
 # Run a single test
-uv run pytest tests/test_vg_agent.py::test_sanity_run_edits_app
+uv run pytest tests/test_vg_agent.py::test_parallel_explorers_run_concurrently_with_overlap
 
-# Full presentation script (regenerate, test, three demo flows)
+# Full presentation script (regenerate, test, live demo scenes if a key is set)
 .\scripts\run_demo.ps1
 .\scripts\run_demo.ps1 -SkipTests   # skip pytest
 
-# Canonical deterministic Docker demo (no API key needed)
-Copy-Item .env.example .env
+# Canonical live Docker demo (requires OPENROUTER_API_KEY in .env)
+Copy-Item .env.example .env            # then edit .env and set OPENROUTER_API_KEY
 New-Item -ItemType Directory -Force workspace,traces
 docker compose build
 docker compose run --rm vg-agent --seed-fixture
 docker compose run --rm vg-agent --task "read data/sample.log, then summarise auth/ and utils.py in parallel" --trace --show-context 8
-
-# Replay a previous run from its JSONL trace
-uv run python -m vg_agent --replay fixtures/demo_repo/traces/<run_id>.jsonl --trace --show-context 3
-
-# Optional live OpenRouter-backed run (extension path)
-$env:OPENROUTER_API_KEY="..."
-uv run python -m vg_agent --task "add input validation to app.py" --live-model --trace --show-context 3
 ```
 
 ## Architecture
 
 One parent agent + typed sub-agents (`Grilling`, `Explorer`, `Coder`,
 `Reviewer`). The agent shell (not model quality) is the VG claim: tool
-execution, context engineering, sub-agent boundaries, tracing, replay,
+execution, context engineering, sub-agent boundaries, tracing,
 safety, cost control.
 
 **Runtime modules (`src/vg_agent/`, all generated):**
 
-- `agent.py` — `run_task` (deterministic demo routes) and `run_live_task`
-  (OpenRouter-backed loop via LiteLLM). Owns parent system prompt, tool dispatch,
-  compaction, Explorer spawning, trace writing.
+- `agent.py` — `run_live_task` is the single runtime path (OpenRouter-backed
+  loop via LiteLLM). Owns parent system prompt, tool dispatch,
+  compaction, Explorer spawning, trace writing. There is no offline/deterministic
+  route; `--task` always runs live and exits `2` without `OPENROUTER_API_KEY`.
 - `tools.py` — `read_file`, `read_file_range`, `write_file`, `edit_file`,
   `run_bash`. `run_bash` is **deny-by-default**: an allowlist of read-only
   commands (`grep`, `rg`, `find`, `ls`, `pwd`, `cat`, `head`, `tail`,
@@ -83,13 +77,13 @@ safety, cost control.
 - `trace.py` — `TraceRecorder` writes one JSONL event per action to
   `traces/<run_id>.jsonl`. `show_context(events, step_idx)` reconstructs
   the parent-visible context at a given step (this is what `--show-context`
-  prints and what `--replay` reads).
-- `live_model_client.py` — LiteLLM OpenRouter adapter. Used only in live
-  mode; tests must inject a fake client and never hit the network.
+  prints).
+- `live_model_client.py` — LiteLLM OpenRouter adapter. Drives every run;
+  tests must inject a fake client and never hit the network.
 - `config.py` — model IDs, pricing, and governance constants generated
   from `MODEL_CONFIG.md` + `specs/30_runtime_governance.md`.
 - `demo_fixture.py` — emits `fixtures/demo_repo/` including a
-  deterministic `data/sample.log` (~6200 lines, >200 KB) sized to exceed
+  reproducible `data/sample.log` (~6200 lines, >200 KB) sized to exceed
   `K_COMPACT` on read.
 
 **Two context-engineering tricks to preserve:**
@@ -98,14 +92,14 @@ safety, cost control.
    estimate exceeds `K_COMPACT` (4000) emits a `compaction` event carrying
    `original_event_idx` and `original_sha256` of the full payload. The next
    parent model turn sees only the compacted marker; the full payload stays
-   in the JSONL trace and is retrievable via `read_file_range` or replay.
+   in the JSONL trace and is retrievable via `read_file_range`.
 2. **Explorer offloading** — `spawn_subagent` invokes one Explorer and
    `spawn_subagents` invokes parallel Explorers with
    read-only tools (`MAX_SUBAGENT_DEPTH = 1`, no nested spawns). Parent
    context receives **only** the Explorer return summary (≤2 KB), never
    Explorer's intermediate `tool_call` / `tool_result` events.
 
-**Trace + replay invariants:**
+**Trace invariants:**
 
 - Every event has a `kind` discriminator and an `event_idx`.
 - `parent_id` distinguishes Explorer-scoped events from parent-scoped events.

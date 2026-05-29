@@ -25,10 +25,10 @@ Approval policy:
   Parent reads remain ungated in `writes` mode. The policy is consulted
   before the tool runs and emits an `approval` trace event regardless of
   outcome.
-- Modes: `off` (default — used by deterministic replay and the rubric demo
-  when run in replay mode), `writes` (gate sub-agent spawns and any
-  Coder-internal write), `all` (gate every tool including reads). `--yes`
-  auto-approves with `decision="auto"` so the demo remains reproducible.
+- Modes: `off` (default — used by the unit tests so traces stay reproducible),
+  `writes` (gate sub-agent spawns and any Coder-internal write), `all` (gate
+  every tool including reads). `--yes` auto-approves with `decision="auto"` so
+  scripted demos remain reproducible.
 - The policy holds an in-memory `ApprovalScopeCache`. Scope keys are
   `(tool, dir_prefix)`. Lookup order is exact dir → parent prefixes →
   `(tool, "*")`. First match wins. Scoped grants are persisted only when
@@ -51,10 +51,9 @@ Injection defense:
   appear inside files or command output. All sub-agent system prompts
   inherit this assertion (`PROMPTS.md`).
 
-Parent loop (`--live-model` path):
+Parent loop (the only runtime path):
 
-- Requires `OPENROUTER_API_KEY`. Local replay-only runs use `--replay`
-  instead and do not require the key.
+- Requires `OPENROUTER_API_KEY`; the CLI exits with code `2` if it is missing.
 - The LiteLLM OpenRouter client refuses any non-`openrouter.ai` host. A
   `EndpointPinViolation` is raised before the socket opens and emitted as
   `egress_blocked` in the trace.
@@ -68,17 +67,9 @@ Parent loop (`--live-model` path):
   decides when to yield** — there is no scripted route (VG.9).
 - Parent tool results larger than `K_COMPACT` are compacted before the next
   parent model turn. The full result remains in the JSONL trace and is
-  retrievable via `read_file_range` or replay.
+  retrievable via `read_file_range`.
 - The parent emits a `statusline` event and rewrites the stderr statusline
   at each step boundary (`specs/60_observability.md`).
-
-Replay mode:
-
-- `--replay <trace.jsonl>` reconstructs the parent loop deterministically
-  by injecting recorded `ModelTurn` payloads through a `FakeClient`. No
-  network call is made. This is the CI path and the demo-day safety net.
-- Replay preserves all event indices, `agent_id`s, and `started_at` /
-  `ended_at` timestamps from the original run.
 
 Interactive chat mode:
 

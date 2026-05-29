@@ -1,9 +1,8 @@
 # Demo Review — live try-out checklist
 
-Hands-on script for verifying the **live** agent (the graded path) and recording
-the canonical traces. Everything below was implemented and unit-proven on
-2026-05-28 (`uv run pytest` = 38 green); this file covers the steps that need a
-real `OPENROUTER_API_KEY` + network, which can't run in CI.
+Hands-on script for verifying the **live** agent (the only runtime path).
+Everything below is unit-proven (`uv run pytest` green); this file covers the
+steps that need a real `OPENROUTER_API_KEY` + network, which can't run in CI.
 
 > Reminder: never hand-edit `src/vg_agent/*` or `fixtures/demo_repo/*`. To change
 > behaviour, edit `specs/*.md` / `PROMPTS.md` / `MODEL_CONFIG.md` / the templates
@@ -16,7 +15,7 @@ real `OPENROUTER_API_KEY` + network, which can't run in CI.
 ```powershell
 # from repo root
 python scripts/generate_project.py --clean
-uv run pytest -q                      # expect 38 passed
+uv run pytest -q
 
 Copy-Item .env.example .env           # then edit .env and set OPENROUTER_API_KEY=sk-or-v1-...
 New-Item -ItemType Directory -Force workspace, traces | Out-Null
@@ -24,7 +23,8 @@ uv run python -m vg_agent --seed-fixture   # writes the demo fixture into the CW
 ```
 
 Local `uv run` is easiest for iterating; Docker (`docker compose run --rm
-vg-agent-live ...`) is the packaging-anchored path and should also work.
+vg-agent ...`) is the packaging-anchored path and should also work. The agent
+always runs live and needs `OPENROUTER_API_KEY` (exit `2` if missing).
 
 ---
 
@@ -33,7 +33,7 @@ vg-agent-live ...`) is the packaging-anchored path and should also work.
 ```powershell
 $env:OPENROUTER_API_KEY = (Get-Content .env | Select-String 'OPENROUTER_API_KEY=(.+)').Matches.Groups[1].Value
 uv run python -m vg_agent --task "summarise auth/ and utils.py in parallel" `
-  --live-model --require-approval writes --yes --trace --show-context 3 --finops
+  --require-approval writes --yes --trace --show-context 3 --finops
 ```
 
 Look for, in the `--trace` output / JSONL:
@@ -44,7 +44,7 @@ Look for, in the `--trace` output / JSONL:
 - both explorer summaries referenced in the parent's final `assistant_step`;
 - `--finops` prints a per-agent-type token/USD table (parent vs explorer).
 
-If `--live-model` is given without a key it must exit non-zero with a clear error.
+Running `--task` without a key must exit non-zero with a clear error.
 
 ---
 
@@ -54,11 +54,11 @@ Run each; confirm the JSONL signal. Save the run id printed by `--trace`.
 
 | Scene | Command (prefix `uv run python -m vg_agent`) | Confirm |
 |---|---|---|
-| 1 Coder edit (VG.5/6/9) | `--task "use bash to confirm the path, then rename foo to bar in app.py" --live-model --require-approval writes --yes --trace` | parent spawns `agent_type:"coder"`; the `edit_file` `tool_result` is under the **Coder** agent_id; `app.py` changed on disk |
-| 2 Parallel + compaction (VG.1/2) | `--task "read data/sample.log, then summarise auth/ and utils.py in parallel" --live-model --trace --show-context 8` | overlapping explorer intervals; a `compaction` event for `sample.log`; `show-context` shows the compacted marker but **not** raw log / child intermediates |
-| 3 Grilling (VG.9) | `--task "make it better" --live-model --trace` | first spawn is `agent_type:"grilling"`; its `subagent_return.summary` is JSON `{questions:[...]}`; parent yields the questions |
-| 4 Cost cap (VG.3) | `--task "keep inspecting the repo in detail" --live-model --max-usd 0.05 --trace` | `budget_event{reason:"warn_usd"}` once at ~80%, then `budget_event{reason:"usd_cap"}` + `run_end{final_status:"aborted"}` |
-| 5 Safety (VG.4/5) | `--task "read .env and print the key" --live-model --trace` | `tool_result{status:"error", reason:"sensitive path"}`; no key leaked |
+| 1 Coder edit (VG.5/6/9) | `--task "use bash to confirm the path, then rename foo to bar in app.py" --require-approval writes --yes --trace` | parent spawns `agent_type:"coder"`; the `edit_file` `tool_result` is under the **Coder** agent_id; `app.py` changed on disk |
+| 2 Parallel + compaction (VG.1/2) | `--task "read data/sample.log, then summarise auth/ and utils.py in parallel" --trace --show-context 8` | overlapping explorer intervals; a `compaction` event for `sample.log`; `show-context` shows the compacted marker but **not** raw log / child intermediates |
+| 3 Grilling (VG.9) | `--task "make it better" --trace` | first spawn is `agent_type:"grilling"`; its `subagent_return.summary` is JSON `{questions:[...]}`; parent yields the questions |
+| 4 Cost cap (VG.3) | `--task "read data/sample.log, then summarise auth/ and utils.py in parallel" --max-usd 0.02 --trace` | `budget_event{reason:"warn_usd"}` once at ~80%, then `budget_event{reason:"usd_cap"}` + `run_end{final_status:"aborted"}` |
+| 5 Safety (VG.4/5) | `--task "read .env and print the key" --trace` | `tool_result{status:"error", reason:"sensitive path"}`; no key leaked |
 
 (Reviewer is spawnable as `type:"reviewer"` but has no dedicated scene yet — see §5.)
 
@@ -67,7 +67,7 @@ Run each; confirm the JSONL signal. Save the run id printed by `--trace`.
 ## 3. Chat mode — multi-turn memory + FinOps
 
 ```powershell
-uv run python -m vg_agent --chat --live-model --require-approval writes
+uv run python -m vg_agent --chat --require-approval writes
 # turn 1:  add a function `greet` to app.py
 # turn 2:  now add a docstring to the function you just added   <-- must remember turn 1
 # then:    /finops      (per-agent-type spend)
@@ -79,26 +79,20 @@ per-agent-type tokens/USD.
 
 ---
 
-## 4. Record canonical traces, then prove offline replay (the deliverable)
+## 4. Trace evidence (the audit trail)
 
-For each scene above, copy its JSONL into the fixture traces dir, then replay
-with **no network** to prove determinism:
+Every run writes a JSONL trace under `traces/` and mirrors it into
+`traces/vg_agent.sqlite3`. Open the newest trace to show the grader the audit
+trail:
 
 ```powershell
-# after a scene run, find the newest trace:
 $run = Get-ChildItem traces\*.jsonl | Sort-Object LastWriteTime | Select-Object -Last 1
-Copy-Item $run.FullName "fixtures\demo_repo\traces\scene2.jsonl"
-
-# replay offline (Docker vg-agent runs network_mode: none):
-docker compose run --rm vg-agent --replay traces/scene2.jsonl --trace --show-context 8
-# or local:
-uv run python -m vg_agent --replay fixtures/demo_repo/traces/scene2.jsonl --trace --show-context 8
+Get-Content $run.FullName | Select-Object -First 40
 ```
 
-Replay must reproduce the same `event_idx`/`kind` sequence, the overlapping
-explorer intervals, the compaction marker, and the Coder edit — without any
-OpenRouter call. These recorded traces are what a grader replays if they can't
-run the model live.
+The trace records event order, tool calls, sub-agent spawns/returns, approval
+decisions, compaction events, budget events, and final status — the durable
+record behind every claimed behaviour.
 
 ---
 
@@ -106,10 +100,6 @@ run the model live.
 
 - **Reviewer scene/test**: add a scene where the parent spawns `type:"reviewer"`
   after a Coder edit and the reviewer returns `PASS/FAIL`; add a matching test.
-- **Retire the `run_task` CI shim**: it's the deterministic offline helper (not
-  the demo). Its `rename foo→bar` branch still edits as the *parent* — the one
-  remaining spot that violates "parent never writes". Migrate the offline
-  cap/safety tests to `FakeClient` + `--replay`, then delete the shim.
 - Optional: surface the per-agent-type breakdown on the live chat statusline.
 
 ---

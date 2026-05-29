@@ -10,12 +10,12 @@ Fixture layout:
 - `README.md`
 - `data/sample.log`
 
-The sample log is deterministic and larger than 200 KB so the parent
+The sample log is reproducible and larger than 200 KB so the parent
 `read_file data/sample.log` result exceeds `K_COMPACT`.
 
 VG slide assertions (context engineering — VG.2):
 
-- A deterministic demo step reads `data/sample.log` through the parent so at
+- The demo reads `data/sample.log` through the parent so at
   least one parent `tool_result` exceeds `K_COMPACT`.
 - A parent-scoped `compaction` event exists for that `tool_use_id`.
 - `compaction.original_event_idx` points to the original event.
@@ -163,18 +163,12 @@ Chat-mode assertions:
 - A turn-2 call that matches a turn-1 scoped approval records
   `decision="approved_scoped"` without invoking the prompt callback.
 
-Replay assertions (the deterministic / CI path):
+Live-loop test assertions (FakeClient, no network):
 
-- `--replay <recorded>.jsonl` reproduces every `event_idx` and `kind` from
-  the original run with no network call.
-- Replay preserves `agent_id`, `agent_type`, `started_at`, and `ended_at`
-  from the original.
-- A replayed run with `--network none` (Docker `vg-agent` service) completes
-  successfully, proving no network was needed.
+These exercise the one runtime path (`run_live_task`) with an injected
+`FakeClient`/`PipelineClient` so CI never opens the network.
 
-Live-mode test assertions (optional live path):
-
-- `--live-model` without `OPENROUTER_API_KEY` exits non-zero with a clear
+- A `--task` run without `OPENROUTER_API_KEY` exits with code `2` and a clear
   error.
 - A fake parent client can request a read and trigger a Coder spawn against
   a temp fixture.
@@ -188,7 +182,7 @@ Packaging assertions (VG.7, VG.8):
 
 - `docker compose config` exits 0.
 - `docker compose run --rm vg-agent --seed-fixture` exits 0 and creates the
-  deterministic fixture under the mounted `./workspace`.
+  fixture under the mounted `./workspace`.
 - `.env.example` enumerates every variable the agent reads from the
   environment.
 - `config.example.toml` enumerates every non-secret config key accepted by

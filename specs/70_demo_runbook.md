@@ -1,38 +1,32 @@
 # 70 Demo Runbook
 
-Five scenes covering every required rubric item. Each scene names: the
-command, the on-screen cue, the JSONL signal the grader can check post-hoc,
-and the rubric items it satisfies. The order is the recommended presentation
+Five live scenes covering every required rubric item. Each scene names: the
+command, the on-screen cue, the JSONL signal the grader can check post-hoc, and
+the rubric items it satisfies. The order is the recommended presentation
 sequence.
+
+The only runtime path is the **live** agent loop (`run_live_task`), where the
+parent model decides each turn whether to call a tool, spawn a typed sub-agent,
+or yield (VG.9). There is no offline/deterministic route.
 
 Setup once before all scenes:
 
 ```bash
 cp .env.example .env
-# optional: edit .env to add OPENROUTER_API_KEY for live-polish runs
+# edit .env and set OPENROUTER_API_KEY=<your-key>
 mkdir -p workspace traces
 docker compose build
 ```
 
-The primary grading path is the **live** agent loop (`run_live_task`), where the
-parent model decides each turn whether to call a tool, spawn a typed sub-agent,
-or yield (VG.9). Each scene starts from a clean copy:
+Each scene starts from a clean copy of the fixture:
 
 ```bash
 rm -rf workspace/*
 docker compose run --rm vg-agent --seed-fixture
 ```
 
-Run the headline scenes live with `vg-agent-live --live-model`. The deterministic
-offline net is **`--replay` of a previously recorded live run** (no network), which
-reproduces the same trace tree, overlapping sub-agent intervals, compaction markers,
-and Coder edits for graders who cannot run the model live. Record canonical traces
-once with `--live-model --trace` and ship them under
-`fixtures/demo_repo/traces/<scene>.jsonl`.
-
-> The non-live `--task` path (`run_task`) is a small deterministic CI shim used by
-> the offline test suite to prove caps/safety without a key; it is **not** the demo
-> path and does not exercise the typed pipeline.
+All commands run through the single networked `vg-agent` Compose service. The
+agent always runs live; it exits with code `2` if `OPENROUTER_API_KEY` is unset.
 
 ## Scene 1 — Autonomous rename (VG.5, VG.6, VG.9)
 
@@ -55,9 +49,9 @@ docker compose run --rm vg-agent \
 ## Scene 2 — Parallel summarise (VG.1, VG.2)
 
 ```bash
-docker compose run --rm vg-agent-live \
+docker compose run --rm vg-agent \
   --task "read data/sample.log, then summarise auth/ and utils.py in parallel" \
-  --live-model --trace --show-context 8
+  --trace --show-context 8
 ```
 
 - On-screen: statusline shows two Explorer entries simultaneously; final
@@ -79,7 +73,7 @@ docker compose run --rm vg-agent-live \
 ## Scene 3 — Grilling clarifies an ambiguous task (VG.1 reinforcement, VG.9, oral)
 
 ```bash
-docker compose run --rm vg-agent-live --task "make it better" --live-model --trace
+docker compose run --rm vg-agent --task "make it better" --trace
 ```
 
 - On-screen: parent spawns Grilling first; Grilling returns clarifying
@@ -99,22 +93,26 @@ docker compose run --rm vg-agent-live --task "make it better" --live-model --tra
 
 ```bash
 docker compose run --rm vg-agent \
-  --task "trigger deterministic budget cap proof" \
-  --max-usd 0.05 --trace
+  --task "read data/sample.log, then summarise auth/ and utils.py in parallel" \
+  --max-usd 0.02 --trace
 ```
 
+A deliberately tiny `--max-usd` makes the cap fire mid-run so the warning and
+hard stop are visible without a long task.
+
 - On-screen:
-  - First steps show statusline ticking USD upward.
-  - At 80% (`0.040`) the USD section is prefixed with `!` (warning).
-  - At 100% the run aborts; final message says the cap fired.
+  - First steps show the statusline ticking USD upward.
+  - At 80% of the cap the USD section is prefixed with `!` (warning).
+  - At 100% the run aborts; the final message says the cap fired.
 - JSONL signals:
-  - One `budget_event{reason:"warn_usd", crossed_at_step:N}`.
-  - One `budget_event{reason:"usd_cap"}` followed immediately by
+  - One `budget_event{budget_reason:"warn_usd"}`.
+  - One `budget_event{budget_reason:"usd_cap"}` followed immediately by
     `run_end{final_status:"aborted"}`.
 - Talking point: real-time monitoring + soft warning + hard cap — all three
-  parts of VG.3 in one demo.
+  parts of VG.3 in one demo. (`--max-tokens` triggers the same path on the
+  token budget.)
 
-## Scene 5 — Safety blocks + replay (VG.4, VG.5, VG.2)
+## Scene 5 — Safety blocks (VG.4, VG.5)
 
 ```bash
 # workspace .env read attempt
@@ -126,8 +124,6 @@ docker compose run --rm vg-agent --task "run: rm -rf ." --trace
 # Approval-gated edit (denied)
 docker compose run --rm vg-agent --task "edit app.py to add a new function" \
   --require-approval writes --trace
-# Replay the previous run with no network
-docker compose run --rm vg-agent --replay traces/<run_id>.jsonl --trace --show-context 5
 ```
 
 - On-screen:
@@ -136,8 +132,6 @@ docker compose run --rm vg-agent --replay traces/<run_id>.jsonl --trace --show-c
   - `rm -rf .` is refused by `run_bash` before `bash -c` is invoked.
   - The edit prompts for approval; entering `n` records a denied approval
     and the file is unchanged.
-  - The replay run reproduces the previous trace tree without making an
-    OpenRouter call (verify with `--network none`).
 - JSONL signals:
   - `tool_result{status:"error", reason:"sensitive path"}` for `.env`.
   - `tool_result{status:"ok"}` for accepted `pwd`.
@@ -145,17 +139,15 @@ docker compose run --rm vg-agent --replay traces/<run_id>.jsonl --trace --show-c
     message containing the offending token.
   - `approval{decision:"denied"}` for the edit attempt; no following
     `tool_call` for `edit_file`.
-  - The replay run's events match the original by `event_idx` and `kind`.
-- Talking point: deny-list + sensitive-path guard + approval gate + replay
-  determinism — covers VG.4, VG.5, and reinforces VG.2 via the compacted
-  markers visible in `--show-context`.
+- Talking point: deny-list + sensitive-path guard + approval gate — covers
+  VG.4 and VG.5.
 
 ## Rubric coverage map
 
 | Rubric item | Scene(s) |
 |---|---|
 | VG.1 — parallel sub-agents | 2 (primary), 3 (typed sub-agents) |
-| VG.2 — context engineering | 2, 5 |
+| VG.2 — context engineering | 2 |
 | VG.3 — cost monitoring + warning + hard cap | 4 |
 | VG.4 — harmful-call protection | 5 |
 | VG.5 — bash execution | 1, 5 (accepted + rejected bash) |

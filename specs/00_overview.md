@@ -3,10 +3,10 @@
 Goal: build a Claude Code / Codex competitor demo with one parent agent,
 typed sub-agents (Grilling, Explorer, Coder, Reviewer) including parallel
 fan-out, two context-engineering tricks, cost guards with live monitoring,
-JSONL observability, replay, and a deterministic fixture repository.
+JSONL observability, and a fixture repository.
 
 The competitor claim is about the agent shell and architecture: tool execution,
-context management, sub-agent boundaries, tracing, replay, safety, and cost
+context management, sub-agent boundaries, tracing, safety, and cost
 control. It is not a claim to beat frontier model quality.
 
 Non-goals:
@@ -24,8 +24,6 @@ Success criteria:
 - The VG slide run proves parent-scoped tool-result compaction and Explorer
   offloading with `--show-context`.
 - A cost-cap run aborts with `budget_event.budget_reason`.
-- Replay reconstructs the same trace tree and parent contexts without model
-  calls.
 - Generated executable project code is reproducible from specs.
 - **At least one demo scene shows ≥2 sub-agents executing with overlapping
   wall-clock and both returns consumed in the next parent step** (VG.1).
@@ -35,20 +33,16 @@ Success criteria:
 
 Execution model:
 
-- The default grading demo path is deterministic replay/fake-client behavior:
-  the parent loop still records model turns and tool decisions, but no
-  external API is required for proof. Optional `--live-model` runs use a real
-  OpenRouter-backed parent loop via LiteLLM where the model decides each turn
-  whether to call a tool or yield (VG.9). Sub-agent dispatch is model-driven,
-  guided by the typed pipeline in `specs/12_subagent_pipeline.md`.
-- `--replay <trace.jsonl>` reproduces a previously recorded live run via
-  `FakeClient` with no network call. This is the CI / deterministic path.
+- The runtime is a single live path: an OpenRouter-backed parent loop via
+  LiteLLM where the model decides each turn whether to call a tool or yield
+  (VG.9). Sub-agent dispatch is model-driven, guided by the typed pipeline in
+  `specs/12_subagent_pipeline.md`. The agent requires `OPENROUTER_API_KEY`.
 - Docker is the primary execution boundary for demos
   (`specs/50_packaging.md`); in-process safety properties hold without it
   so unit tests run unsandboxed.
-- Primary grading evidence is deterministic first: replay/fake-client traces
-  prove caps, parallelism, safety, and context behavior. Live OpenRouter runs
-  are optional polish, not the only way to satisfy a rubric item.
+- Grading evidence is the **live demo**. Unit tests exercise the same live loop
+  with an injected `FakeClient` (no network, per the no-network test rule) to
+  prove caps, parallelism, safety, and context behavior reproducibly in CI.
 - Source-of-truth and CLI details live in
   `specs/05_source_of_truth_and_generation.md`,
   `specs/15_cli_contract.md`, and

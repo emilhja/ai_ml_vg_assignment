@@ -24,15 +24,14 @@ fi
 mkdir -p "$ROOT_DIR/workspace" "$ROOT_DIR/traces"
 
 echo "building Docker live chat image..."
-docker compose build vg-agent-live
+docker compose build vg-agent
 
 echo "seeding chat workspace..."
 docker compose run --rm vg-agent --seed-fixture
 
 echo "opening VG Agent live chat in Docker..."
-exec docker compose run --rm -it vg-agent-live \
+exec docker compose run --rm -it vg-agent \
   --chat \
-  --live-model \
   --trace \
   --show-context 3 \
   --require-approval writes

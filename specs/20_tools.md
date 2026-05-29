@@ -86,7 +86,7 @@ Tool-result size cap:
 - Tool results above the cap are truncated in the value returned to the
   parent model and appended with a marker that points to the full content in
   the JSONL trace (`run_id`, `event_idx`). Truncation is recorded as a
-  `tool_result` field (`truncated: true`) so replays show what the model saw.
+  `tool_result` field (`truncated: true`) so the trace shows what the model saw.
 
 Path-resolution rules:
 
@@ -104,5 +104,5 @@ Approval policy (see `specs/10_main_agent.md` and `specs/30_runtime_governance.m
   `spawn_subagent` and `spawn_subagents` are also gated because they consume
   budget).
 - The runtime exposes `--require-approval [off|writes|all]` and `--yes`.
-  Default is `off` so the deterministic demo and tests stay reproducible;
+  Default is `off` so the unit tests stay reproducible;
   `writes` is the recommended live setting.
