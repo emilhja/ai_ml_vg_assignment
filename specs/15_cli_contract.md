@@ -34,6 +34,7 @@ model step.
 | `/finops` | Print a per-agent-type FinOps table for the session, including input/output/total tokens, model-call count, tool-call count, and USD spend. |
 | `/approvals` | Print the session approval history and any cached reusable approval scopes. |
 | `/reset` | Clear cached approval scopes, reset the session budget guard, clear conversation history, and emit a `session_reset` trace event. |
+| `/new` | Start a fresh chat session and trace inside the current REPL process; clear cached approval scopes, reset the budget guard, clear conversation history, and emit a `session_new` trace event in the new trace. |
 | `/show-context N` | Print the parent-visible context at parent step `N` as formatted JSON. If `N` is omitted, step `0` is used. |
 | `/help` | Print the available slash commands in their compact help form. |
 

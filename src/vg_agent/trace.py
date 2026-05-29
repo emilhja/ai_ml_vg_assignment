@@ -156,6 +156,8 @@ def render_tree(events: list[dict[str, object]]) -> str:
             lines.append(f"{prefix}{event['event_idx']:03d} redaction {event.get('pattern')} count={event.get('count')} orig_idx={event.get('original_event_idx')}")
         elif kind == "session_reset":
             lines.append(f"{prefix}{event['event_idx']:03d} session_reset")
+        elif kind == "session_new":
+            lines.append(f"{prefix}{event['event_idx']:03d} session_new")
         elif kind == "run_end":
             lines.append(f"{prefix}{event['event_idx']:03d} run_end {event.get('final_status')} cost={event.get('total_cost_usd')}")
         else:

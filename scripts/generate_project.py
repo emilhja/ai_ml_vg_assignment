@@ -1034,6 +1034,8 @@ def render_tree(events: list[dict[str, object]]) -> str:
             lines.append(f"{prefix}{event['event_idx']:03d} redaction {event.get('pattern')} count={event.get('count')} orig_idx={event.get('original_event_idx')}")
         elif kind == "session_reset":
             lines.append(f"{prefix}{event['event_idx']:03d} session_reset")
+        elif kind == "session_new":
+            lines.append(f"{prefix}{event['event_idx']:03d} session_new")
         elif kind == "run_end":
             lines.append(f"{prefix}{event['event_idx']:03d} run_end {event.get('final_status')} cost={event.get('total_cost_usd')}")
         else:
@@ -1454,7 +1456,7 @@ FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "run_bash": {
         "name": "run_bash",
-        "description": "Run one simple inspection command through bash, or exactly `rm <relative-file>` for approved single-file deletion. No pipes, redirection, shell control, Python, pytest, package managers, network tools, command chains, rm flags, globs, or directory deletion.",
+        "description": "Run one simple inspection command through bash, or exactly `rm <relative-file>` for approved single-file deletion. For top-level folder listings use `find . -maxdepth 1 -type d`. No pipes, redirection, shell control, Python, pytest, package managers, network tools, command chains, rm flags, globs, or directory deletion.",
         "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
     },
 }
@@ -2362,6 +2364,7 @@ SLASH_COMMANDS = (
     "/finops",
     "/approvals",
     "/reset",
+    "/new",
     "/show-context",
     "/help",
 )
@@ -2374,6 +2377,7 @@ SLASH_COMMAND_META = {
     "/finops": "Show per-agent token, tool, and cost table",
     "/approvals": "Show approval history and cached scopes",
     "/reset": "Clear approvals, budget, and chat history",
+    "/new": "Start a fresh chat session and trace",
     "/show-context": "N: parent step index; default 0",
     "/help": "Show slash command help",
 }
@@ -2842,7 +2846,16 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 policy.cache.clear()
                 guard = BudgetGuard.for_workspace(root)
                 conversation.clear()
+                last_intent_prompt = ""
                 recorder.emit("session_reset")
+                continue
+            if prompt == "/new":
+                policy.cache.clear()
+                guard = BudgetGuard.for_workspace(root)
+                conversation.clear()
+                last_intent_prompt = ""
+                recorder = TraceRecorder(root, redact=not args.no_redact, event_sink=_make_progress_sink())
+                recorder.emit("session_new")
                 continue
             if prompt == "/finops":
                 _print_finops(guard, recorder)

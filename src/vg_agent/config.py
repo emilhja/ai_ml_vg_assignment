@@ -1,6 +1,6 @@
 """Generated runtime constants from MODEL_CONFIG.md."""
 
-SPEC_DIGEST = "5e6983ce3a4e239d2ed71ee4d629e1a9643f560cc19a5c479feba05ca9335fe2"
+SPEC_DIGEST = "f01720fbe84fa7977b519daef01840bd5ef564b00ffe0f71f7733a1d1683cfea"
 
 PARENT_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
 GRILLING_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"

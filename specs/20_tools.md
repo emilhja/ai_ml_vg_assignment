@@ -60,6 +60,9 @@ Windows/Git Bash rules:
 - The safety gate is intentionally conservative. If a demo needs a command not
   on the allowlist, add it to the spec first, regenerate code, and add a test
   proving it cannot mutate the workspace under any flag combination.
+- Use safe single-command forms instead of pipelines. For example, top-level
+  folders should be listed with `find . -maxdepth 1 -type d`, not
+  `ls -l | grep '^d'`.
 - Normalize Windows and Git Bash paths at tool boundaries.
 
 Sensitive-path denylist (applies to `read_file`, `read_file_range`,

@@ -18,6 +18,7 @@ from vg_agent.agent import (
     ApprovalOutcome,
     ApprovalPolicy,
     ApprovalRequest,
+    PARENT_SYSTEM_PROMPT,
     PARENT_TOOL_SCHEMAS,
     run_live_task,
     run_task,
@@ -264,9 +265,11 @@ def test_run_bash_rejects_dangerous_commands(tmp_path: Path) -> None:
     assert validate_shell_command("rm -rf .") is not None
     assert validate_shell_command("grep -R keep .; rm -rf .") is not None
     assert validate_shell_command("grep keep victim.txt > out.txt") is not None
+    assert validate_shell_command('ls -l | grep "^d"') is not None
     assert validate_shell_command("Remove-Item victim.txt") is not None
     assert validate_shell_command("sed -i 's/a/b/' foo") is not None
     assert validate_shell_command("find . -delete") is not None
+    assert validate_shell_command("find . -maxdepth 1 -type d") is None
     assert validate_shell_command("git fetch origin") is not None
     assert validate_shell_command("ssh user@host ls") is not None
 
@@ -284,6 +287,10 @@ def test_run_bash_rejects_dangerous_commands(tmp_path: Path) -> None:
 
     folder = tmp_path / "folder"
     folder.mkdir()
+    list_dirs = run_bash(tmp_path, "find . -maxdepth 1 -type d", "list-dirs")
+    assert list_dirs["status"] == "ok"
+    assert "./folder" in str(list_dirs["result_full"])
+
     result = run_bash(tmp_path, "rm folder", "dir-rm")
     assert result["status"] == "error"
     assert "regular files" in str(result["result_full"])
@@ -364,6 +371,10 @@ def test_parent_has_no_write_tools_and_coder_is_sole_mutation_path(tmp_path: Pat
     names = {schema["name"] for schema in PARENT_TOOL_SCHEMAS}
     assert "write_file" not in names and "edit_file" not in names
     assert {"spawn_subagent", "spawn_subagents"} <= names
+    prompt_tool_block = PARENT_SYSTEM_PROMPT.split("Pipeline guidance", 1)[0]
+    assert "write_file" not in prompt_tool_block
+    assert "edit_file" not in prompt_tool_block
+    assert "spawn a Coder sub-agent" in PARENT_SYSTEM_PROMPT
 
     write_fixture(tmp_path)
     client = PipelineClient(
@@ -474,11 +485,14 @@ def test_chat_slash_command_completer_matches_prefixes() -> None:
     completer = _slash_command_completer()
     all_commands = list(completer.get_completions(Document("/"), CompleteEvent()))
     finops = list(completer.get_completions(Document("/fin"), CompleteEvent()))
+    new_session = list(completer.get_completions(Document("/ne"), CompleteEvent()))
     show_context = list(completer.get_completions(Document("/show"), CompleteEvent()))
 
     assert [completion.text for completion in all_commands] == list(SLASH_COMMANDS)
     assert [completion.text for completion in finops] == ["/finops"]
+    assert [completion.text for completion in new_session] == ["/new"]
     assert [completion.text for completion in show_context] == ["/show-context"]
+    assert "fresh chat session" in new_session[0].display_meta_text
     assert "N: parent step index; default 0" in show_context[0].display_meta_text
     assert len(show_context[0].display_text) > len(show_context[0].text)
     assert list(completer.get_completions(Document(""), CompleteEvent())) == []
@@ -1067,3 +1081,59 @@ def test_chat_slash_reset_emits_event(tmp_path: Path) -> None:
     assert len(traces) == 1
     events = read_events(traces[0])
     assert any(e["kind"] == "session_reset" for e in events)
+
+
+def test_chat_slash_new_starts_fresh_trace_and_live_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vg_agent import __main__ as cli
+
+    prompts = iter(["remember first turn", "/new", "second turn", "/exit"])
+    history_lengths: list[int] = []
+
+    def read_prompt() -> str:
+        return next(prompts)
+
+    def fake_run_live_task(
+        root: Path,
+        prompt: str,
+        recorder: TraceRecorder,
+        *,
+        client: object,
+        guard: BudgetGuard,
+        policy: ApprovalPolicy,
+        history: list[dict[str, object]],
+    ) -> TraceRecorder:
+        history_lengths.append(len(history))
+        history.append({"role": "user", "content": prompt})
+        recorder.emit("user_prompt", prompt=prompt)
+        recorder.emit(
+            "assistant_step",
+            assistant_text=f"ack {prompt}",
+            tool_calls=[],
+            stop_reason="end_turn",
+        )
+        return recorder
+
+    monkeypatch.setattr(cli, "_make_chat_prompt", lambda _history_path: (read_prompt, lambda: None))
+    monkeypatch.setattr(cli, "LiveModelClient", SimpleNamespace(from_env=lambda recorder=None: object()))
+    monkeypatch.setattr(cli, "run_live_task", fake_run_live_task)
+
+    args = SimpleNamespace(
+        no_redact=False,
+        require_approval="off",
+        yes=False,
+        live_model=True,
+    )
+    assert cli._chat_loop(tmp_path, args) == 0
+    assert history_lengths == [0, 0]
+
+    traces = sorted((tmp_path / "traces").glob("*.jsonl"))
+    assert len(traces) == 2
+    loaded = [read_events(path) for path in traces]
+    first_trace = next(events for events in loaded if any(e.get("prompt") == "remember first turn" for e in events))
+    second_trace = next(events for events in loaded if any(e["kind"] == "session_new" for e in events))
+    assert not any(e["kind"] == "session_new" for e in first_trace)
+    assert any(e.get("prompt") == "second turn" for e in second_trace)
+    assert not any(e.get("prompt") == "remember first turn" for e in second_trace)

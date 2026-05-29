@@ -96,6 +96,7 @@ SLASH_COMMANDS = (
     "/finops",
     "/approvals",
     "/reset",
+    "/new",
     "/show-context",
     "/help",
 )
@@ -108,6 +109,7 @@ SLASH_COMMAND_META = {
     "/finops": "Show per-agent token, tool, and cost table",
     "/approvals": "Show approval history and cached scopes",
     "/reset": "Clear approvals, budget, and chat history",
+    "/new": "Start a fresh chat session and trace",
     "/show-context": "N: parent step index; default 0",
     "/help": "Show slash command help",
 }
@@ -576,7 +578,16 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 policy.cache.clear()
                 guard = BudgetGuard.for_workspace(root)
                 conversation.clear()
+                last_intent_prompt = ""
                 recorder.emit("session_reset")
+                continue
+            if prompt == "/new":
+                policy.cache.clear()
+                guard = BudgetGuard.for_workspace(root)
+                conversation.clear()
+                last_intent_prompt = ""
+                recorder = TraceRecorder(root, redact=not args.no_redact, event_sink=_make_progress_sink())
+                recorder.emit("session_new")
                 continue
             if prompt == "/finops":
                 _print_finops(guard, recorder)
