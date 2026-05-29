@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,6 +68,9 @@ class TraceRecorder:
             self.session_id = self.run_id
         self.turn_counter = 0
         self.current_turn_id: str | None = None
+        # Reentrant lock: parallel sub-agents (spawn_subagents) emit concurrently,
+        # and emit() re-enters via _emit_redaction.
+        self._lock = threading.RLock()
         self.sqlite_store: SQLiteTraceStore | None = None
         if self.sqlite_enabled:
             try:
@@ -74,42 +78,44 @@ class TraceRecorder:
             except Exception as exc:  # pragma: no cover - best-effort mirror
                 sys.stderr.write(f"warning: sqlite trace disabled: {exc}\n")
 
-    def emit(self, kind: str, agent_id: str = "parent", parent_id: str | None = None, **fields: object) -> dict[str, object]:
-        if kind == "user_prompt":
-            self.turn_counter += 1
-            self.current_turn_id = f"{self.session_id}:turn:{self.turn_counter}"
-            fields.setdefault("turn_id", self.current_turn_id)
-            fields.setdefault("turn_index", self.turn_counter)
-        elif self.current_turn_id is not None:
-            fields.setdefault("turn_id", self.current_turn_id)
-            fields.setdefault("turn_index", self.turn_counter)
-        event: dict[str, object] = {
-            "run_id": self.run_id,
-            "session_id": self.session_id,
-            "event_idx": len(self.events),
-            "timestamp_iso": now_iso(),
-            "agent_id": agent_id,
-            "parent_id": parent_id,
-            "kind": kind,
-        }
-        event.update(fields)
-        redaction_summary: list[tuple[str, int]] = []
-        if self.redact:
-            event, redaction_summary = _redact_event_fields(event)
-        self.events.append(event)
-        with self.path.open("a", encoding="utf-8", newline="\n") as fh:
-            fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
-        if self.sqlite_store is not None:
-            try:
-                self.sqlite_store.record_event(event)
-            except Exception as exc:  # pragma: no cover - JSONL remains canonical
-                sys.stderr.write(f"warning: sqlite trace write failed: {exc}\n")
-                self.sqlite_store = None
-        if self.event_sink is not None:
-            self.event_sink(event)
-        if redaction_summary and kind != "redaction":
-            self._emit_redaction(int(event["event_idx"]), redaction_summary)
-        return event
+    def emit(self, kind: str, agent_id: str = "parent", parent_id: str | None = None, agent_type: str = "parent", **fields: object) -> dict[str, object]:
+        with self._lock:
+            if kind == "user_prompt":
+                self.turn_counter += 1
+                self.current_turn_id = f"{self.session_id}:turn:{self.turn_counter}"
+                fields.setdefault("turn_id", self.current_turn_id)
+                fields.setdefault("turn_index", self.turn_counter)
+            elif self.current_turn_id is not None:
+                fields.setdefault("turn_id", self.current_turn_id)
+                fields.setdefault("turn_index", self.turn_counter)
+            event: dict[str, object] = {
+                "run_id": self.run_id,
+                "session_id": self.session_id,
+                "event_idx": len(self.events),
+                "timestamp_iso": now_iso(),
+                "agent_id": agent_id,
+                "agent_type": agent_type,
+                "parent_id": parent_id,
+                "kind": kind,
+            }
+            event.update(fields)
+            redaction_summary: list[tuple[str, int]] = []
+            if self.redact:
+                event, redaction_summary = _redact_event_fields(event)
+            self.events.append(event)
+            with self.path.open("a", encoding="utf-8", newline="\n") as fh:
+                fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+            if self.sqlite_store is not None:
+                try:
+                    self.sqlite_store.record_event(event)
+                except Exception as exc:  # pragma: no cover - JSONL remains canonical
+                    sys.stderr.write(f"warning: sqlite trace write failed: {exc}\n")
+                    self.sqlite_store = None
+            if self.event_sink is not None:
+                self.event_sink(event)
+            if redaction_summary and kind != "redaction":
+                self._emit_redaction(int(event["event_idx"]), redaction_summary)
+            return event
 
     def _emit_redaction(self, original_event_idx: int, summary: list[tuple[str, int]]) -> None:
         for pattern_name, count in summary:
@@ -142,6 +148,8 @@ def render_tree(events: list[dict[str, object]]) -> str:
             lines.append(f"{prefix}{event['event_idx']:03d} budget_event {event.get('budget_reason')}")
         elif kind == "approval":
             lines.append(f"{prefix}{event['event_idx']:03d} approval {event.get('tool')} decision={event.get('decision')} scope={event.get('scope_key')}")
+        elif kind == "model_error":
+            lines.append(f"{prefix}{event['event_idx']:03d} {event['agent_id']} model_error {event.get('error_type')} retryable={event.get('retryable')}")
         elif kind == "egress_blocked":
             lines.append(f"{prefix}{event['event_idx']:03d} egress_blocked host={event.get('host')!r}")
         elif kind == "redaction":
@@ -216,5 +224,12 @@ def show_context(events: list[dict[str, object]], step_idx: int) -> list[dict[st
                 "role": "meta",
                 "kind": "egress_blocked",
                 "host": event.get("host"),
+            })
+        elif kind == "model_error":
+            context.append({
+                "role": "meta",
+                "kind": "model_error",
+                "message": event.get("message"),
+                "retryable": event.get("retryable"),
             })
     return context

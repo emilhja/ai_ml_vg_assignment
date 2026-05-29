@@ -3,7 +3,7 @@ name = "vg-agent"
 version = "0.1.0"
 description = "VG assignment agent with sub-agent offloading, compaction, traces, and replay."
 requires-python = ">=3.10"
-dependencies = ["litellm>=1.0"]
+dependencies = ["litellm>=1.0", "prompt-toolkit>=3.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

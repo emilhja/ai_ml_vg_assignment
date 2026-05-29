@@ -7,6 +7,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -23,6 +25,7 @@ from vg_agent.agent import (
 from vg_agent.live_model_client import (
     EndpointPinViolation,
     LiveModelClient,
+    LiveModelRateLimitError,
     ModelTurn,
     ToolCall,
 )
@@ -56,6 +59,66 @@ class FakeClient:
         if not self.turns:
             raise AssertionError("fake client has no remaining turns")
         return self.turns.pop(0)
+
+
+class FailingRateLimitClient:
+    def complete(self, **_kwargs: object) -> ModelTurn:
+        raise LiveModelRateLimitError(
+            "live model provider rate-limited openrouter/google/gemini-2.0-flash-001. Retry shortly."
+        )
+
+
+def _classify_agent(system_prompt: str) -> str:
+    if "parent coding agent" in system_prompt:
+        return "parent"
+    if "You are Grilling" in system_prompt:
+        return "grilling"
+    if "You are Explorer" in system_prompt:
+        return "explorer"
+    if "You are Coder" in system_prompt:
+        return "coder"
+    if "You are Reviewer" in system_prompt:
+        return "reviewer"
+    return "parent"
+
+
+def _last_user_text(messages: list[dict[str, object]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return " ".join(str(b.get("content") or b.get("text") or "") for b in content if isinstance(b, dict))
+    return ""
+
+
+class PipelineClient:
+    """Thread-safe fake routing by typed system prompt.
+
+    Parent turns are popped in order. Sub-agents pop from a per-type queue when
+    provided; otherwise they return a single no-tool summary echoing the question,
+    which keeps concurrent (threaded) spawn_subagents deterministic regardless of
+    completion order.
+    """
+
+    def __init__(self, parent_turns: list[ModelTurn], by_type: dict[str, list[ModelTurn]] | None = None) -> None:
+        self.parent_turns = list(parent_turns)
+        self.by_type = {k: list(v) for k, v in (by_type or {}).items()}
+        self.lock = threading.Lock()
+        self.calls: list[dict[str, object]] = []
+
+    def complete(self, **kwargs: object) -> ModelTurn:
+        with self.lock:
+            self.calls.append(json.loads(json.dumps(kwargs, default=str)))
+            agent = _classify_agent(str(kwargs.get("system_prompt") or ""))
+            if agent == "parent":
+                return self.parent_turns.pop(0)
+            queue = self.by_type.get(agent)
+            if queue:
+                return queue.pop(0)
+            question = _last_user_text(kwargs.get("messages") or [])  # type: ignore[arg-type]
+            return ModelTurn(assistant_text=f"{agent} summary: {question}", input_tokens=20, output_tokens=10)
 
 
 def test_budget_guard_reasons_and_costs() -> None:
@@ -212,6 +275,20 @@ def test_run_bash_rejects_dangerous_commands(tmp_path: Path) -> None:
     assert "refused unsafe command" in str(result["result_full"])
     assert victim.exists()
 
+    delete_me = tmp_path / "delete-me.txt"
+    delete_me.write_text("remove me", encoding="utf-8")
+    assert validate_shell_command("rm delete-me.txt") is None
+    result = run_bash(tmp_path, "rm delete-me.txt", "safe-rm")
+    assert result["status"] == "ok"
+    assert not delete_me.exists()
+
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    result = run_bash(tmp_path, "rm folder", "dir-rm")
+    assert result["status"] == "error"
+    assert "regular files" in str(result["result_full"])
+    assert folder.exists()
+
 
 def test_live_model_cli_requires_openrouter_key(tmp_path: Path) -> None:
     env = os.environ.copy()
@@ -261,6 +338,15 @@ def test_file_tools_reject_path_traversal(tmp_path: Path) -> None:
     assert ok["status"] == "ok"
 
 
+def test_edit_file_reports_replacement_count(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("foo = 1\nprint(foo)\n", encoding="utf-8")
+    result = edit_file(tmp_path, "app.py", "foo", "bar", "edit-count")
+    assert result["status"] == "ok"
+    assert "replaced 2 occurrence(s)" in str(result["result_full"])
+    assert target.read_text(encoding="utf-8") == "bar = 1\nprint(bar)\n"
+
+
 def test_live_loop_budget_abort_before_client_call(tmp_path: Path) -> None:
     client = FakeClient([])
     recorder = TraceRecorder(tmp_path)
@@ -272,30 +358,53 @@ def test_live_loop_budget_abort_before_client_call(tmp_path: Path) -> None:
     assert events[-1]["final_status"] == "aborted"
 
 
-def test_live_parent_tool_flow_reads_and_edits_fixture(tmp_path: Path) -> None:
+def test_parent_has_no_write_tools_and_coder_is_sole_mutation_path(tmp_path: Path) -> None:
+    # VG.6 / architecture: the parent tool schema never exposes write/edit; all
+    # mutation flows through a Coder sub-agent.
+    names = {schema["name"] for schema in PARENT_TOOL_SCHEMAS}
+    assert "write_file" not in names and "edit_file" not in names
+    assert {"spawn_subagent", "spawn_subagents"} <= names
+
     write_fixture(tmp_path)
-    client = FakeClient([
-        ModelTurn(
-            assistant_text="I will inspect and edit app.py.",
-            tool_calls=[
-                ToolCall("read-app", "read_file", {"path": "app.py"}),
-                ToolCall("edit-app", "edit_file", {"path": "app.py", "old": "foo", "new": "baz"}),
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Inspect then delegate the edit to a Coder.",
+                [ToolCall("read-app", "read_file", {"path": "app.py"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn(
+                "Delegate the rename to a Coder sub-agent.",
+                [ToolCall("spawn-coder", "spawn_subagent", {"type": "coder", "question": "rename foo to baz in app.py"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("Coder renamed foo to baz in app.py.", input_tokens=100, output_tokens=20),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn(
+                    "Applying the minimal edit.",
+                    [ToolCall("coder-edit", "edit_file", {"path": "app.py", "old": "foo", "new": "baz"})],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn("app.py: renamed foo to baz", input_tokens=40, output_tokens=10),
             ],
-            stop_reason="tool_use",
-            input_tokens=100,
-            output_tokens=50,
-        ),
-        ModelTurn("Renamed foo to baz.", input_tokens=100, output_tokens=20),
-    ])
+        },
+    )
     recorder = TraceRecorder(tmp_path)
-    run_live_task(tmp_path, "rename foo to baz", recorder, client=client)
+    run_live_task(tmp_path, "rename foo to baz in app.py", recorder, client=client)
     assert "def baz(" in (tmp_path / "app.py").read_text(encoding="utf-8")
     events = read_events(recorder.path)
-    assert events[1]["kind"] == "llm_start"
-    assert events[1]["model"] == config.PARENT_MODEL_ID
-    assert [e["tool"] for e in events if e["kind"] == "tool_result"] == ["read_file", "edit_file"]
+    coder_spawn = next(e for e in events if e["kind"] == "subagent_spawn" and e["agent_type"] == "coder")
+    edit_results = [e for e in events if e["kind"] == "tool_result" and e["tool"] == "edit_file"]
+    assert edit_results and edit_results[0]["agent_id"] == coder_spawn["child_agent_id"]
     assert events[-1]["final_status"] == "ok"
-    assert len(client.calls) == 2
 
 
 def test_trace_event_sink_receives_progress_events(tmp_path: Path) -> None:
@@ -307,6 +416,56 @@ def test_trace_event_sink_receives_progress_events(tmp_path: Path) -> None:
 
     assert seen and seen[0]["kind"] == "llm_start"
     assert "[llm] parent step 1" in str(_format_progress_event(seen[0]))
+
+
+def test_progress_formats_model_error(tmp_path: Path) -> None:
+    recorder = TraceRecorder(tmp_path)
+    event = recorder.emit(
+        "model_error",
+        agent_id="parent",
+        step_idx=1,
+        message="live model provider rate-limited openrouter/google/gemini-2.0-flash-001. Retry shortly.",
+        retryable=True,
+    )
+
+    from vg_agent.__main__ import _format_progress_event
+
+    line = str(_format_progress_event(event))
+    assert "failed retryable" in line
+    assert "rate-limited" in line
+
+
+def test_live_chat_statusline_shows_context_and_budget(tmp_path: Path) -> None:
+    recorder = TraceRecorder(tmp_path)
+    guard = BudgetGuard(max_steps=5, max_tokens=10_000, max_usd=0.5)
+    recorder.emit("llm_start", model=config.PARENT_MODEL_ID, step_idx=1, tokens_in=1234, max_tokens=4096)
+    guard.record_model_call(config.PARENT_MODEL_ID, 1234, 66)
+
+    from vg_agent.__main__ import _chat_statusline_color, _format_chat_statusline
+
+    line = _format_chat_statusline(recorder, guard, live_model=True, width=200)
+    assert "[live]" in line
+    assert "ctx 1.2k in" in line
+    assert "run #---------" in line
+    assert "1.3k/10.0k tok" in line
+    assert "steps 1/5" in line
+    assert "usd $" in line
+    assert _chat_statusline_color(line, use_color=True).startswith("\x1b[32m[live]")
+    assert _chat_statusline_color(line, use_color=True).endswith("\x1b[0m")
+
+
+def test_chat_slash_command_completer_matches_prefixes() -> None:
+    from prompt_toolkit.completion import CompleteEvent
+    from prompt_toolkit.document import Document
+    from vg_agent.__main__ import SLASH_COMMAND_HELP, _slash_command_completer
+
+    completer = _slash_command_completer()
+    finops = list(completer.get_completions(Document("/fin"), CompleteEvent()))
+    show_context = list(completer.get_completions(Document("/show"), CompleteEvent()))
+
+    assert [completion.text for completion in finops] == ["/finops"]
+    assert [completion.text for completion in show_context] == ["/show-context"]
+    assert "/show-context N" in SLASH_COMMAND_HELP
 
 
 def test_live_explorer_context_excludes_child_intermediate_results(tmp_path: Path) -> None:
@@ -338,41 +497,79 @@ def test_live_explorer_context_excludes_child_intermediate_results(tmp_path: Pat
     assert "child-read" not in context_text
 
 
-def test_parent_exposes_parallel_spawn_tool_and_consumes_returns(tmp_path: Path) -> None:
+def test_parallel_explorers_run_concurrently_with_overlap(tmp_path: Path) -> None:
+    # VG.1: a single spawn_subagents call runs >=2 explorers with overlapping
+    # wall-clock, and the parent consumes both returns.
     names = {schema["name"] for schema in PARENT_TOOL_SCHEMAS}
     assert {"spawn_subagent", "spawn_subagents"} <= names
 
-    client = FakeClient([
-        ModelTurn(
-            "Delegating two bounded inspections.",
-            [
-                ToolCall(
-                    "spawn-many",
-                    "spawn_subagents",
-                    {
-                        "requests": [
-                            {"question": "inspect app.py"},
-                            {"question": "inspect utils.py"},
-                        ]
-                    },
-                )
-            ],
-            stop_reason="tool_use",
-            input_tokens=100,
-            output_tokens=40,
-        ),
-        ModelTurn("Explorer summary: app.py inspected.", input_tokens=60, output_tokens=20),
-        ModelTurn("Explorer summary: utils.py inspected.", input_tokens=60, output_tokens=20),
-        ModelTurn("Parent final using both Explorer summaries.", input_tokens=100, output_tokens=20),
-    ])
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Delegating two bounded inspections in parallel.",
+                [
+                    ToolCall(
+                        "spawn-many",
+                        "spawn_subagents",
+                        {
+                            "requests": [
+                                {"type": "explorer", "question": "inspect app.py SENTINEL_APP"},
+                                {"type": "explorer", "question": "inspect utils.py SENTINEL_UTILS"},
+                            ]
+                        },
+                    )
+                ],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=40,
+            ),
+            ModelTurn("Parent integrates SENTINEL_APP and SENTINEL_UTILS findings.", input_tokens=100, output_tokens=20),
+        ],
+    )
     recorder = TraceRecorder(tmp_path)
-    run_live_task(tmp_path, "inspect app.py and utils.py", recorder, client=client)
-    results = [e for e in read_events(recorder.path) if e["kind"] == "tool_result"]
-    parallel_result = next(e for e in results if e["tool"] == "spawn_subagents")
+    run_live_task(tmp_path, "inspect app.py and utils.py in parallel", recorder, client=client)
+    events = read_events(recorder.path)
+
+    returns = [e for e in events if e["kind"] == "subagent_return" and e["agent_type"] == "explorer"]
+    assert len(returns) == 2
+    (a_start, a_end), (b_start, b_end) = [(r["started_at"], r["ended_at"]) for r in returns]
+    assert a_start <= b_end and b_start <= a_end  # genuinely overlapping wall-clock
+
+    parallel_result = next(e for e in events if e["kind"] == "tool_result" and e["tool"] == "spawn_subagents")
     payload = json.loads(str(parallel_result["result_full"]))
     assert [item["status"] for item in payload] == ["ok", "ok"]
-    assert "app.py inspected" in payload[0]["payload"]
-    assert "utils.py inspected" in payload[1]["payload"]
+    assert "SENTINEL_APP" in payload[0]["payload"]
+    assert "SENTINEL_UTILS" in payload[1]["payload"]
+    final = [e for e in events if e["kind"] == "assistant_step" and e["agent_id"] == "parent"][-1]
+    assert "SENTINEL_APP" in final["assistant_text"] and "SENTINEL_UTILS" in final["assistant_text"]
+
+
+def test_parallel_cap_and_coder_conflict(tmp_path: Path) -> None:
+    # A request beyond MAX_PARALLEL_SUBAGENTS overflows; a second Coder in the
+    # same batch is serialised as a conflict rather than run concurrently.
+    requests = [{"type": "explorer", "question": f"q{i}"} for i in range(config.MAX_PARALLEL_SUBAGENTS + 1)]
+    requests[0] = {"type": "coder", "question": "edit A"}
+    requests[1] = {"type": "coder", "question": "edit B"}
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Over-request on purpose.",
+                [ToolCall("spawn-many", "spawn_subagents", {"requests": requests})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=40,
+            ),
+            ModelTurn("Done.", input_tokens=50, output_tokens=10),
+        ],
+        by_type={"coder": [ModelTurn("A: edited", input_tokens=20, output_tokens=10)]},
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "batch", recorder, client=client)
+    payload = json.loads(str(next(e for e in read_events(recorder.path) if e["kind"] == "tool_result" and e["tool"] == "spawn_subagents")["result_full"]))
+    statuses = [item["status"] for item in payload]
+    assert "conflict" in statuses  # second Coder serialised
+    assert "tool_error" in statuses  # fifth request over the cap
+    assert any(item["payload"] == "parallel cap exceeded" for item in payload)
 
 
 def test_live_parent_large_tool_result_compacted_before_next_turn(tmp_path: Path) -> None:
@@ -466,39 +663,45 @@ def test_approval_scope_cache_hit(tmp_path: Path) -> None:
     write_fixture(tmp_path)
     (tmp_path / "utils.py").write_text("foo=1\n", encoding="utf-8")
 
-    calls = {"count": 0}
+    prompt_calls: dict[str, int] = {}
 
     def grant_scoped(request: ApprovalRequest) -> ApprovalOutcome:
-        calls["count"] += 1
-        return ApprovalOutcome(decision="approved_scoped", scope_key="", reason="grant root")
+        prompt_calls[request.tool] = prompt_calls.get(request.tool, 0) + 1
+        if request.tool == "edit_file":
+            return ApprovalOutcome(decision="approved_scoped", scope_key="", reason="grant root for edits")
+        return ApprovalOutcome(decision="approved_always", reason="allow spawn")
 
     policy = ApprovalPolicy(mode="writes", prompt=grant_scoped)
 
-    client = FakeClient([
-        ModelTurn(
-            "edit app",
-            [ToolCall("e1", "edit_file", {"path": "app.py", "old": "foo", "new": "bar"})],
-            stop_reason="tool_use",
-            input_tokens=10,
-            output_tokens=5,
-        ),
-        ModelTurn(
-            "edit utils",
-            [ToolCall("e2", "edit_file", {"path": "utils.py", "old": "foo", "new": "bar"})],
-            stop_reason="tool_use",
-            input_tokens=10,
-            output_tokens=5,
-        ),
-        ModelTurn("done.", input_tokens=10, output_tokens=5),
-    ])
+    # One Coder edits two files in the same directory; the second edit_file reuses
+    # the scoped grant from the first without re-prompting.
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Delegate both edits to a Coder.",
+                [ToolCall("spawn-coder", "spawn_subagent", {"type": "coder", "question": "rename foo to bar in app.py and utils.py"})],
+                stop_reason="tool_use",
+                input_tokens=10,
+                output_tokens=5,
+            ),
+            ModelTurn("Coder renamed foo to bar in both files.", input_tokens=10, output_tokens=5),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn("edit app", [ToolCall("e1", "edit_file", {"path": "app.py", "old": "foo", "new": "bar"})], stop_reason="tool_use", input_tokens=10, output_tokens=5),
+                ModelTurn("edit utils", [ToolCall("e2", "edit_file", {"path": "utils.py", "old": "foo", "new": "bar"})], stop_reason="tool_use", input_tokens=10, output_tokens=5),
+                ModelTurn("both: renamed", input_tokens=10, output_tokens=5),
+            ],
+        },
+    )
     recorder = TraceRecorder(tmp_path)
     run_live_task(tmp_path, "rename in two files", recorder, client=client, policy=policy)
-    approvals = [e for e in recorder.events if e["kind"] == "approval"]
-    assert len(approvals) == 2
-    assert approvals[0]["decision"] == "approved_scoped"
-    assert approvals[1]["decision"] == "approved_scoped"
-    # Prompt callback invoked only on the first call
-    assert calls["count"] == 1
+    edit_approvals = [e for e in recorder.events if e["kind"] == "approval" and e["tool"] == "edit_file"]
+    assert len(edit_approvals) == 2
+    assert all(a["decision"] == "approved_scoped" for a in edit_approvals)
+    # The edit_file prompt callback fires only once; the second edit is a cache hit.
+    assert prompt_calls.get("edit_file") == 1
+    assert "bar" in (tmp_path / "app.py").read_text(encoding="utf-8")
 
 
 def test_approval_scope_does_not_bypass_denylist(tmp_path: Path) -> None:
@@ -508,28 +711,28 @@ def test_approval_scope_does_not_bypass_denylist(tmp_path: Path) -> None:
         return ApprovalOutcome(decision="approved_always", reason="trust me")
 
     policy = ApprovalPolicy(mode="writes", prompt=grant_always)
-    # First, populate cache with a write to app.py
-    client = FakeClient([
-        ModelTurn(
-            "edit app",
-            [ToolCall("e1", "edit_file", {"path": "app.py", "old": "foo", "new": "bar"})],
-            stop_reason="tool_use",
-            input_tokens=10,
-            output_tokens=5,
-        ),
-        ModelTurn(
-            "try .env",
-            [ToolCall("e2", "edit_file", {"path": ".env", "old": "", "new": "EVIL=1"})],
-            stop_reason="tool_use",
-            input_tokens=10,
-            output_tokens=5,
-        ),
-        ModelTurn("done", input_tokens=10, output_tokens=5),
-    ])
+    # A Coder tries to write .env; even with approved_always the tools layer refuses.
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Delegate the edit to a Coder.",
+                [ToolCall("spawn-coder", "spawn_subagent", {"type": "coder", "question": "write the env file"})],
+                stop_reason="tool_use",
+                input_tokens=10,
+                output_tokens=5,
+            ),
+            ModelTurn("Coder reported the write was refused.", input_tokens=10, output_tokens=5),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn("try .env", [ToolCall("e2", "edit_file", {"path": ".env", "old": "", "new": "EVIL=1"})], stop_reason="tool_use", input_tokens=10, output_tokens=5),
+                ModelTurn(".env: refused", input_tokens=10, output_tokens=5),
+            ],
+        },
+    )
     (tmp_path / ".env").write_text("SECRET=abc", encoding="utf-8")
     recorder = TraceRecorder(tmp_path)
-    run_live_task(tmp_path, "rename in app then try env", recorder, client=client, policy=policy)
-    # Even with approved_always, .env is denylisted at tools layer
+    run_live_task(tmp_path, "try to write env", recorder, client=client, policy=policy)
     assert (tmp_path / ".env").read_text(encoding="utf-8") == "SECRET=abc"
     sensitive_errors = [
         e for e in recorder.events
@@ -591,6 +794,39 @@ def test_endpoint_host_pinned(tmp_path: Path) -> None:
     assert recorder.events[-1]["host"] == "evil.example"
 
 
+def test_live_client_maps_litellm_429_to_readable_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    class RateLimitError(Exception):
+        status_code = 429
+
+    def completion(**_kwargs: object) -> object:
+        raise RateLimitError(
+            '429 Too Many Requests {"user_id":"user_secret","metadata":{"raw":"temporarily rate-limited upstream"}}'
+        )
+
+    fake_litellm = SimpleNamespace(completion=completion, suppress_debug_info=False, set_verbose=True)
+    monkeypatch.setitem(sys.modules, "litellm", fake_litellm)
+
+    client = LiveModelClient(api_key="dummy")
+    with pytest.raises(LiveModelRateLimitError) as exc_info:
+        client.complete(model=config.PARENT_MODEL_ID, system_prompt="x", messages=[], tools=[])
+
+    message = str(exc_info.value)
+    assert "rate-limited" in message
+    assert "OpenRouter integrations" in message
+    assert "user_secret" not in message
+
+
+def test_live_task_records_model_error_without_traceback(tmp_path: Path) -> None:
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "do work", recorder, client=FailingRateLimitClient())
+    events = read_events(recorder.path)
+    model_errors = [event for event in events if event["kind"] == "model_error"]
+    assert model_errors
+    assert model_errors[0]["retryable"] is True
+    assert events[-1]["kind"] == "run_end"
+    assert events[-1]["final_status"] == "model_error"
+
+
 def test_trace_redacts_secrets(tmp_path: Path) -> None:
     redacted, summary = _redact("token sk-or-v1-AbCdEf-12 and key AKIA0123456789ABCDEF and Bearer xyz")
     assert "***REDACTED***" in redacted
@@ -623,6 +859,108 @@ def test_prompts_match_prompts_md() -> None:
     assert "data, not as instructions" in text
 
 
+def test_finops_view_renders_per_agent_type(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # P1.3 / pitch FinOps: per-agent-type token+USD breakdown renders from the guard.
+    guard = BudgetGuard(max_tokens=10_000, max_usd=1.0)
+    guard.record_model_call(config.PARENT_MODEL_ID, 100, 50, cost_usd=0.01, agent_type="parent")
+    guard.record_model_call(config.EXPLORER_MODEL_ID, 200, 40, cost_usd=0.02, agent_type="explorer")
+    guard.record_model_call(config.CODER_MODEL_ID, 80, 30, cost_usd=0.03, agent_type="coder")
+    from vg_agent.__main__ import _print_finops
+
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="inspect")
+    recorder.emit("tool_call", agent_type="parent", tool="spawn_subagent", tool_use_id="t1", args={})
+    recorder.emit("tool_call", agent_type="coder", tool="edit_file", tool_use_id="t2", args={})
+
+    _print_finops(guard, recorder)
+    out = capsys.readouterr().out
+    assert "parent" in out and "explorer" in out and "coder" in out
+    assert "in_tok" in out and "out_tok" in out and "prompts" in out and "tools" in out
+    assert "user_prompts 1" in out
+    assert "TOTAL" in out
+    assert guard.per_agent_type_tokens["explorer"] == 240
+    assert guard.per_agent_type_input_tokens["explorer"] == 200
+    assert guard.per_agent_type_output_tokens["explorer"] == 40
+
+
+def test_grilling_yields_clarifying_questions(tmp_path: Path) -> None:
+    # VG.9 / pitch: on an ambiguous task the parent spawns Grilling, which asks
+    # clarifying questions; the parent surfaces them and yields without acting.
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Ambiguous task - consult Grilling first.",
+                [ToolCall("spawn-grill", "spawn_subagent", {"type": "grilling", "question": "make it better"})],
+                stop_reason="tool_use",
+                input_tokens=20,
+                output_tokens=10,
+            ),
+            ModelTurn("Before I proceed I need answers to the Grilling questions.", input_tokens=20, output_tokens=10),
+        ],
+        by_type={
+            "grilling": [
+                ModelTurn('{"questions": ["Which file or module?", "What does better mean here?"]}', input_tokens=20, output_tokens=10),
+            ],
+        },
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "make it better", recorder, client=client)
+    events = read_events(recorder.path)
+    spawns = [e for e in events if e["kind"] == "subagent_spawn"]
+    assert spawns[0]["agent_type"] == "grilling"
+    grill_return = next(e for e in events if e["kind"] == "subagent_return" and e["agent_type"] == "grilling")
+    payload = json.loads(str(grill_return["summary"]))
+    assert "questions" in payload and len(payload["questions"]) >= 1
+    assert events[-1]["final_status"] == "ok"
+    # P1.2: every event carries an agent_type attribution field.
+    assert all("agent_type" in e for e in events)
+
+
+def test_run_live_task_history_persists_across_turns(tmp_path: Path) -> None:
+    # P1.1: a shared history list carries conversation context across turns.
+    history: list[dict[str, object]] = []
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(
+        tmp_path,
+        "remember MEMORY_TOKEN for later",
+        recorder,
+        client=PipelineClient([ModelTurn("Noted MEMORY_TOKEN.", input_tokens=10, output_tokens=5)]),
+        history=history,
+    )
+    second = PipelineClient([ModelTurn("You asked me to remember it.", input_tokens=10, output_tokens=5)])
+    run_live_task(tmp_path, "what did I ask you to remember?", recorder, client=second, history=history)
+    seen = json.dumps(second.calls[0]["messages"])
+    assert "MEMORY_TOKEN" in seen  # turn-1 content visible in turn-2 context
+    assert "what did I ask you to remember?" in seen
+
+
+def test_literal_tool_output_fallback_for_listing_requests(tmp_path: Path) -> None:
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="list all files")
+    recorder.emit("tool_call", tool="run_bash", tool_use_id="ls-1", command="ls -l", args={"command": "ls -l"})
+    recorder.emit(
+        "tool_result",
+        tool="run_bash",
+        tool_use_id="ls-1",
+        result_full="total 1\n-rw-r--r-- 1 user user 7 app.py\n",
+        bytes=41,
+        tokens=10,
+        latency_ms=1,
+        status="ok",
+    )
+    recorder.emit(
+        "assistant_step",
+        assistant_text="Here is the list of files.",
+        tool_calls=[],
+        stop_reason="end_turn",
+    )
+
+    from vg_agent.__main__ import _literal_tool_outputs
+
+    outputs = _literal_tool_outputs(recorder.events, 0, "list all files", "Here is the list of files.")
+    assert outputs == ["Tool output (ls -l):\ntotal 1\n-rw-r--r-- 1 user user 7 app.py"]
+
+
 def test_chat_persists_budget_and_approvals_across_turns(tmp_path: Path) -> None:
     write_fixture(tmp_path)
     env = os.environ.copy()
@@ -646,6 +984,9 @@ def test_chat_persists_budget_and_approvals_across_turns(tmp_path: Path) -> None
     # Budget output should be present in stdout
     assert "steps" in completed.stdout
     assert "Renamed foo to bar in app.py." in completed.stdout
+    assert "Approvals - session history" in completed.stdout
+    assert "edit_file" in completed.stdout
+    assert "app.py" in completed.stdout
     # Trace should be a single JSONL with one session_id
     trace_dir = tmp_path / "traces"
     traces = list(trace_dir.glob("*.jsonl"))

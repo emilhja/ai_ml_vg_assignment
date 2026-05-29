@@ -1,10 +1,20 @@
 """Generated runtime constants from MODEL_CONFIG.md."""
 
-SPEC_DIGEST = "2a91e807518775e7ee4dda52972006e8cce9fa190bc94aa6f6296092fd3666a8"
+SPEC_DIGEST = "5e6983ce3a4e239d2ed71ee4d629e1a9643f560cc19a5c479feba05ca9335fe2"
 
 PARENT_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
+GRILLING_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
 EXPLORER_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
+CODER_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
+REVIEWER_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
 COMPACTOR_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
+
+SUBAGENT_MODEL_IDS = {
+    "grilling": GRILLING_MODEL_ID,
+    "explorer": EXPLORER_MODEL_ID,
+    "coder": CODER_MODEL_ID,
+    "reviewer": REVIEWER_MODEL_ID,
+}
 
 PRICING_USD_PER_MTOK = {
     "openrouter/google/gemini-2.0-flash-001": {"input": 0.10, "output": 0.40},
@@ -17,9 +27,14 @@ MAX_PARENT_STEPS = 15
 MAX_SUBAGENT_STEPS = 8
 MAX_SUBAGENT_DEPTH = 1
 MAX_CONCURRENT_SUBAGENTS = 2
+MAX_PARALLEL_SUBAGENTS = 4
+SUBAGENT_TYPES = ("grilling", "explorer", "coder", "reviewer")
 MAX_TOKENS_PER_RUN = 80_000
 MAX_USD_PER_RUN = 0.50
 MAX_USD_PER_DAY = 5.00
+WARN_USD_FRACTION = 0.8
+WARN_TOKEN_FRACTION = 0.8
+WARN_STEP_FRACTION = 0.8
 WALL_CLOCK_TIMEOUT = 120
 TOOL_TIMEOUT = 30
 K_COMPACT = 4000

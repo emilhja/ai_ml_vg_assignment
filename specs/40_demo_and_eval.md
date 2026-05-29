@@ -29,13 +29,36 @@ VG slide assertions (context engineering — VG.2):
 
 Parallel-sub-agent assertions (VG.1):
 
-- A demo run with Scene 2's task emits two `subagent_spawn{agent_type:"explorer"}`
-  events whose `[started_at, ended_at]` intervals overlap.
-- Both `subagent_return{status:"ok"}` payloads are referenced (sentinel
-  substring match) in the next parent `assistant_step.content`.
+- A `spawn_subagents` call runs its requests on a `ThreadPoolExecutor`; the two
+  resulting `subagent_return{agent_type:"explorer"}` events carry `started_at`
+  and `ended_at` whose intervals **overlap** (proving concurrent wall-clock).
+  A `threading.Barrier` rendezvous makes the overlap deterministic under the
+  fake-client test path.
+- Both explorer return payloads are referenced (sentinel substring match) in
+  the next parent `assistant_step.content`.
 - `MAX_PARALLEL_SUBAGENTS = 4` is enforced: a fifth request in one
-  `spawn_subagents` call returns `subagent_return{status:"tool_error",
-  reason:"parallel cap exceeded"}` for the overflow without spawning.
+  `spawn_subagents` call is reported in the tool payload as
+  `{status:"tool_error", payload:"parallel cap exceeded"}` for the overflow
+  without spawning.
+- A second Coder in the same `spawn_subagents` batch is serialised: it is
+  reported as `{status:"conflict"}` rather than run concurrently with the first
+  Coder (overlapping write paths).
+
+Typed-pipeline assertions (VG.6, architecture):
+
+- `PARENT_TOOL_SCHEMAS` excludes `write_file` and `edit_file`; the parent's
+  only mutation route is `spawn_subagent{type:"coder"}`. A unit test asserts the
+  absence and that a Coder spawn produces the `edit_file` `tool_result` under the
+  Coder's `agent_id`, not the parent's.
+- An ambiguous task spawns `subagent_spawn{agent_type:"grilling"}` first; the
+  Grilling `subagent_return.summary` parses as JSON `{questions:[...]}` and the
+  parent yields with `run_end{final_status:"ok"}`.
+
+Attribution assertions (VG.3/observability):
+
+- Every emitted event carries an `agent_type` field
+  (`parent|grilling|explorer|coder|reviewer`); `BudgetGuard` tracks
+  `per_agent_type_tokens`/`per_agent_type_usd`, surfaced by `--finops` / `/finops`.
 
 Grilling assertions (VG.1 reinforcement, VG.9):
 

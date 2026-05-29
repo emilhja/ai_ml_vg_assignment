@@ -9,9 +9,9 @@ import time
 from pathlib import Path
 
 
-SAFE_COMMANDS = {"grep", "rg", "find", "ls", "pwd", "cat", "head", "tail", "wc"}
+SAFE_COMMANDS = {"grep", "rg", "find", "ls", "pwd", "cat", "head", "tail", "wc", "rm"}
 DESTRUCTIVE_TOKENS = {
-    "rm", "del", "erase", "rmdir", "remove-item", "ri", "rd",
+    "del", "erase", "rmdir", "remove-item", "ri", "rd",
     "mv", "move", "cp", "copy", "chmod", "chown", "mkfs", "dd",
     "curl", "wget", "pip", "npm", "pnpm", "yarn", "uv", "python",
     "powershell", "pwsh", "cmd",
@@ -23,6 +23,7 @@ FORBIDDEN_ARG_TOKENS = {
     "-fprint", "-fprintf", "-fls",
 }
 SHELL_CONTROL_MARKERS = [";", "&&", "||", "|", ">", "<", "`", "$("]
+GLOB_MARKERS = ["*", "?", "["]
 
 SENSITIVE_PATH_PATTERNS = [
     re.compile(r"(?:^|/)\.env(?:$|\.(?!example))"),
@@ -82,6 +83,37 @@ def _path_token_error(token: str) -> str | None:
     return None
 
 
+def rm_delete_target(command: str) -> str | None:
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    head = Path(tokens[0]).name.lower()
+    if head.endswith(".exe"):
+        head = head[:-4]
+    if head != "rm" or len(tokens) != 2:
+        return None
+    return tokens[1]
+
+
+def _validate_rm_tokens(tokens: list[str]) -> str | None:
+    if len(tokens) != 2:
+        return "rm may delete exactly one file and accepts no flags"
+    target = tokens[1]
+    if target.startswith("-"):
+        return "rm flags are not allowed"
+    if target in {".", "./", "..", "../"}:
+        return "rm target must be a regular file, not a directory"
+    if any(marker in target for marker in GLOB_MARKERS):
+        return "rm glob patterns are not allowed"
+    sensitive = validate_sensitive_path(target)
+    if sensitive:
+        return sensitive
+    return _path_token_error(target)
+
+
 def validate_shell_command(command: str) -> str | None:
     lowered = command.lower()
     for marker in SHELL_CONTROL_MARKERS:
@@ -99,6 +131,8 @@ def validate_shell_command(command: str) -> str | None:
         if base.endswith(".exe"):
             base = base[:-4]
         normalized.append(base)
+    if normalized[0] == "rm":
+        return _validate_rm_tokens(tokens)
     if normalized[0] not in SAFE_COMMANDS:
         return f"command {normalized[0]!r} is not in the read-only allowlist"
     for token in normalized:
@@ -112,6 +146,24 @@ def validate_shell_command(command: str) -> str | None:
         path_error = _path_token_error(token)
         if path_error:
             return path_error
+    return None
+
+
+def validate_shell_command_for_workspace(root: Path, command: str) -> str | None:
+    syntax_error = validate_shell_command(command)
+    if syntax_error:
+        return syntax_error
+    target = rm_delete_target(command)
+    if target is None:
+        return None
+    try:
+        path = resolve_workspace_path(root, target)
+    except ValueError as exc:
+        return str(exc)
+    if not path.exists():
+        return f"rm target {target!r} does not exist"
+    if not path.is_file():
+        return "rm may delete only regular files"
     return None
 
 
@@ -176,17 +228,18 @@ def edit_file(root: Path, rel_path: str, old: str, new: str, tool_use_id: str) -
     try:
         path = resolve_workspace_path(root, rel_path)
         content = path.read_text(encoding="utf-8")
-        if old not in content:
+        occurrences = content.count(old)
+        if occurrences == 0:
             return _result(tool_use_id, "edit_file", f"old text not found in {rel_path}", "error", started)
         path.write_text(content.replace(old, new), encoding="utf-8", newline="\n")
-        return _result(tool_use_id, "edit_file", f"edited {rel_path}", "ok", started)
+        return _result(tool_use_id, "edit_file", f"edited {rel_path}; replaced {occurrences} occurrence(s)", "ok", started)
     except (OSError, ValueError) as exc:
         return _result(tool_use_id, "edit_file", str(exc), "error", started)
 
 
 def run_bash(root: Path, command: str, tool_use_id: str) -> dict[str, object]:
     started = time.perf_counter()
-    safety_error = validate_shell_command(command)
+    safety_error = validate_shell_command_for_workspace(root, command)
     if safety_error:
         return _result(tool_use_id, "run_bash", f"refused unsafe command: {safety_error}", "error", started)
     completed = subprocess.run(["bash", "-c", command], cwd=root, text=True, capture_output=True, timeout=30)

@@ -51,6 +51,14 @@ class EndpointPinViolation(RuntimeError):
     pass
 
 
+class LiveModelError(RuntimeError):
+    retryable = False
+
+
+class LiveModelRateLimitError(LiveModelError):
+    retryable = True
+
+
 @dataclass
 class ToolCall:
     tool_use_id: str
@@ -137,6 +145,10 @@ class LiveModelClient:
                     api_base=self.endpoint,
                     extra_headers=_openrouter_headers(),
                 )
+            except Exception as exc:
+                if _is_rate_limit_error(exc):
+                    raise LiveModelRateLimitError(_rate_limit_message(model)) from exc
+                raise
             finally:
                 stdout_filter.flush()
                 stderr_filter.flush()
@@ -216,6 +228,29 @@ def _value(obj: Any, key: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 429:
+        return True
+    class_name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    return (
+        "ratelimit" in class_name
+        or "rate_limit" in class_name
+        or "429" in text
+        or "too many requests" in text
+        or "temporarily rate-limited" in text
+        or "rate limited" in text
+    )
+
+
+def _rate_limit_message(model: str) -> str:
+    return (
+        f"live model provider rate-limited {model}. Retry shortly, switch models, "
+        "or add your own provider key in OpenRouter integrations."
+    )
 
 
 def _normalise_response(response: Any, requested_model: str) -> ModelTurn:

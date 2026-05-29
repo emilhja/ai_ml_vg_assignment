@@ -76,13 +76,20 @@ Replay mode:
 Interactive chat mode:
 
 - `--chat` opens a REPL serving multiple user turns from one process. The
-  `BudgetGuard`, `ApprovalScopeCache`, and JSONL trace persist across turns
-  for the life of the session under a single `session_id`.
+  `BudgetGuard`, `ApprovalScopeCache`, **conversation history**, and JSONL
+  trace persist across turns for the life of the session under a single
+  `session_id`. The persisted history list is threaded into `run_live_task`
+  (`history=`) so the model sees prior turns; oversized carried tool results are
+  compacted like any other parent context.
 - Slash commands handled before dispatch: `/exit`, `/quit`, `/reset`
-  (clears approvals and budget; emits `session_reset`), `/budget`,
+  (clears approvals, budget, and conversation history; emits `session_reset`),
+  `/budget`, `/status`, `/finops` (per-agent-type token/USD breakdown),
   `/show-context N`, `/approvals`, `/help`.
-- Input history is appended to `.vg_history` (gitignored). Ctrl-C aborts
-  the current turn with `budget_reason="user_abort"`; a second Ctrl-C
-  exits.
+- Interactive TTY chat uses arrow-key slash-command autocomplete: typing a
+  command prefix such as `/fin` displays `/finops`, and the highlighted
+  completion can be selected with the arrow keys and Enter. Piped stdin keeps
+  the plain newline-driven input path for scripted demos.
+- Input history is appended to `.vg_chat_history` (gitignored). Ctrl-C aborts
+  the current turn with `budget_reason="user_abort"`; a second Ctrl-C exits.
 - Non-TTY stdin reads newline-separated prompts and answers approval
   prompts from the same stream so the demo script can drive it.

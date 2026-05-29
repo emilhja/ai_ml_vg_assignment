@@ -14,16 +14,25 @@ mkdir -p workspace traces
 docker compose build
 ```
 
-The primary grading path is deterministic. Each scene starts from a clean
-copy:
+The primary grading path is the **live** agent loop (`run_live_task`), where the
+parent model decides each turn whether to call a tool, spawn a typed sub-agent,
+or yield (VG.9). Each scene starts from a clean copy:
 
 ```bash
 rm -rf workspace/*
 docker compose run --rm vg-agent --seed-fixture
 ```
 
-Use `vg-agent-live --live-model` only as optional polish after the
-deterministic scene passes.
+Run the headline scenes live with `vg-agent-live --live-model`. The deterministic
+offline net is **`--replay` of a previously recorded live run** (no network), which
+reproduces the same trace tree, overlapping sub-agent intervals, compaction markers,
+and Coder edits for graders who cannot run the model live. Record canonical traces
+once with `--live-model --trace` and ship them under
+`fixtures/demo_repo/traces/<scene>.jsonl`.
+
+> The non-live `--task` path (`run_task`) is a small deterministic CI shim used by
+> the offline test suite to prove caps/safety without a key; it is **not** the demo
+> path and does not exercise the typed pipeline.
 
 ## Scene 1 — Autonomous rename (VG.5, VG.6, VG.9)
 
@@ -46,17 +55,19 @@ docker compose run --rm vg-agent \
 ## Scene 2 — Parallel summarise (VG.1, VG.2)
 
 ```bash
-docker compose run --rm vg-agent \
+docker compose run --rm vg-agent-live \
   --task "read data/sample.log, then summarise auth/ and utils.py in parallel" \
-  --trace --show-context 8
+  --live-model --trace --show-context 8
 ```
 
 - On-screen: statusline shows two Explorer entries simultaneously; final
   answer integrates both summaries in one paragraph.
 - JSONL signals:
-  - Two `subagent_spawn{agent_type:"explorer"}` events with overlapping
-    `[started_at, ended_at]`.
-  - Both `subagent_return.payload` strings referenced verbatim/paraphrased
+  - Two `subagent_spawn{agent_type:"explorer"}` events, and two matching
+    `subagent_return{agent_type:"explorer"}` events whose `[started_at,
+    ended_at]` intervals **overlap** (the parent issues one `spawn_subagents`
+    call that runs them on a `ThreadPoolExecutor`).
+  - Both `subagent_return.summary` strings referenced verbatim/paraphrased
     in the next `assistant_step.content`.
   - A parent `read_file data/sample.log` result exceeds `K_COMPACT` and
     emits a `compaction` event.
@@ -68,7 +79,7 @@ docker compose run --rm vg-agent \
 ## Scene 3 — Grilling clarifies an ambiguous task (VG.1 reinforcement, VG.9, oral)
 
 ```bash
-docker compose run --rm vg-agent --task "make it better" --trace
+docker compose run --rm vg-agent-live --task "make it better" --live-model --trace
 ```
 
 - On-screen: parent spawns Grilling first; Grilling returns clarifying
@@ -76,7 +87,7 @@ docker compose run --rm vg-agent --task "make it better" --trace
   guessing.
 - JSONL signals:
   - First sub-agent spawn is `agent_type:"grilling"`.
-  - `subagent_return.payload` is JSON `{questions: [...]}`.
+  - `subagent_return.summary` is JSON `{questions: [...]}`.
   - The parent's `assistant_step` that follows surfaces those questions to
     the user and stops.
 - Talking point: agent autonomy decides to clarify rather than act (VG.9);

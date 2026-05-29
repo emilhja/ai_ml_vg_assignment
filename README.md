@@ -51,6 +51,13 @@ docker compose run --rm vg-agent-live `
 `vg-agent-live` is the only Compose service intended for live model calls. The
 client still pins egress to `openrouter.ai` before calling LiteLLM.
 
+Live chat mode (`--chat --live-model`) prints a compact statusline before each
+prompt with the active model, latest parent context size, run token budget,
+step count, cost, approval events, and last run state. Use `/status` to print
+the same line on demand. In an interactive terminal, slash commands autocomplete
+as you type; for example `/fin` shows `/finops` and can be selected with the
+arrow keys and Enter.
+
 ### 4. Replay A Trace
 
 After any traced run, replay it without network:

@@ -24,7 +24,10 @@ def read_config() -> dict[str, str]:
     text = (ROOT / "MODEL_CONFIG.md").read_text(encoding="utf-8")
     keys = [
         "PARENT_MODEL_ID",
+        "GRILLING_MODEL_ID",
         "EXPLORER_MODEL_ID",
+        "CODER_MODEL_ID",
+        "REVIEWER_MODEL_ID",
         "COMPACTOR_MODEL_ID",
         "GEMINI_2_0_FLASH_INPUT_PER_MTOK",
         "GEMINI_2_0_FLASH_OUTPUT_PER_MTOK",
@@ -50,7 +53,10 @@ def read_prompts() -> dict[str, str]:
     sections: dict[str, str] = {}
     section_titles = {
         "PARENT_SYSTEM_PROMPT": "## Parent system prompt",
+        "GRILLING_SYSTEM_PROMPT": "## Grilling system prompt",
         "EXPLORER_SYSTEM_PROMPT": "## Explorer system prompt",
+        "CODER_SYSTEM_PROMPT": "## Coder system prompt",
+        "REVIEWER_SYSTEM_PROMPT": "## Reviewer system prompt",
         "COMPACTION_SYSTEM_PROMPT": "## Compaction system prompt",
     }
     for key, header in section_titles.items():
@@ -98,8 +104,18 @@ __all__ = ["SPEC_DIGEST"]
 SPEC_DIGEST = "__SPEC_DIGEST__"
 
 PARENT_MODEL_ID = "__PARENT_MODEL_ID__"
+GRILLING_MODEL_ID = "__GRILLING_MODEL_ID__"
 EXPLORER_MODEL_ID = "__EXPLORER_MODEL_ID__"
+CODER_MODEL_ID = "__CODER_MODEL_ID__"
+REVIEWER_MODEL_ID = "__REVIEWER_MODEL_ID__"
 COMPACTOR_MODEL_ID = "__COMPACTOR_MODEL_ID__"
+
+SUBAGENT_MODEL_IDS = {
+    "grilling": GRILLING_MODEL_ID,
+    "explorer": EXPLORER_MODEL_ID,
+    "coder": CODER_MODEL_ID,
+    "reviewer": REVIEWER_MODEL_ID,
+}
 
 PRICING_USD_PER_MTOK = {
     "openrouter/google/gemini-2.0-flash-001": {"input": __GEMINI_2_0_FLASH_INPUT_PER_MTOK__, "output": __GEMINI_2_0_FLASH_OUTPUT_PER_MTOK__},
@@ -112,9 +128,14 @@ MAX_PARENT_STEPS = 15
 MAX_SUBAGENT_STEPS = 8
 MAX_SUBAGENT_DEPTH = 1
 MAX_CONCURRENT_SUBAGENTS = 2
+MAX_PARALLEL_SUBAGENTS = 4
+SUBAGENT_TYPES = ("grilling", "explorer", "coder", "reviewer")
 MAX_TOKENS_PER_RUN = 80_000
 MAX_USD_PER_RUN = 0.50
 MAX_USD_PER_DAY = 5.00
+WARN_USD_FRACTION = 0.8
+WARN_TOKEN_FRACTION = 0.8
+WARN_STEP_FRACTION = 0.8
 WALL_CLOCK_TIMEOUT = 120
 TOOL_TIMEOUT = 30
 K_COMPACT = 4000
@@ -131,6 +152,7 @@ SQLITE_TRACE_DB = "traces/vg_agent.sqlite3"
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -205,11 +227,20 @@ class BudgetGuard:
     max_usd: float = config.MAX_USD_PER_RUN
     daily_remaining_usd: float = config.MAX_USD_PER_DAY
     running_tokens: int = 0
+    running_input_tokens: int = 0
+    running_output_tokens: int = 0
     running_usd: float = 0.0
     step_count: int = 0
     last_tool_signature: tuple[str, str] | None = None
     repeat_count: int = 0
     ledger: DailySpendLedger | None = None
+    per_agent_type_tokens: dict[str, int] = field(default_factory=dict)
+    per_agent_type_input_tokens: dict[str, int] = field(default_factory=dict)
+    per_agent_type_output_tokens: dict[str, int] = field(default_factory=dict)
+    per_agent_type_model_calls: dict[str, int] = field(default_factory=dict)
+    per_agent_type_usd: dict[str, float] = field(default_factory=dict)
+    warned: set[str] = field(default_factory=set)
+    lock: object = field(default_factory=threading.RLock, compare=False, repr=False)
 
     @classmethod
     def for_workspace(cls, root: Path | None, **kwargs: object) -> "BudgetGuard":
@@ -223,43 +254,71 @@ class BudgetGuard:
         return (input_tokens / 1_000_000) * price["input"] + (output_tokens / 1_000_000) * price["output"]
 
     def before_model_call(self, model: str, worst_input_tokens: int, worst_output_tokens: int) -> BudgetDecision:
-        if self.step_count >= self.max_steps:
-            return BudgetDecision(False, "step_cap", {"steps": self.step_count, "max_steps": self.max_steps})
-        if self.running_tokens + worst_input_tokens + worst_output_tokens > self.max_tokens:
-            return BudgetDecision(False, "token_cap", {"tokens": self.running_tokens, "max_tokens": self.max_tokens})
-        worst_cost = self.estimate_cost(model, worst_input_tokens, worst_output_tokens)
-        if self.running_usd + worst_cost > self.max_usd:
-            return BudgetDecision(False, "usd_cap", {"running_usd": self.running_usd, "worst_next_usd": worst_cost})
-        if self.running_usd + worst_cost > self.daily_remaining_usd:
-            return BudgetDecision(False, "daily_cap", {"running_usd": self.running_usd, "daily_remaining_usd": self.daily_remaining_usd})
-        return BudgetDecision(True)
+        with self.lock:
+            if self.step_count >= self.max_steps:
+                return BudgetDecision(False, "step_cap", {"steps": self.step_count, "max_steps": self.max_steps})
+            if self.running_tokens + worst_input_tokens + worst_output_tokens > self.max_tokens:
+                return BudgetDecision(False, "token_cap", {"tokens": self.running_tokens, "max_tokens": self.max_tokens})
+            worst_cost = self.estimate_cost(model, worst_input_tokens, worst_output_tokens)
+            if self.running_usd + worst_cost > self.max_usd:
+                return BudgetDecision(False, "usd_cap", {"running_usd": self.running_usd, "worst_next_usd": worst_cost})
+            if self.running_usd + worst_cost > self.daily_remaining_usd:
+                return BudgetDecision(False, "daily_cap", {"running_usd": self.running_usd, "daily_remaining_usd": self.daily_remaining_usd})
+            return BudgetDecision(True)
 
-    def record_model_call(self, model: str, input_tokens: int, output_tokens: int, cost_usd: float | None = None) -> float:
-        self.step_count += 1
-        self.running_tokens += input_tokens + output_tokens
-        if cost_usd is not None:
-            cost = float(cost_usd)
-        elif model in config.PRICING_USD_PER_MTOK:
-            cost = self.estimate_cost(model, input_tokens, output_tokens)
-        else:
-            raise PricingUnavailable(
-                f"no local pricing for live model {model!r}; OpenRouter/LiteLLM must return explicit response cost"
-            )
-        self.running_usd += cost
-        if self.ledger is not None:
-            self.ledger.add(cost)
-        return cost
+    def record_model_call(self, model: str, input_tokens: int, output_tokens: int, cost_usd: float | None = None, agent_type: str = "parent") -> float:
+        with self.lock:
+            self.step_count += 1
+            self.running_tokens += input_tokens + output_tokens
+            self.running_input_tokens += input_tokens
+            self.running_output_tokens += output_tokens
+            if cost_usd is not None:
+                cost = float(cost_usd)
+            elif model in config.PRICING_USD_PER_MTOK:
+                cost = self.estimate_cost(model, input_tokens, output_tokens)
+            else:
+                raise PricingUnavailable(
+                    f"no local pricing for live model {model!r}; OpenRouter/LiteLLM must return explicit response cost"
+                )
+            self.running_usd += cost
+            self.per_agent_type_tokens[agent_type] = self.per_agent_type_tokens.get(agent_type, 0) + input_tokens + output_tokens
+            self.per_agent_type_input_tokens[agent_type] = self.per_agent_type_input_tokens.get(agent_type, 0) + input_tokens
+            self.per_agent_type_output_tokens[agent_type] = self.per_agent_type_output_tokens.get(agent_type, 0) + output_tokens
+            self.per_agent_type_model_calls[agent_type] = self.per_agent_type_model_calls.get(agent_type, 0) + 1
+            self.per_agent_type_usd[agent_type] = self.per_agent_type_usd.get(agent_type, 0.0) + cost
+            if self.ledger is not None:
+                self.ledger.add(cost)
+            return cost
+
+    def pending_warnings(self) -> list[BudgetDecision]:
+        """Return budget warnings whose threshold was newly crossed (once each).
+
+        Soft warnings never abort; the hard caps remain the only termination triggers.
+        """
+        with self.lock:
+            out: list[BudgetDecision] = []
+            if "warn_usd" not in self.warned and self.max_usd > 0 and self.running_usd >= config.WARN_USD_FRACTION * self.max_usd:
+                self.warned.add("warn_usd")
+                out.append(BudgetDecision(True, "warn_usd", {"running_usd": self.running_usd, "max_usd": self.max_usd, "crossed_at_step": self.step_count}))
+            if "warn_tokens" not in self.warned and self.max_tokens > 0 and self.running_tokens >= config.WARN_TOKEN_FRACTION * self.max_tokens:
+                self.warned.add("warn_tokens")
+                out.append(BudgetDecision(True, "warn_tokens", {"running_tokens": self.running_tokens, "max_tokens": self.max_tokens, "crossed_at_step": self.step_count}))
+            if "warn_steps" not in self.warned and self.max_steps > 0 and self.step_count >= config.WARN_STEP_FRACTION * self.max_steps:
+                self.warned.add("warn_steps")
+                out.append(BudgetDecision(True, "warn_steps", {"step_count": self.step_count, "max_steps": self.max_steps, "crossed_at_step": self.step_count}))
+            return out
 
     def record_tool_signature(self, tool: str, args_key: str) -> BudgetDecision:
-        signature = (tool, args_key)
-        if signature == self.last_tool_signature:
-            self.repeat_count += 1
-        else:
-            self.last_tool_signature = signature
-            self.repeat_count = 1
-        if self.repeat_count >= 3:
-            return BudgetDecision(False, "repetition_abort", {"tool": tool, "args_key": args_key, "repeat_count": self.repeat_count})
-        return BudgetDecision(True)
+        with self.lock:
+            signature = (tool, args_key)
+            if signature == self.last_tool_signature:
+                self.repeat_count += 1
+            else:
+                self.last_tool_signature = signature
+                self.repeat_count = 1
+            if self.repeat_count >= 3:
+                return BudgetDecision(False, "repetition_abort", {"tool": tool, "args_key": args_key, "repeat_count": self.repeat_count})
+            return BudgetDecision(True)
 ''',
     "live_model_client.py": '''"""Generated LiteLLM OpenRouter live-model client."""
 
@@ -312,6 +371,14 @@ class MissingOpenRouterKey(RuntimeError):
 
 class EndpointPinViolation(RuntimeError):
     pass
+
+
+class LiveModelError(RuntimeError):
+    retryable = False
+
+
+class LiveModelRateLimitError(LiveModelError):
+    retryable = True
 
 
 @dataclass
@@ -400,6 +467,10 @@ class LiveModelClient:
                     api_base=self.endpoint,
                     extra_headers=_openrouter_headers(),
                 )
+            except Exception as exc:
+                if _is_rate_limit_error(exc):
+                    raise LiveModelRateLimitError(_rate_limit_message(model)) from exc
+                raise
             finally:
                 stdout_filter.flush()
                 stderr_filter.flush()
@@ -481,6 +552,29 @@ def _value(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 429:
+        return True
+    class_name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    return (
+        "ratelimit" in class_name
+        or "rate_limit" in class_name
+        or "429" in text
+        or "too many requests" in text
+        or "temporarily rate-limited" in text
+        or "rate limited" in text
+    )
+
+
+def _rate_limit_message(model: str) -> str:
+    return (
+        f"live model provider rate-limited {model}. Retry shortly, switch models, "
+        "or add your own provider key in OpenRouter integrations."
+    )
+
+
 def _normalise_response(response: Any, requested_model: str) -> ModelTurn:
     choices = _value(response, "choices", []) or []
     choice = choices[0] if choices else {}
@@ -544,9 +638,9 @@ import time
 from pathlib import Path
 
 
-SAFE_COMMANDS = {"grep", "rg", "find", "ls", "pwd", "cat", "head", "tail", "wc"}
+SAFE_COMMANDS = {"grep", "rg", "find", "ls", "pwd", "cat", "head", "tail", "wc", "rm"}
 DESTRUCTIVE_TOKENS = {
-    "rm", "del", "erase", "rmdir", "remove-item", "ri", "rd",
+    "del", "erase", "rmdir", "remove-item", "ri", "rd",
     "mv", "move", "cp", "copy", "chmod", "chown", "mkfs", "dd",
     "curl", "wget", "pip", "npm", "pnpm", "yarn", "uv", "python",
     "powershell", "pwsh", "cmd",
@@ -558,6 +652,7 @@ FORBIDDEN_ARG_TOKENS = {
     "-fprint", "-fprintf", "-fls",
 }
 SHELL_CONTROL_MARKERS = [";", "&&", "||", "|", ">", "<", "`", "$("]
+GLOB_MARKERS = ["*", "?", "["]
 
 SENSITIVE_PATH_PATTERNS = [
     re.compile(r"(?:^|/)\\.env(?:$|\\.(?!example))"),
@@ -617,6 +712,37 @@ def _path_token_error(token: str) -> str | None:
     return None
 
 
+def rm_delete_target(command: str) -> str | None:
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    head = Path(tokens[0]).name.lower()
+    if head.endswith(".exe"):
+        head = head[:-4]
+    if head != "rm" or len(tokens) != 2:
+        return None
+    return tokens[1]
+
+
+def _validate_rm_tokens(tokens: list[str]) -> str | None:
+    if len(tokens) != 2:
+        return "rm may delete exactly one file and accepts no flags"
+    target = tokens[1]
+    if target.startswith("-"):
+        return "rm flags are not allowed"
+    if target in {".", "./", "..", "../"}:
+        return "rm target must be a regular file, not a directory"
+    if any(marker in target for marker in GLOB_MARKERS):
+        return "rm glob patterns are not allowed"
+    sensitive = validate_sensitive_path(target)
+    if sensitive:
+        return sensitive
+    return _path_token_error(target)
+
+
 def validate_shell_command(command: str) -> str | None:
     lowered = command.lower()
     for marker in SHELL_CONTROL_MARKERS:
@@ -634,6 +760,8 @@ def validate_shell_command(command: str) -> str | None:
         if base.endswith(".exe"):
             base = base[:-4]
         normalized.append(base)
+    if normalized[0] == "rm":
+        return _validate_rm_tokens(tokens)
     if normalized[0] not in SAFE_COMMANDS:
         return f"command {normalized[0]!r} is not in the read-only allowlist"
     for token in normalized:
@@ -647,6 +775,24 @@ def validate_shell_command(command: str) -> str | None:
         path_error = _path_token_error(token)
         if path_error:
             return path_error
+    return None
+
+
+def validate_shell_command_for_workspace(root: Path, command: str) -> str | None:
+    syntax_error = validate_shell_command(command)
+    if syntax_error:
+        return syntax_error
+    target = rm_delete_target(command)
+    if target is None:
+        return None
+    try:
+        path = resolve_workspace_path(root, target)
+    except ValueError as exc:
+        return str(exc)
+    if not path.exists():
+        return f"rm target {target!r} does not exist"
+    if not path.is_file():
+        return "rm may delete only regular files"
     return None
 
 
@@ -711,17 +857,18 @@ def edit_file(root: Path, rel_path: str, old: str, new: str, tool_use_id: str) -
     try:
         path = resolve_workspace_path(root, rel_path)
         content = path.read_text(encoding="utf-8")
-        if old not in content:
+        occurrences = content.count(old)
+        if occurrences == 0:
             return _result(tool_use_id, "edit_file", f"old text not found in {rel_path}", "error", started)
         path.write_text(content.replace(old, new), encoding="utf-8", newline="\\n")
-        return _result(tool_use_id, "edit_file", f"edited {rel_path}", "ok", started)
+        return _result(tool_use_id, "edit_file", f"edited {rel_path}; replaced {occurrences} occurrence(s)", "ok", started)
     except (OSError, ValueError) as exc:
         return _result(tool_use_id, "edit_file", str(exc), "error", started)
 
 
 def run_bash(root: Path, command: str, tool_use_id: str) -> dict[str, object]:
     started = time.perf_counter()
-    safety_error = validate_shell_command(command)
+    safety_error = validate_shell_command_for_workspace(root, command)
     if safety_error:
         return _result(tool_use_id, "run_bash", f"refused unsafe command: {safety_error}", "error", started)
     completed = subprocess.run(["bash", "-c", command], cwd=root, text=True, capture_output=True, timeout=30)
@@ -736,6 +883,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -798,6 +946,9 @@ class TraceRecorder:
             self.session_id = self.run_id
         self.turn_counter = 0
         self.current_turn_id: str | None = None
+        # Reentrant lock: parallel sub-agents (spawn_subagents) emit concurrently,
+        # and emit() re-enters via _emit_redaction.
+        self._lock = threading.RLock()
         self.sqlite_store: SQLiteTraceStore | None = None
         if self.sqlite_enabled:
             try:
@@ -805,42 +956,44 @@ class TraceRecorder:
             except Exception as exc:  # pragma: no cover - best-effort mirror
                 sys.stderr.write(f"warning: sqlite trace disabled: {exc}\\n")
 
-    def emit(self, kind: str, agent_id: str = "parent", parent_id: str | None = None, **fields: object) -> dict[str, object]:
-        if kind == "user_prompt":
-            self.turn_counter += 1
-            self.current_turn_id = f"{self.session_id}:turn:{self.turn_counter}"
-            fields.setdefault("turn_id", self.current_turn_id)
-            fields.setdefault("turn_index", self.turn_counter)
-        elif self.current_turn_id is not None:
-            fields.setdefault("turn_id", self.current_turn_id)
-            fields.setdefault("turn_index", self.turn_counter)
-        event: dict[str, object] = {
-            "run_id": self.run_id,
-            "session_id": self.session_id,
-            "event_idx": len(self.events),
-            "timestamp_iso": now_iso(),
-            "agent_id": agent_id,
-            "parent_id": parent_id,
-            "kind": kind,
-        }
-        event.update(fields)
-        redaction_summary: list[tuple[str, int]] = []
-        if self.redact:
-            event, redaction_summary = _redact_event_fields(event)
-        self.events.append(event)
-        with self.path.open("a", encoding="utf-8", newline="\\n") as fh:
-            fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\\n")
-        if self.sqlite_store is not None:
-            try:
-                self.sqlite_store.record_event(event)
-            except Exception as exc:  # pragma: no cover - JSONL remains canonical
-                sys.stderr.write(f"warning: sqlite trace write failed: {exc}\\n")
-                self.sqlite_store = None
-        if self.event_sink is not None:
-            self.event_sink(event)
-        if redaction_summary and kind != "redaction":
-            self._emit_redaction(int(event["event_idx"]), redaction_summary)
-        return event
+    def emit(self, kind: str, agent_id: str = "parent", parent_id: str | None = None, agent_type: str = "parent", **fields: object) -> dict[str, object]:
+        with self._lock:
+            if kind == "user_prompt":
+                self.turn_counter += 1
+                self.current_turn_id = f"{self.session_id}:turn:{self.turn_counter}"
+                fields.setdefault("turn_id", self.current_turn_id)
+                fields.setdefault("turn_index", self.turn_counter)
+            elif self.current_turn_id is not None:
+                fields.setdefault("turn_id", self.current_turn_id)
+                fields.setdefault("turn_index", self.turn_counter)
+            event: dict[str, object] = {
+                "run_id": self.run_id,
+                "session_id": self.session_id,
+                "event_idx": len(self.events),
+                "timestamp_iso": now_iso(),
+                "agent_id": agent_id,
+                "agent_type": agent_type,
+                "parent_id": parent_id,
+                "kind": kind,
+            }
+            event.update(fields)
+            redaction_summary: list[tuple[str, int]] = []
+            if self.redact:
+                event, redaction_summary = _redact_event_fields(event)
+            self.events.append(event)
+            with self.path.open("a", encoding="utf-8", newline="\\n") as fh:
+                fh.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\\n")
+            if self.sqlite_store is not None:
+                try:
+                    self.sqlite_store.record_event(event)
+                except Exception as exc:  # pragma: no cover - JSONL remains canonical
+                    sys.stderr.write(f"warning: sqlite trace write failed: {exc}\\n")
+                    self.sqlite_store = None
+            if self.event_sink is not None:
+                self.event_sink(event)
+            if redaction_summary and kind != "redaction":
+                self._emit_redaction(int(event["event_idx"]), redaction_summary)
+            return event
 
     def _emit_redaction(self, original_event_idx: int, summary: list[tuple[str, int]]) -> None:
         for pattern_name, count in summary:
@@ -873,6 +1026,8 @@ def render_tree(events: list[dict[str, object]]) -> str:
             lines.append(f"{prefix}{event['event_idx']:03d} budget_event {event.get('budget_reason')}")
         elif kind == "approval":
             lines.append(f"{prefix}{event['event_idx']:03d} approval {event.get('tool')} decision={event.get('decision')} scope={event.get('scope_key')}")
+        elif kind == "model_error":
+            lines.append(f"{prefix}{event['event_idx']:03d} {event['agent_id']} model_error {event.get('error_type')} retryable={event.get('retryable')}")
         elif kind == "egress_blocked":
             lines.append(f"{prefix}{event['event_idx']:03d} egress_blocked host={event.get('host')!r}")
         elif kind == "redaction":
@@ -947,6 +1102,13 @@ def show_context(events: list[dict[str, object]], step_idx: int) -> list[dict[st
                 "role": "meta",
                 "kind": "egress_blocked",
                 "host": event.get("host"),
+            })
+        elif kind == "model_error":
+            context.append({
+                "role": "meta",
+                "kind": "model_error",
+                "message": event.get("message"),
+                "retryable": event.get("retryable"),
             })
     return context
 ''',
@@ -1045,20 +1207,50 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 from pathlib import Path
 
 from . import config, tools
-from .live_model_client import LiveModelClient, ModelTurn, ToolCall
+from .live_model_client import LiveModelClient, LiveModelError, ModelTurn, ToolCall
 from .budget import BudgetGuard
-from .trace import TraceRecorder, compacted_marker
+from .trace import TraceRecorder, compacted_marker, now_iso
 
 
 PARENT_SYSTEM_PROMPT = __PARENT_SYSTEM_PROMPT_LITERAL__
 
+GRILLING_SYSTEM_PROMPT = __GRILLING_SYSTEM_PROMPT_LITERAL__
+
 EXPLORER_SYSTEM_PROMPT = __EXPLORER_SYSTEM_PROMPT_LITERAL__
+
+CODER_SYSTEM_PROMPT = __CODER_SYSTEM_PROMPT_LITERAL__
+
+REVIEWER_SYSTEM_PROMPT = __REVIEWER_SYSTEM_PROMPT_LITERAL__
+
+SUBAGENT_SYSTEM_PROMPTS = {
+    "grilling": GRILLING_SYSTEM_PROMPT,
+    "explorer": EXPLORER_SYSTEM_PROMPT,
+    "coder": CODER_SYSTEM_PROMPT,
+    "reviewer": REVIEWER_SYSTEM_PROMPT,
+}
+
+# Tool surface per typed sub-agent. The parent has NO write tools; Coder is the
+# only mutation path in the system (specs/10, specs/12).
+SUBAGENT_TOOL_NAMES = {
+    "grilling": set(),
+    "explorer": {"read_file", "read_file_range", "run_bash"},
+    "coder": {"read_file", "read_file_range", "run_bash", "write_file", "edit_file"},
+    "reviewer": {"read_file", "read_file_range", "run_bash"},
+}
+
+
+def _normalise_agent_type(value: object) -> str:
+    text = str(value or "explorer").strip().lower()
+    return text if text in config.SUBAGENT_TYPES else "explorer"
+
 
 GATED_WRITES = {"write_file", "edit_file", "run_bash", "spawn_subagent", "spawn_subagents"}
 GATED_ALL = {"read_file", "read_file_range"} | GATED_WRITES
@@ -1101,6 +1293,11 @@ class ApprovalScopeCache:
 
 def _scope_candidates(request: ApprovalRequest) -> list[str]:
     if request.tool == "run_bash":
+        if request.path:
+            normalized = request.path.replace("\\\\", "/")
+            parts = [p for p in normalized.split("/") if p and p != "."]
+            parent = "/".join(parts[:-1])
+            return [parent, "*"] if parent else ["", "*"]
         command = str(request.args.get("command") or "")
         head = command.strip().split()[0] if command.strip() else ""
         return [f"cmd:{head}", "*"] if head else ["*"]
@@ -1188,6 +1385,9 @@ def _args_summary(tool: str, args: dict[str, Any]) -> str:
 
 def _request_for(call: ToolCall) -> ApprovalRequest:
     path = call.args.get("path") or call.args.get("rel_path")
+    if call.name == "run_bash":
+        command = str(call.args.get("command") or "")
+        path = tools.rm_delete_target(command) or path
     return ApprovalRequest(
         tool=call.name,
         path=str(path) if path else None,
@@ -1208,11 +1408,12 @@ def _emit_approval(recorder: TraceRecorder, call: ToolCall, outcome: ApprovalOut
     )
 
 
-def _emit_tool_call(recorder: TraceRecorder, call: ToolCall, agent_id: str = "parent", parent_id: str | None = None) -> None:
+def _emit_tool_call(recorder: TraceRecorder, call: ToolCall, agent_id: str = "parent", parent_id: str | None = None, agent_type: str = "parent") -> None:
     recorder.emit(
         "tool_call",
         agent_id=agent_id,
         parent_id=parent_id,
+        agent_type=agent_type,
         tool_use_id=call.tool_use_id,
         tool=call.name,
         args=call.args,
@@ -1221,13 +1422,14 @@ def _emit_tool_call(recorder: TraceRecorder, call: ToolCall, agent_id: str = "pa
         command=call.args.get("command"),
     )
 
-PARENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
-    {
+# Concrete file/bash tool schemas keyed by name; reused to compose per-agent surfaces.
+FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    "read_file": {
         "name": "read_file",
         "description": "Read a UTF-8 text file under the workspace root.",
         "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
     },
-    {
+    "read_file_range": {
         "name": "read_file_range",
         "description": "Read an inclusive 1-based line range from a UTF-8 text file under the workspace root.",
         "input_schema": {
@@ -1236,45 +1438,60 @@ PARENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["path", "start_line", "end_line"],
         },
     },
-    {
+    "write_file": {
         "name": "write_file",
-        "description": "Write a UTF-8 text file under the workspace root.",
+        "description": "Write a UTF-8 text file under the workspace root (Coder only).",
         "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]},
     },
-    {
+    "edit_file": {
         "name": "edit_file",
-        "description": "Replace exact text in a UTF-8 text file under the workspace root.",
+        "description": "Replace exact text in a UTF-8 text file under the workspace root (Coder only).",
         "input_schema": {
             "type": "object",
             "properties": {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}},
             "required": ["path", "old", "new"],
         },
     },
-    {
+    "run_bash": {
         "name": "run_bash",
-        "description": "Run one simple read-only inspection command through bash. No pipes, redirection, shell control, Python, pytest, package managers, network tools, or command chains.",
+        "description": "Run one simple inspection command through bash, or exactly `rm <relative-file>` for approved single-file deletion. No pipes, redirection, shell control, Python, pytest, package managers, network tools, command chains, rm flags, globs, or directory deletion.",
         "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
     },
+}
+
+_SUBAGENT_REQUEST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {"type": "string", "enum": list(config.SUBAGENT_TYPES)},
+        "question": {"type": "string"},
+    },
+    "required": ["type", "question"],
+}
+
+SPAWN_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "spawn_subagent",
-        "description": "Ask Explorer a bounded read-only repository-inspection question.",
-        "input_schema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]},
+        "description": (
+            "Spawn one typed sub-agent (grilling | explorer | coder | reviewer) for a "
+            "bounded task. Grilling asks clarifying questions; Explorer inspects read-only; "
+            "Coder is the only agent that may write/edit files; Reviewer verifies a Coder change."
+        ),
+        "input_schema": _SUBAGENT_REQUEST_SCHEMA,
     },
     {
         "name": "spawn_subagents",
-        "description": "Ask two or more Explorer sub-agents independent bounded read-only questions in parallel.",
+        "description": (
+            "Spawn two or more typed sub-agents that run concurrently. Use this for >=2 "
+            "independent tasks (e.g. inspecting different files) so they execute in parallel."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "requests": {
                     "type": "array",
                     "minItems": 2,
-                    "maxItems": 4,
-                    "items": {
-                        "type": "object",
-                        "properties": {"question": {"type": "string"}},
-                        "required": ["question"],
-                    },
+                    "maxItems": config.MAX_PARALLEL_SUBAGENTS,
+                    "items": _SUBAGENT_REQUEST_SCHEMA,
                 }
             },
             "required": ["requests"],
@@ -1282,7 +1499,21 @@ PARENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
 ]
 
-EXPLORER_TOOL_SCHEMAS = [schema for schema in PARENT_TOOL_SCHEMAS if schema["name"] in {"read_file", "read_file_range", "run_bash"}]
+# The parent never writes files directly: its surface is read tools + spawn tools.
+PARENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    FILE_TOOL_SCHEMAS["read_file"],
+    FILE_TOOL_SCHEMAS["read_file_range"],
+    FILE_TOOL_SCHEMAS["run_bash"],
+    *SPAWN_TOOL_SCHEMAS,
+]
+
+
+def _subagent_tool_schemas(agent_type: str) -> list[dict[str, Any]]:
+    names = SUBAGENT_TOOL_NAMES.get(agent_type, set())
+    return [FILE_TOOL_SCHEMAS[name] for name in FILE_TOOL_SCHEMAS if name in names]
+
+
+EXPLORER_TOOL_SCHEMAS = _subagent_tool_schemas("explorer")
 
 
 def _compact_if_needed(recorder: TraceRecorder, event: dict[str, object], deterministic: bool = False) -> dict[str, object] | None:
@@ -1367,6 +1598,43 @@ def _record_budget_abort(recorder: TraceRecorder, guard: BudgetGuard, decision: 
     )
 
 
+def _record_model_error(
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    exc: LiveModelError,
+    started: float,
+    *,
+    model: str,
+    step_idx: int,
+    agent_id: str = "parent",
+    parent_id: str | None = None,
+    agent_type: str = "parent",
+) -> None:
+    recorder.emit(
+        "model_error",
+        agent_id=agent_id,
+        parent_id=parent_id,
+        agent_type=agent_type,
+        model=model,
+        model_id=model,
+        step_idx=step_idx,
+        error_type=type(exc).__name__,
+        message=str(exc),
+        retryable=getattr(exc, "retryable", False),
+    )
+    if agent_id == "parent":
+        recorder.emit(
+            "run_end",
+            final_status="model_error",
+            total_cost_usd=round(guard.running_usd, 6),
+            total_tokens=guard.running_tokens,
+            duration_s=round(time.perf_counter() - started, 3),
+        )
+
+
+PARENT_TOOL_NAMES = {schema["name"] for schema in PARENT_TOOL_SCHEMAS}
+
+
 def _execute_live_tool(
     *,
     root: Path,
@@ -1374,22 +1642,25 @@ def _execute_live_tool(
     recorder: TraceRecorder,
     client: Any,
     guard: BudgetGuard,
-    read_only: bool,
-    allow_spawn: bool,
+    allowed_tools: set[str],
     started: float,
     policy: ApprovalPolicy,
     agent_id: str = "parent",
     parent_id: str | None = None,
+    agent_type: str = "parent",
 ) -> dict[str, object]:
     tool_name = call.name
     args = call.args
     tool_started = time.perf_counter()
     path = str(args.get("path") or args.get("rel_path") or "")
-    _emit_tool_call(recorder, call, agent_id=agent_id, parent_id=parent_id)
+    _emit_tool_call(recorder, call, agent_id=agent_id, parent_id=parent_id, agent_type=agent_type)
+
+    if tool_name not in allowed_tools:
+        return _result(call.tool_use_id, tool_name, f"{agent_type} is not permitted to call {tool_name}", "error", tool_started)
 
     if tool_name == "run_bash":
         command = str(args.get("command") or "")
-        safety_error = tools.validate_shell_command(command)
+        safety_error = tools.validate_shell_command_for_workspace(root, command)
         if safety_error:
             return _result(call.tool_use_id, "run_bash", f"refused unsafe command: {safety_error}", "error", tool_started)
 
@@ -1409,53 +1680,35 @@ def _execute_live_tool(
         command = str(args.get("command") or "")
         repeat = guard.record_tool_signature("run_bash", command)
         if not repeat.allowed:
-            recorder.emit("budget_event", budget_reason=repeat.budget_reason, details=repeat.details)
+            recorder.emit("budget_event", agent_id=agent_id, parent_id=parent_id, agent_type=agent_type, budget_reason=repeat.budget_reason, details=repeat.details)
             return _result(call.tool_use_id, "run_bash", f"budget abort: {repeat.budget_reason}", "error", tool_started)
         return tools.run_bash(root, command, call.tool_use_id)
     if tool_name == "write_file":
-        if read_only:
-            return _result(call.tool_use_id, tool_name, "Explorer is read-only and cannot write files", "error", tool_started)
         return tools.write_file(root, path, str(args.get("content") or ""), call.tool_use_id)
     if tool_name == "edit_file":
-        if read_only:
-            return _result(call.tool_use_id, tool_name, "Explorer is read-only and cannot edit files", "error", tool_started)
         return tools.edit_file(root, path, str(args.get("old") or ""), str(args.get("new") or ""), call.tool_use_id)
     if tool_name == "spawn_subagent":
-        if not allow_spawn:
-            return _result(call.tool_use_id, tool_name, "Explorer cannot spawn sub-agents", "error", tool_started)
+        child_type = _normalise_agent_type(args.get("type"))
         question = str(args.get("question") or "")
-        child_id = f"explorer-{sum(1 for event in recorder.events if event.get('kind') == 'subagent_spawn') + 1}"
-        recorder.emit("subagent_spawn", child_agent_id=child_id, question=question, model=config.EXPLORER_MODEL_ID)
-        summary = _run_live_explorer(root, question, recorder, client, guard, child_id, started, policy)
-        return _result(call.tool_use_id, "spawn_subagent", summary, "ok", tool_started)
+        outcome = _spawn_one(root, child_type, question, recorder, client, guard, started, policy)
+        return _result(call.tool_use_id, "spawn_subagent", json.dumps(outcome, ensure_ascii=False), "ok", tool_started)
     if tool_name == "spawn_subagents":
-        if not allow_spawn:
-            return _result(call.tool_use_id, tool_name, "Explorer cannot spawn sub-agents", "error", tool_started)
         raw_requests = args.get("requests") or []
         if not isinstance(raw_requests, list) or len(raw_requests) < 2:
             return _result(call.tool_use_id, tool_name, "spawn_subagents requires at least two requests", "error", tool_started)
-        summaries: list[dict[str, str]] = []
-        accepted: list[tuple[str, str]] = []
-        overflow = raw_requests[4:]
-        for raw in raw_requests[:4]:
-            if not isinstance(raw, dict):
-                continue
-            question = str(raw.get("question") or "")
-            child_id = f"explorer-{sum(1 for event in recorder.events if event.get('kind') == 'subagent_spawn') + 1}"
-            recorder.emit("subagent_spawn", child_agent_id=child_id, question=question, model=config.EXPLORER_MODEL_ID)
-            accepted.append((child_id, question))
-        for child_id, question in accepted:
-            summary = _run_live_explorer(root, question, recorder, client, guard, child_id, started, policy)
-            summaries.append({"agent_id": child_id, "status": "ok", "payload": summary})
-        for raw in overflow:
-            child_id = f"explorer-overflow-{sum(1 for event in recorder.events if event.get('kind') == 'subagent_spawn') + 1}"
-            summaries.append({"agent_id": child_id, "status": "tool_error", "payload": "parallel cap exceeded"})
+        summaries = _spawn_many(root, raw_requests, recorder, client, guard, started, policy)
         return _result(call.tool_use_id, "spawn_subagents", json.dumps(summaries, ensure_ascii=False), "ok", tool_started)
     return _result(call.tool_use_id, tool_name, f"unknown tool {tool_name!r}", "error", tool_started)
 
 
-def _run_live_explorer(
+def _next_child_id(recorder: TraceRecorder, agent_type: str) -> str:
+    n = sum(1 for event in recorder.events if event.get("kind") == "subagent_spawn") + 1
+    return f"{agent_type}-{n}"
+
+
+def _run_live_subagent(
     root: Path,
+    agent_type: str,
     question: str,
     recorder: TraceRecorder,
     client: Any,
@@ -1463,53 +1716,71 @@ def _run_live_explorer(
     child_id: str,
     started: float,
     policy: ApprovalPolicy,
-) -> str:
-    messages: list[dict[str, Any]] = [{"role": "user", "content": question}]
-    child_cost_before = guard.running_usd
-    child_tokens_before = guard.running_tokens
+    review_slice: str | None = None,
+) -> tuple[str, str]:
+    """Run one typed sub-agent loop. Returns (summary, status)."""
+    system_prompt = SUBAGENT_SYSTEM_PROMPTS[agent_type]
+    model = config.SUBAGENT_MODEL_IDS[agent_type]
+    tool_schemas = _subagent_tool_schemas(agent_type)
+    allowed = set(SUBAGENT_TOOL_NAMES.get(agent_type, set()))
+    if review_slice:
+        messages: list[dict[str, Any]] = [{"role": "user", "content": f"{question}\\n\\nCoder run under review (JSONL slice):\\n{review_slice}"}]
+    else:
+        messages = [{"role": "user", "content": question}]
     final_summary = ""
+    status = "ok"
 
     for local_step in range(1, config.MAX_SUBAGENT_STEPS + 1):
         if time.perf_counter() - started > config.WALL_CLOCK_TIMEOUT:
-            recorder.emit("budget_event", agent_id=child_id, parent_id="parent", budget_reason="timeout", details={"timeout_s": config.WALL_CLOCK_TIMEOUT})
+            recorder.emit("budget_event", agent_id=child_id, parent_id="parent", agent_type=agent_type, budget_reason="timeout", details={"timeout_s": config.WALL_CLOCK_TIMEOUT})
+            status = "timeout"
             break
-        expected_in = _estimate_message_tokens(EXPLORER_SYSTEM_PROMPT, messages)
-        decision = guard.before_model_call(config.EXPLORER_MODEL_ID, expected_in, 2048)
+        expected_in = _estimate_message_tokens(system_prompt, messages)
+        decision = guard.before_model_call(model, expected_in, 2048)
         if not decision.allowed:
-            recorder.emit("budget_event", agent_id=child_id, parent_id="parent", budget_reason=decision.budget_reason, details=decision.details)
+            recorder.emit("budget_event", agent_id=child_id, parent_id="parent", agent_type=agent_type, budget_reason=decision.budget_reason, details=decision.details)
+            status = "tool_error"
             break
         recorder.emit(
             "llm_start",
             agent_id=child_id,
             parent_id="parent",
-            model=config.EXPLORER_MODEL_ID,
-            model_id=config.EXPLORER_MODEL_ID,
+            agent_type=agent_type,
+            model=model,
+            model_id=model,
             step_idx=local_step,
             tokens_in=expected_in,
             max_tokens=2048,
             endpoint_host=config.OPENROUTER_ENDPOINT_HOST,
-            system_prompt_sha256=hashlib.sha256(EXPLORER_SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
-            tool_schema_count=len(EXPLORER_TOOL_SCHEMAS),
-            tool_schema_names=[schema["name"] for schema in EXPLORER_TOOL_SCHEMAS],
+            system_prompt_sha256=hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
+            tool_schema_count=len(tool_schemas),
+            tool_schema_names=[schema["name"] for schema in tool_schemas],
         )
-        turn = client.complete(
-            model=config.EXPLORER_MODEL_ID,
-            system_prompt=EXPLORER_SYSTEM_PROMPT,
-            messages=messages,
-            tools=EXPLORER_TOOL_SCHEMAS,
-            max_tokens=2048,
-        )
+        try:
+            turn = client.complete(
+                model=model,
+                system_prompt=system_prompt,
+                messages=messages,
+                tools=tool_schemas,
+                max_tokens=2048,
+            )
+        except LiveModelError as exc:
+            _record_model_error(recorder, guard, exc, started, model=model, step_idx=local_step, agent_id=child_id, parent_id="parent", agent_type=agent_type)
+            final_summary = f"{agent_type} stopped because {exc}"
+            status = "tool_error"
+            break
         if not isinstance(turn, ModelTurn):
             turn = ModelTurn(**turn)
-        turn.tool_calls = [_normalise_tool_call(call) for call in turn.tool_calls]
-        model_id = turn.model_id or config.EXPLORER_MODEL_ID
+        turn.tool_calls = [_normalise_tool_call(c) for c in turn.tool_calls]
+        model_id = turn.model_id or model
         input_tokens = turn.input_tokens or expected_in
         output_tokens = turn.output_tokens or tools.estimate_tokens(turn.assistant_text + json.dumps([asdict(c) for c in turn.tool_calls], sort_keys=True))
-        cost = guard.record_model_call(model_id, input_tokens, output_tokens, cost_usd=turn.cost_usd)
+        cost = guard.record_model_call(model_id, input_tokens, output_tokens, cost_usd=turn.cost_usd, agent_type=agent_type)
         recorder.emit(
             "assistant_step",
             agent_id=child_id,
             parent_id="parent",
+            agent_type=agent_type,
             model=model_id,
             model_id=model_id,
             step_idx=local_step,
@@ -1517,7 +1788,7 @@ def _run_live_explorer(
             tokens_out=output_tokens,
             cost_usd=cost,
             assistant_text=turn.assistant_text,
-            tool_calls=[_tool_call_trace(call) for call in turn.tool_calls],
+            tool_calls=[_tool_call_trace(c) for c in turn.tool_calls],
             stop_reason=turn.stop_reason,
         )
         messages.append({"role": "assistant", "content": _assistant_content(turn)})
@@ -1525,39 +1796,140 @@ def _run_live_explorer(
             final_summary = turn.assistant_text[:2048]
             break
         tool_blocks: list[dict[str, Any]] = []
-        for call in turn.tool_calls:
+        had_error = False
+        for c in turn.tool_calls:
             result = _execute_live_tool(
                 root=root,
-                call=call,
+                call=c,
                 recorder=recorder,
                 client=client,
                 guard=guard,
-                read_only=True,
-                allow_spawn=False,
+                allowed_tools=allowed,
                 started=started,
                 policy=policy,
                 agent_id=child_id,
                 parent_id="parent",
+                agent_type=agent_type,
             )
-            recorder.emit("tool_result", agent_id=child_id, parent_id="parent", **result)
-            tool_blocks.append({"type": "tool_result", "tool_use_id": call.tool_use_id, "content": str(result["result_full"]), "is_error": result["status"] != "ok"})
+            recorder.emit("tool_result", agent_id=child_id, parent_id="parent", agent_type=agent_type, **result)
+            tool_blocks.append({"type": "tool_result", "tool_use_id": c.tool_use_id, "content": str(result["result_full"]), "is_error": result["status"] != "ok"})
             if result["status"] != "ok":
                 final_summary = str(result["result_full"])[:2048]
+                status = "tool_error"
+                had_error = True
                 break
         messages.append({"role": "user", "content": tool_blocks})
-        if final_summary and any(block.get("is_error") for block in tool_blocks):
+        if had_error:
             break
 
     if not final_summary:
-        final_summary = "Explorer stopped before producing a final summary."
+        final_summary = f"{agent_type} stopped before producing a final summary."
+    return final_summary, status
+
+
+def _spawn_one(
+    root: Path,
+    agent_type: str,
+    question: str,
+    recorder: TraceRecorder,
+    client: Any,
+    guard: BudgetGuard,
+    started: float,
+    policy: ApprovalPolicy,
+    review_slice: str | None = None,
+    child_id: str | None = None,
+    barrier: "threading.Barrier | None" = None,
+) -> dict[str, object]:
+    child_id = child_id or _next_child_id(recorder, agent_type)
+    model = config.SUBAGENT_MODEL_IDS[agent_type]
+    started_at = now_iso()
+    recorder.emit(
+        "subagent_spawn",
+        agent_id=child_id,
+        parent_id="parent",
+        agent_type=agent_type,
+        child_agent_id=child_id,
+        question=question,
+        model=model,
+        started_at=started_at,
+    )
+    cost_before = guard.running_usd
+    tok_before = guard.running_tokens
+    if barrier is not None:
+        try:
+            barrier.wait(timeout=config.WALL_CLOCK_TIMEOUT)
+        except threading.BrokenBarrierError:
+            pass
+    run_started_at = now_iso()
+    summary, status = _run_live_subagent(root, agent_type, question, recorder, client, guard, child_id, started, policy, review_slice)
+    ended_at = now_iso()
     recorder.emit(
         "subagent_return",
+        agent_id=child_id,
+        parent_id="parent",
+        agent_type=agent_type,
         child_agent_id=child_id,
-        summary=final_summary,
-        child_total_cost_usd=round(guard.running_usd - child_cost_before, 6),
-        child_total_tokens=guard.running_tokens - child_tokens_before,
+        status=status,
+        summary=summary,
+        started_at=run_started_at,
+        ended_at=ended_at,
+        child_total_cost_usd=round(guard.running_usd - cost_before, 6),
+        child_total_tokens=guard.running_tokens - tok_before,
     )
-    return final_summary
+    return {"agent_id": child_id, "agent_type": agent_type, "status": status, "payload": summary}
+
+
+def _spawn_many(
+    root: Path,
+    raw_requests: list[Any],
+    recorder: TraceRecorder,
+    client: Any,
+    guard: BudgetGuard,
+    started: float,
+    policy: ApprovalPolicy,
+) -> list[dict[str, object]]:
+    parsed: list[tuple[str, str]] = []
+    for raw in raw_requests:
+        if isinstance(raw, dict):
+            parsed.append((_normalise_agent_type(raw.get("type")), str(raw.get("question") or "")))
+    accepted = parsed[: config.MAX_PARALLEL_SUBAGENTS]
+    overflow = parsed[config.MAX_PARALLEL_SUBAGENTS :]
+
+    # Coders never run concurrently with another Coder (overlapping write paths):
+    # the runtime serialises them and reports `conflict` for the second.
+    runnable: list[tuple[int, str, str, str]] = []  # (slot, child_id, type, question)
+    conflicts: list[dict[str, object]] = []
+    seen_coder = False
+    for slot, (atype, question) in enumerate(accepted):
+        child_id = _next_child_id(recorder, atype) + f".{slot}"
+        if atype == "coder" and seen_coder:
+            conflicts.append({"agent_id": child_id, "agent_type": atype, "status": "conflict", "payload": "serialised: another Coder in the same batch holds the write lock", "slot": slot})
+            continue
+        if atype == "coder":
+            seen_coder = True
+        runnable.append((slot, child_id, atype, question))
+
+    results_by_slot: dict[int, dict[str, object]] = {}
+    barrier = threading.Barrier(len(runnable)) if len(runnable) > 1 else None
+    if runnable:
+        with ThreadPoolExecutor(max_workers=len(runnable)) as pool:
+            futures = {
+                pool.submit(_spawn_one, root, atype, question, recorder, client, guard, started, policy, None, child_id, barrier): slot
+                for (slot, child_id, atype, question) in runnable
+            }
+            for future, slot in futures.items():
+                out = future.result()
+                out["slot"] = slot
+                results_by_slot[slot] = out
+    for conflict in conflicts:
+        results_by_slot[int(conflict["slot"])] = conflict
+
+    summaries = [results_by_slot[slot] for slot in sorted(results_by_slot)]
+    for slot, (atype, question) in enumerate(overflow, start=len(accepted)):
+        summaries.append({"agent_id": f"{atype}-overflow-{slot}", "agent_type": atype, "status": "tool_error", "payload": "parallel cap exceeded"})
+    for entry in summaries:
+        entry.pop("slot", None)
+    return summaries
 
 
 def run_live_task(
@@ -1567,6 +1939,7 @@ def run_live_task(
     client: Any | None = None,
     guard: BudgetGuard | None = None,
     policy: ApprovalPolicy | None = None,
+    history: list[dict[str, Any]] | None = None,
 ) -> TraceRecorder:
     recorder = recorder or TraceRecorder(root)
     client = client or LiveModelClient.from_env(recorder=recorder)
@@ -1575,7 +1948,10 @@ def run_live_task(
     guard = guard or BudgetGuard.for_workspace(root)
     policy = policy or ApprovalPolicy()
     started = time.perf_counter()
-    messages: list[dict[str, Any]] = [{"role": "user", "content": task}]
+    # `history` lets --chat carry conversation context across turns under one session;
+    # when None this is a single-shot task.
+    messages: list[dict[str, Any]] = history if history is not None else []
+    messages.append({"role": "user", "content": task})
     recorder.emit("user_prompt", prompt=task, live_model=True)
 
     while True:
@@ -1600,13 +1976,24 @@ def run_live_task(
             tool_schema_count=len(PARENT_TOOL_SCHEMAS),
             tool_schema_names=[schema["name"] for schema in PARENT_TOOL_SCHEMAS],
         )
-        turn = client.complete(
-            model=config.PARENT_MODEL_ID,
-            system_prompt=PARENT_SYSTEM_PROMPT,
-            messages=messages,
-            tools=PARENT_TOOL_SCHEMAS,
-            max_tokens=4096,
-        )
+        try:
+            turn = client.complete(
+                model=config.PARENT_MODEL_ID,
+                system_prompt=PARENT_SYSTEM_PROMPT,
+                messages=messages,
+                tools=PARENT_TOOL_SCHEMAS,
+                max_tokens=4096,
+            )
+        except LiveModelError as exc:
+            _record_model_error(
+                recorder,
+                guard,
+                exc,
+                started,
+                model=config.PARENT_MODEL_ID,
+                step_idx=guard.step_count + 1,
+            )
+            return recorder
         if not isinstance(turn, ModelTurn):
             turn = ModelTurn(**turn)
         turn.tool_calls = [_normalise_tool_call(call) for call in turn.tool_calls]
@@ -1614,6 +2001,8 @@ def run_live_task(
         input_tokens = turn.input_tokens or expected_in
         output_tokens = turn.output_tokens or tools.estimate_tokens(turn.assistant_text + json.dumps([asdict(c) for c in turn.tool_calls], sort_keys=True))
         cost = guard.record_model_call(model_id, input_tokens, output_tokens, cost_usd=turn.cost_usd)
+        for warning in guard.pending_warnings():
+            recorder.emit("budget_event", budget_reason=warning.budget_reason, details=warning.details)
         step_idx = guard.step_count
         recorder.emit(
             "assistant_step",
@@ -1646,10 +2035,10 @@ def run_live_task(
                 recorder=recorder,
                 client=client,
                 guard=guard,
-                read_only=False,
-                allow_spawn=True,
+                allowed_tools=PARENT_TOOL_NAMES,
                 started=started,
                 policy=policy,
+                agent_type="parent",
             )
             event = recorder.emit("tool_result", **result)
             content = str(result["result_full"])
@@ -1882,6 +2271,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -1890,6 +2280,15 @@ try:
     import readline  # enables arrow-key history in input() on POSIX
 except ImportError:  # Windows host lacks GNU readline; chat mode requires a TTY anyway
     readline = None
+
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import WordCompleter
+    from prompt_toolkit.history import FileHistory
+except ImportError:  # pragma: no cover - dependency is optional at runtime fallback level
+    PromptSession = None
+    WordCompleter = None
+    FileHistory = None
 
 from . import config
 from .agent import ApprovalOutcome, ApprovalPolicy, ApprovalRequest, run_live_task, run_task
@@ -1916,7 +2315,7 @@ def _stdin_prompt(stream: object | None = None) -> "callable":
             path = request.path or ""
             normalized = path.replace("\\\\", "/")
             parent = "/".join(normalized.split("/")[:-1])
-            if request.tool == "run_bash":
+            if request.tool == "run_bash" and not request.path:
                 command = str(request.args.get("command") or "")
                 head = command.strip().split()[0] if command.strip() else ""
                 scope = f"cmd:{head}" if head else "*"
@@ -1954,12 +2353,214 @@ def _print_budget(guard: BudgetGuard) -> None:
     )
 
 
+SLASH_COMMANDS = (
+    "/exit",
+    "/quit",
+    "/budget",
+    "/status",
+    "/finops",
+    "/approvals",
+    "/reset",
+    "/show-context",
+    "/help",
+)
+SLASH_COMMAND_HELP = " ".join((*SLASH_COMMANDS[:-2], "/show-context N", SLASH_COMMANDS[-1]))
+
+
+def _slash_command_completer() -> Any:
+    if WordCompleter is None:
+        return None
+    return WordCompleter(list(SLASH_COMMANDS), ignore_case=True, match_middle=False, WORD=True)
+
+
+def _make_chat_prompt(history_path: Path) -> tuple[Any, Any]:
+    if (
+        bool(getattr(sys.stdin, "isatty", lambda: False)())
+        and PromptSession is not None
+        and FileHistory is not None
+    ):
+        session = PromptSession(
+            "vg> ",
+            completer=_slash_command_completer(),
+            complete_while_typing=True,
+            history=FileHistory(str(history_path)),
+        )
+        return session.prompt, lambda: None
+
+    readline_history_enabled = False
+    if readline is not None:
+        readline.set_history_length(1000)
+        try:
+            readline.read_history_file(str(history_path))
+        except OSError:
+            pass
+        readline_history_enabled = True
+
+    def read_prompt() -> str:
+        return input("vg> ")
+
+    def save_history() -> None:
+        if not readline_history_enabled:
+            return
+        try:
+            readline.write_history_file(str(history_path))
+        except OSError:
+            pass
+
+    return read_prompt, save_history
+
+
+def _tool_calls_by_agent_type(events: list[dict[str, object]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for event in events:
+        if event.get("kind") != "tool_call":
+            continue
+        agent_type = str(event.get("agent_type") or "parent")
+        counts[agent_type] = counts.get(agent_type, 0) + 1
+    return counts
+
+
+def _print_finops(guard: BudgetGuard, recorder: TraceRecorder | None = None) -> None:
+    """Per-agent-type FinOps breakdown (the pitch's live cost dashboard).
+
+    Live values come from the BudgetGuard; the persistent store is the SQLite
+    mirror at config.SQLITE_TRACE_DB for offline dashboard queries.
+    """
+    tool_counts = _tool_calls_by_agent_type(recorder.events) if recorder is not None else {}
+    rows = sorted(
+        set(guard.per_agent_type_tokens) | set(guard.per_agent_type_usd) | set(tool_counts),
+        key=lambda t: guard.per_agent_type_usd.get(t, 0.0),
+        reverse=True,
+    )
+    sys.stdout.write("FinOps - per-agent-type spend this session\\n")
+    sys.stdout.write("prompts=model calls, tools=tool calls\\n")
+    sys.stdout.write(f"{'agent_type':<12} {'in_tok':>10} {'out_tok':>10} {'total_tok':>10} {'prompts':>8} {'tools':>7} {'usd':>12}\\n")
+    for agent_type in rows:
+        input_tokens = guard.per_agent_type_input_tokens.get(agent_type, 0)
+        output_tokens = guard.per_agent_type_output_tokens.get(agent_type, 0)
+        tokens = guard.per_agent_type_tokens.get(agent_type, 0)
+        model_calls = guard.per_agent_type_model_calls.get(agent_type, 0)
+        tools = tool_counts.get(agent_type, 0)
+        usd = guard.per_agent_type_usd.get(agent_type, 0.0)
+        sys.stdout.write(f"{agent_type:<12} {input_tokens:>10} {output_tokens:>10} {tokens:>10} {model_calls:>8} {tools:>7} {usd:>12.6f}\\n")
+    sys.stdout.write(
+        f"{'TOTAL':<12} {guard.running_input_tokens:>10} {guard.running_output_tokens:>10} "
+        f"{guard.running_tokens:>10} {guard.step_count:>8} {sum(tool_counts.values()):>7} {guard.running_usd:>12.6f}\\n"
+    )
+    if recorder is not None:
+        user_prompts = sum(1 for event in recorder.events if event.get("kind") == "user_prompt")
+        sys.stdout.write(f"user_prompts {user_prompts}\\n")
+
+
+def _print_approvals(policy: ApprovalPolicy, recorder: TraceRecorder) -> None:
+    approvals = [event for event in recorder.events if event.get("kind") == "approval"]
+    sys.stdout.write("Approvals - session history\\n")
+    if approvals:
+        sys.stdout.write(f"{'#':>4} {'tool':<16} {'decision':<18} {'scope':<18} summary\\n")
+        for event in approvals:
+            scope = str(event.get("scope_key") or "-")
+            summary = str(event.get("args_summary") or "")
+            sys.stdout.write(
+                f"{int(event.get('event_idx') or 0):>4} "
+                f"{str(event.get('tool') or ''):<16} "
+                f"{str(event.get('decision') or ''):<18} "
+                f"{scope:<18} {summary}\\n"
+            )
+    else:
+        sys.stdout.write("  (no approvals this session)\\n")
+
+    cached = policy.cache.listing()
+    sys.stdout.write("Cached approval scopes\\n")
+    if cached:
+        for tool, scope in cached:
+            sys.stdout.write(f"  {tool}  {scope}\\n")
+    else:
+        sys.stdout.write("  (no reusable scopes)\\n")
+
+
+def _format_compact_number(value: object) -> str:
+    number = float(value or 0)
+    if number >= 1_000_000:
+        return f"{number / 1_000_000:.1f}m"
+    if number >= 1_000:
+        return f"{number / 1_000:.1f}k"
+    return str(int(number))
+
+
+def _bar(used: int, total: int, width: int = 10) -> str:
+    if total <= 0:
+        return "-" * width
+    filled = max(0, min(width, round((used / total) * width)))
+    return "#" * filled + "-" * (width - filled)
+
+
 def _short_model(model: object) -> str:
     text = str(model or "")
     for prefix in ("openrouter/anthropic/", "openrouter/"):
         if text.startswith(prefix):
             return text[len(prefix):]
     return text
+
+
+def _latest_parent_llm_start(events: list[dict[str, object]]) -> dict[str, object] | None:
+    for event in reversed(events):
+        if event.get("kind") == "llm_start" and event.get("agent_id") == "parent":
+            return event
+    return None
+
+
+def _latest_run_state(events: list[dict[str, object]]) -> str:
+    for event in reversed(events):
+        kind = event.get("kind")
+        if kind == "run_end":
+            return str(event.get("final_status") or "done")
+        if kind == "budget_event":
+            return str(event.get("budget_reason") or "budget")
+    return "ready"
+
+
+def _format_chat_statusline(
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    *,
+    live_model: bool,
+    width: int | None = None,
+) -> str:
+    mode = "live" if live_model else "deterministic"
+    latest_llm = _latest_parent_llm_start(recorder.events)
+    model = _short_model((latest_llm or {}).get("model") or config.PARENT_MODEL_ID)
+    context_tokens = int((latest_llm or {}).get("tokens_in") or 0)
+    status = _latest_run_state(recorder.events)
+    approval_events = sum(1 for event in recorder.events if event.get("kind") == "approval")
+    token_bar = _bar(guard.running_tokens, guard.max_tokens)
+    line = (
+        f"[{mode}] {model} | ctx {_format_compact_number(context_tokens)} in | "
+        f"run {token_bar} {_format_compact_number(guard.running_tokens)}/{_format_compact_number(guard.max_tokens)} tok | "
+        f"steps {guard.step_count}/{guard.max_steps} | "
+        f"usd ${guard.running_usd:.4f}/${guard.max_usd:.2f} | "
+        f"approvals {approval_events} | {status}"
+    )
+    if width is None:
+        width = shutil.get_terminal_size((120, 20)).columns
+    if width > 20 and len(line) > width:
+        return line[: max(0, width - 3)] + "..."
+    return line
+
+
+def _chat_statusline_color(line: str, *, use_color: bool) -> str:
+    if not use_color:
+        return line
+    return f"\\x1b[32m{line}\\x1b[0m"
+
+
+def _print_chat_statusline(recorder: TraceRecorder, guard: BudgetGuard, *, live_model: bool) -> None:
+    if not live_model:
+        return
+    line = _format_chat_statusline(recorder, guard, live_model=live_model)
+    use_color = bool(getattr(sys.stderr, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
+    line = _chat_statusline_color(line, use_color=use_color)
+    sys.stderr.write(line + "\\n")
+    sys.stderr.flush()
 
 
 def _tool_summary(call: dict[str, Any]) -> str:
@@ -2016,6 +2617,9 @@ def _format_progress_event(event: dict[str, object]) -> str | None:
         return f"[context] compacted {event.get('before_tokens')} -> {event.get('after_tokens')} tokens"
     if kind == "budget_event":
         return f"[budget] {event.get('budget_reason')}"
+    if kind == "model_error":
+        retry = " retryable" if event.get("retryable") else ""
+        return f"[llm] {agent} step {event.get('step_idx')} failed{retry}: {event.get('message')}"
     if kind == "egress_blocked":
         return f"[network] blocked host={event.get('host')}"
     if kind == "run_end":
@@ -2050,6 +2654,13 @@ def _latest_parent_answer(events: list[dict[str, object]], start_idx: int = 0) -
     return ""
 
 
+def _latest_run_end_status(events: list[dict[str, object]]) -> str | None:
+    for event in reversed(events):
+        if event.get("kind") == "run_end":
+            return str(event.get("final_status") or "")
+    return None
+
+
 def _apply_model_overrides(args: argparse.Namespace) -> None:
     if getattr(args, "parent_model", None):
         config.PARENT_MODEL_ID = args.parent_model
@@ -2063,17 +2674,14 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
     policy = _make_policy(args)
     guard = BudgetGuard.for_workspace(root)
     history_path = root / ".vg_chat_history"
-    if readline is not None:
-        readline.set_history_length(1000)
-        try:
-            readline.read_history_file(str(history_path))
-        except OSError:
-            pass
+    read_prompt, save_history = _make_chat_prompt(history_path)
     sys.stderr.write("VG Agent chat mode. Type /help for commands.\\n")
+    conversation: list[dict[str, Any]] = []
     try:
         while True:
             try:
-                prompt = input("vg> ").strip()
+                _print_chat_statusline(recorder, guard, live_model=bool(args.live_model))
+                prompt = read_prompt().strip()
             except KeyboardInterrupt:
                 recorder.emit("budget_event", budget_reason="user_abort", details={})
                 sys.stderr.write("\\n")
@@ -2088,14 +2696,22 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             if prompt == "/budget":
                 _print_budget(guard)
                 continue
+            if prompt == "/status":
+                line = _format_chat_statusline(recorder, guard, live_model=bool(args.live_model))
+                use_color = bool(getattr(sys.stdout, "isatty", lambda: False)()) and bool(args.live_model) and not os.environ.get("NO_COLOR")
+                sys.stdout.write(_chat_statusline_color(line, use_color=use_color) + "\\n")
+                continue
             if prompt == "/approvals":
-                for entry in policy.cache.listing():
-                    sys.stdout.write(f"  {entry[0]}  {entry[1]}\\n")
+                _print_approvals(policy, recorder)
                 continue
             if prompt == "/reset":
                 policy.cache.clear()
                 guard = BudgetGuard.for_workspace(root)
+                conversation.clear()
                 recorder.emit("session_reset")
+                continue
+            if prompt == "/finops":
+                _print_finops(guard, recorder)
                 continue
             if prompt.startswith("/show-context"):
                 parts = prompt.split()
@@ -2103,7 +2719,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 sys.stdout.write(json.dumps(show_context(recorder.events, step), indent=2, ensure_ascii=False) + "\\n")
                 continue
             if prompt == "/help":
-                sys.stdout.write("/exit /quit /budget /approvals /reset /show-context N /help\\n")
+                sys.stdout.write(SLASH_COMMAND_HELP + "\\n")
                 continue
             start_idx = len(recorder.events)
             if args.live_model:
@@ -2112,7 +2728,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 except MissingOpenRouterKey as exc:
                     sys.stderr.write(f"error: {exc}\\n")
                     return 2
-                run_live_task(root, prompt, recorder, client=client, guard=guard, policy=policy)
+                run_live_task(root, prompt, recorder, client=client, guard=guard, policy=policy, history=conversation)
             else:
                 run_task(root, prompt, recorder, policy=policy)
             answer = _latest_parent_answer(recorder.events, start_idx)
@@ -2120,11 +2736,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 sys.stdout.write(answer + "\\n")
                 sys.stdout.flush()
     finally:
-        if readline is not None:
-            try:
-                readline.write_history_file(str(history_path))
-            except OSError:
-                pass
+        save_history()
     return 0
 
 
@@ -2142,6 +2754,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-approval", choices=["off", "writes", "all"], default=config.REQUIRE_APPROVAL_DEFAULT)
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--no-redact", action="store_true")
+    parser.add_argument("--budget", action="store_true")
+    parser.add_argument("--finops", action="store_true")
     args = parser.parse_args(argv)
     _apply_model_overrides(args)
 
@@ -2174,12 +2788,14 @@ def main(argv: list[str] | None = None) -> int:
         event_sink=_make_progress_sink() if args.live_model else None,
     )
     policy = _make_policy(args)
+    guard: BudgetGuard | None = None
     if args.live_model:
         try:
             client = LiveModelClient.from_env(recorder=recorder)
         except MissingOpenRouterKey as exc:
             parser.exit(2, f"error: {exc}\\n")
-        run_live_task(root, args.task, recorder, client=client, policy=policy)
+        guard = BudgetGuard.for_workspace(root)
+        run_live_task(root, args.task, recorder, client=client, guard=guard, policy=policy)
     else:
         run_task(root, args.task, recorder, policy=policy)
     answer = _latest_parent_answer(recorder.events)
@@ -2190,6 +2806,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"trace: {recorder.path}")
     if args.show_context is not None:
         print(json.dumps(show_context(recorder.events, args.show_context), indent=2, ensure_ascii=False))
+    if guard is not None and args.budget:
+        _print_budget(guard)
+    if guard is not None and args.finops:
+        _print_finops(guard, recorder)
+    if _latest_run_end_status(recorder.events) == "model_error":
+        return 75
     return 0
 
 

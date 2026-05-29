@@ -1,5 +1,27 @@
 # Next Steps
 
+## 0. Typed-pipeline upgrade — follow-ups (2026-05-28)
+
+The live agent loop now implements the full typed pipeline (Grilling, Explorer,
+Coder, Reviewer), genuinely concurrent `spawn_subagents` (ThreadPoolExecutor +
+barrier, overlapping `started_at`/`ended_at`), a parent with **no** write tools
+(Coder is the sole mutation path), per-event `agent_type`, cross-turn chat
+history, and a `--finops` / `/finops` per-agent-type view. All covered by
+`uv run pytest` (38 tests). Remaining:
+
+- **Record canonical live traces** (needs `OPENROUTER_API_KEY` + network): run
+  each runbook scene with `--live-model --trace` and save the JSONL under
+  `fixtures/demo_repo/traces/<scene>.jsonl` so graders can `--replay` them
+  offline (the runbook now points at these).
+- **Reviewer** is wired as a spawnable type but has no dedicated demo scene/test
+  yet; add one (verify Coder's change is present on disk → `PASS`/`FAIL`).
+- **Retire the `run_task` CI shim** once the offline cap/safety tests are
+  migrated to `FakeClient` + `--replay`; it is currently labelled a CI-only
+  shim in `specs/70` and still routes the parent edit directly in its
+  `rename foo→bar` branch (the only place the parent "writes").
+- Optional: surface the per-agent-type breakdown on the live chat statusline.
+
+
 ## 1. Run Deterministic Smoke Demo
 
 Verify the existing no-network demo path still behaves as expected:
