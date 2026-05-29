@@ -1116,6 +1116,64 @@ def test_chat_slash_reset_emits_event(tmp_path: Path) -> None:
     assert any(e["kind"] == "session_reset" for e in events)
 
 
+
+
+def test_chat_ui_status_bar_segments(tmp_path: Path) -> None:
+    from vg_agent.chat_ui import build_status_bar_text
+
+    recorder = TraceRecorder(tmp_path)
+    guard = BudgetGuard.for_workspace(tmp_path)
+    recorder.emit(
+        "llm_start",
+        agent_id="parent",
+        model="openrouter/anthropic/claude-haiku-4.5",
+        tokens_in=4200,
+    )
+    recorder.emit("run_end", final_status="ready")
+    line = build_status_bar_text(
+        root=tmp_path,
+        recorder=recorder,
+        guard=guard,
+        live_model=True,
+        since_event_idx=0,
+    )
+    assert "\U0001f4c1" in line
+    assert "claude-haiku-4.5" in line
+    assert "live" in line
+    assert "ctx 4.2k in" in line
+    assert "\u2713 ready" in line
+
+    recorder.emit("tool_result", agent_id="parent", tool="read_file", status="error", result_full="nope")
+    recorder.emit("run_end", final_status="tool_error")
+    turn_line = build_status_bar_text(
+        root=tmp_path,
+        recorder=recorder,
+        guard=guard,
+        live_model=True,
+        since_event_idx=2,
+    )
+    assert "\u2717" in turn_line
+    assert "tool_error" in turn_line
+
+
+def test_chat_ui_non_tty_skips_rich(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from vg_agent import __main__ as cli
+
+    monkeypatch.setattr(cli, "use_rich_ui", lambda: False)
+
+    prompts = iter(["/exit"])
+
+    monkeypatch.setattr(cli, "_make_chat_prompt", lambda _history_path: (lambda: next(prompts), lambda: None))
+
+    args = SimpleNamespace(
+        no_redact=False,
+        require_approval="off",
+        yes=False,
+        live_model=False,
+    )
+    assert cli.use_rich_ui() is False
+    assert cli._chat_loop(tmp_path, args) == 0
+
 def test_chat_slash_new_starts_fresh_trace_and_live_history(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

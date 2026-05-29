@@ -20,13 +20,23 @@ try:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.styles import Style
 except ImportError:  # pragma: no cover - dependency is optional at runtime fallback level
     PromptSession = None
     Completer = None
     Completion = None
     FileHistory = None
+    Style = None
 
 from . import config, tools
+from .chat_ui import (
+    CHAT_PLACEHOLDER,
+    print_chat_dashboard,
+    refresh_chat_status_bar,
+    render_input_bottom_and_footer,
+    render_input_top_rule,
+    use_rich_ui,
+)
 from .agent import BUDGET_CAP_TOOL, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, run_live_task, run_task
 from .live_model_client import LiveModelClient, MissingOpenRouterKey
 from .budget import BudgetGuard
@@ -114,7 +124,7 @@ SLASH_COMMAND_META = {
     "/exit": "End chat cleanly",
     "/quit": "Alias for /exit",
     "/budget": "Show steps, tokens, USD, and daily remaining",
-    "/status": "Show compact live chat status",
+    "/status": "Reprint session dashboard (TTY) or compact status + budget",
     "/finops": "Show per-agent token, tool, and cost table",
     "/approvals": "Show approval history and cached scopes",
     "/reset": "Clear approvals, budget, and chat history",
@@ -172,11 +182,17 @@ def _make_chat_prompt(history_path: Path) -> tuple[Any, Any]:
         and PromptSession is not None
         and FileHistory is not None
     ):
+        prompt_style = Style.from_dict({"prompt": "dim"}) if Style is not None and use_rich_ui() else None
+        message: Any = "> "
+        if use_rich_ui():
+            message = [("class:prompt", "> ")]
         session = PromptSession(
-            "vg> ",
+            message,
             completer=_slash_command_completer(),
             complete_while_typing=True,
             history=FileHistory(str(history_path)),
+            placeholder=CHAT_PLACEHOLDER if use_rich_ui() else None,
+            style=prompt_style,
         )
         return session.prompt, lambda: None
 
@@ -190,7 +206,7 @@ def _make_chat_prompt(history_path: Path) -> tuple[Any, Any]:
         readline_history_enabled = True
 
     def read_prompt() -> str:
-        return input("vg> ")
+        return input("> ")
 
     def save_history() -> None:
         if not readline_history_enabled:
@@ -650,25 +666,44 @@ def _apply_model_overrides(args: argparse.Namespace) -> None:
         config.COMPACTOR_MODEL_ID = args.subagent_model
 
 
+
+
+def _chat_ui_kwargs(
+    root: Path,
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    args: argparse.Namespace,
+    *,
+    since_event_idx: int = 0,
+) -> dict[str, Any]:
+    return {
+        "root": root,
+        "recorder": recorder,
+        "guard": guard,
+        "live_model": bool(args.live_model),
+        "since_event_idx": since_event_idx,
+    }
+
+
 def _chat_loop(root: Path, args: argparse.Namespace) -> int:
     recorder = TraceRecorder(root, redact=not args.no_redact, event_sink=_make_progress_sink())
     policy = _make_policy(args)
     guard = BudgetGuard.for_workspace(root)
     history_path = root / ".vg_chat_history"
     read_prompt, save_history = _make_chat_prompt(history_path)
-    sys.stderr.write("VG Agent chat mode. Type /help for commands.\n")
+    ui_since = 0
+    if use_rich_ui():
+        print_chat_dashboard(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
+    else:
+        sys.stderr.write("VG Agent chat mode. Type /help for commands.\n")
     conversation: list[dict[str, Any]] = []
     last_intent_prompt = ""
     try:
         while True:
             try:
-                _print_chat_statusline(
-                    recorder,
-                    guard,
-                    live_model=bool(args.live_model),
-                    since_event_idx=len(recorder.events),
-                )
+                render_input_top_rule()
                 prompt = read_prompt().strip()
+                render_input_bottom_and_footer(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
             except KeyboardInterrupt:
                 recorder.emit("budget_event", budget_reason="user_abort", details={})
                 sys.stderr.write("\n")
@@ -684,9 +719,12 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 _print_budget(guard)
                 continue
             if prompt == "/status":
-                line = _format_chat_statusline(recorder, guard, live_model=bool(args.live_model))
-                use_color = bool(getattr(sys.stdout, "isatty", lambda: False)()) and bool(args.live_model) and not os.environ.get("NO_COLOR")
-                sys.stdout.write(_chat_statusline_color(line, use_color=use_color) + "\n")
+                if use_rich_ui():
+                    print_chat_dashboard(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
+                else:
+                    line = _format_chat_statusline(recorder, guard, live_model=bool(args.live_model))
+                    sys.stdout.write(line + "\n")
+                    _print_budget(guard)
                 continue
             if prompt == "/approvals":
                 _print_approvals(policy, recorder)
@@ -696,7 +734,10 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 guard = BudgetGuard.for_workspace(root)
                 conversation.clear()
                 last_intent_prompt = ""
+                ui_since = len(recorder.events)
                 recorder.emit("session_reset")
+                if use_rich_ui():
+                    print_chat_dashboard(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
                 continue
             if prompt == "/new":
                 policy.cache.clear()
@@ -704,7 +745,10 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 conversation.clear()
                 last_intent_prompt = ""
                 recorder = TraceRecorder(root, redact=not args.no_redact, event_sink=_make_progress_sink())
+                ui_since = 0
                 recorder.emit("session_new")
+                if use_rich_ui():
+                    print_chat_dashboard(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
                 continue
             if prompt == "/finops":
                 _print_finops(guard, recorder)
@@ -738,6 +782,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 sys.stderr.write(notice + "\n")
             if answer or literal_outputs:
                 sys.stdout.flush()
+            refresh_chat_status_bar(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=start_idx))
             if not _is_ack_prompt(prompt):
                 last_intent_prompt = prompt
     finally:
