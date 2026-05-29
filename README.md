@@ -55,8 +55,8 @@ Live chat mode (`--chat --live-model`) prints a compact statusline before each
 prompt with the active model, latest parent context size, run token budget,
 step count, cost, approval events, and last run state. Use `/status` to print
 the same line on demand. In an interactive terminal, slash commands autocomplete
-as you type; for example `/fin` shows `/finops` and can be selected with the
-arrow keys and Enter.
+after a leading `/`; for example `/fin` shows `/finops` with a short description
+and can be selected with the arrow keys and Enter.
 
 ### 4. Replay A Trace
 

@@ -26,6 +26,11 @@ Concrete example:
 - When a warning threshold is crossed, the relevant section is highlighted
   with leading `!` (e.g., `!usd 0.41/0.50 (82%)`). Highlighting is the
   visible cue for VG.3's "budget warning" requirement.
+- Live chat statuslines include the session tool-error count and use color in
+  TTYs: green for normal state, yellow for budget/cap warnings, and red for
+  error/abort states. The progress stream uses distinct colors for approvals,
+  sub-agent activity, compaction, warnings, and failures; non-TTY output remains
+  plain text.
 - Statusline is also written as a `statusline` JSONL event at every parent
   step boundary so replays can reconstruct the user-visible UI.
 - A non-TTY stderr (CI, piped) writes one line per step with a trailing

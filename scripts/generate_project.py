@@ -2283,11 +2283,12 @@ except ImportError:  # Windows host lacks GNU readline; chat mode requires a TTY
 
 try:
     from prompt_toolkit import PromptSession
-    from prompt_toolkit.completion import WordCompleter
+    from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.history import FileHistory
 except ImportError:  # pragma: no cover - dependency is optional at runtime fallback level
     PromptSession = None
-    WordCompleter = None
+    Completer = None
+    Completion = None
     FileHistory = None
 
 from . import config
@@ -2365,12 +2366,39 @@ SLASH_COMMANDS = (
     "/help",
 )
 SLASH_COMMAND_HELP = " ".join((*SLASH_COMMANDS[:-2], "/show-context N", SLASH_COMMANDS[-1]))
+SLASH_COMMAND_META = {
+    "/exit": "End chat cleanly",
+    "/quit": "Alias for /exit",
+    "/budget": "Show steps, tokens, USD, and daily remaining",
+    "/status": "Show compact live chat status",
+    "/finops": "Show per-agent token, tool, and cost table",
+    "/approvals": "Show approval history and cached scopes",
+    "/reset": "Clear approvals, budget, and chat history",
+    "/show-context": "N: parent step index; default 0",
+    "/help": "Show slash command help",
+}
 
 
 def _slash_command_completer() -> Any:
-    if WordCompleter is None:
+    if Completer is None or Completion is None:
         return None
-    return WordCompleter(list(SLASH_COMMANDS), ignore_case=True, match_middle=False, WORD=True)
+
+    class SlashCommandCompleter(Completer):
+        def get_completions(self, document: Any, complete_event: Any) -> Any:
+            before_cursor = document.text_before_cursor
+            if not before_cursor.startswith("/") or any(ch.isspace() for ch in before_cursor):
+                return
+            prefix = before_cursor.lower()
+            for command in SLASH_COMMANDS:
+                if command.lower().startswith(prefix):
+                    yield Completion(
+                        command,
+                        start_position=-len(before_cursor),
+                        display=f"{command:<16}",
+                        display_meta=SLASH_COMMAND_META[command],
+                    )
+
+    return SlashCommandCompleter()
 
 
 def _make_chat_prompt(history_path: Path) -> tuple[Any, Any]:
@@ -2519,6 +2547,14 @@ def _latest_run_state(events: list[dict[str, object]]) -> str:
     return "ready"
 
 
+def _tool_error_count(events: list[dict[str, object]]) -> int:
+    return sum(
+        1
+        for event in events
+        if event.get("kind") == "tool_result" and event.get("status") != "ok"
+    )
+
+
 def _format_chat_statusline(
     recorder: TraceRecorder,
     guard: BudgetGuard,
@@ -2532,13 +2568,14 @@ def _format_chat_statusline(
     context_tokens = int((latest_llm or {}).get("tokens_in") or 0)
     status = _latest_run_state(recorder.events)
     approval_events = sum(1 for event in recorder.events if event.get("kind") == "approval")
+    tool_errors = _tool_error_count(recorder.events)
     token_bar = _bar(guard.running_tokens, guard.max_tokens)
     line = (
         f"[{mode}] {model} | ctx {_format_compact_number(context_tokens)} in | "
         f"run {token_bar} {_format_compact_number(guard.running_tokens)}/{_format_compact_number(guard.max_tokens)} tok | "
         f"steps {guard.step_count}/{guard.max_steps} | "
         f"usd ${guard.running_usd:.4f}/${guard.max_usd:.2f} | "
-        f"approvals {approval_events} | {status}"
+        f"approvals {approval_events} | errors {tool_errors} | {status}"
     )
     if width is None:
         width = shutil.get_terminal_size((120, 20)).columns
@@ -2550,7 +2587,15 @@ def _format_chat_statusline(
 def _chat_statusline_color(line: str, *, use_color: bool) -> str:
     if not use_color:
         return line
-    return f"\\x1b[32m{line}\\x1b[0m"
+    lowered = line.lower()
+    has_tool_errors = "errors " in lowered and "errors 0" not in lowered
+    if any(marker in lowered for marker in ("tool_error", "model_error", "aborted")) or has_tool_errors:
+        color = "\\x1b[31m"
+    elif any(marker in lowered for marker in ("warn_", "cap")):
+        color = "\\x1b[33m"
+    else:
+        color = "\\x1b[32m"
+    return f"{color}{line}\\x1b[0m"
 
 
 def _print_chat_statusline(recorder: TraceRecorder, guard: BudgetGuard, *, live_model: bool) -> None:
@@ -2603,10 +2648,15 @@ def _format_progress_event(event: dict[str, object]) -> str | None:
                 line += " tools=" + " | ".join(summaries)
         return line
     if kind == "tool_result":
-        return (
+        line = (
             f"[tool] {agent} {event.get('tool')} {event.get('status')} "
             f"tokens={event.get('tokens')} {event.get('latency_ms')}ms"
         )
+        if event.get("status") != "ok":
+            detail = str(event.get("result_full") or "").strip().replace("\\n", " ")
+            if detail:
+                line += f": {detail[:180]}"
+        return line
     if kind == "approval":
         return f"[approval] {event.get('tool')} decision={event.get('decision')} scope={event.get('scope_key')}"
     if kind == "subagent_spawn":
@@ -2627,17 +2677,38 @@ def _format_progress_event(event: dict[str, object]) -> str | None:
     return None
 
 
+def _progress_event_color(event: dict[str, object], *, use_color: bool) -> str:
+    if not use_color:
+        return ""
+    kind = event.get("kind")
+    if kind == "tool_result" and event.get("status") != "ok":
+        return "\\x1b[31m"
+    if kind == "run_end" and event.get("final_status") not in {None, "ok"}:
+        return "\\x1b[31m"
+    if kind in {"model_error", "egress_blocked"}:
+        return "\\x1b[31m"
+    if kind == "budget_event":
+        return "\\x1b[33m"
+    if kind == "approval":
+        return "\\x1b[36m"
+    if kind in {"subagent_spawn", "subagent_return"}:
+        return "\\x1b[35m"
+    if kind == "compaction":
+        return "\\x1b[34m"
+    return "\\x1b[90m"
+
+
 def _make_progress_sink(stream: object | None = None) -> "callable":
     fh = stream if stream is not None else sys.stderr
     use_color = bool(getattr(fh, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
-    grey = "\\x1b[90m" if use_color else ""
     reset = "\\x1b[0m" if use_color else ""
 
     def sink(event: dict[str, object]) -> None:
         line = _format_progress_event(event)
         if line is None:
             return
-        fh.write(f"{grey}{line}{reset}\\n")
+        color = _progress_event_color(event, use_color=use_color)
+        fh.write(f"{color}{line}{reset}\\n")
         fh.flush()
 
     return sink
@@ -2652,6 +2723,68 @@ def _latest_parent_answer(events: list[dict[str, object]], start_idx: int = 0) -
         if not tool_calls and text:
             return text
     return ""
+
+
+ACK_PROMPTS = {"y", "yes", "ok", "okay", "sure", "go", "go ahead", "proceed"}
+LITERAL_OUTPUT_PROMPT_MARKERS = (
+    "pwd",
+    "ls",
+    "list",
+    "read",
+    "show",
+    "print",
+    "display",
+    "contents",
+    "content",
+    "cat",
+)
+LITERAL_OUTPUT_TOOLS = {"read_file", "read_file_range", "run_bash"}
+
+
+def _is_ack_prompt(prompt: str) -> bool:
+    return prompt.strip().lower() in ACK_PROMPTS
+
+
+def _wants_literal_tool_output(prompt: str) -> bool:
+    lower = prompt.strip().lower()
+    if not lower:
+        return False
+    if lower in {"pwd", "ls", "ls -l", "dir"}:
+        return True
+    return any(marker in lower for marker in LITERAL_OUTPUT_PROMPT_MARKERS)
+
+
+def _parent_tool_calls(events: list[dict[str, object]], start_idx: int) -> dict[str, dict[str, object]]:
+    calls: dict[str, dict[str, object]] = {}
+    for event in events[start_idx:]:
+        if event.get("kind") != "tool_call" or event.get("agent_id") != "parent":
+            continue
+        tool_use_id = str(event.get("tool_use_id") or "")
+        if tool_use_id:
+            calls[tool_use_id] = event
+    return calls
+
+
+def _literal_tool_outputs(events: list[dict[str, object]], start_idx: int, prompt: str, answer: str) -> list[str]:
+    if not _wants_literal_tool_output(prompt):
+        return []
+    calls = _parent_tool_calls(events, start_idx)
+    outputs: list[str] = []
+    answer_text = answer.strip()
+    for event in events[start_idx:]:
+        if event.get("kind") != "tool_result" or event.get("agent_id") != "parent":
+            continue
+        if event.get("tool") not in LITERAL_OUTPUT_TOOLS:
+            continue
+        content = str(event.get("result_full") or "").strip()
+        if not content or (answer_text and content in answer_text):
+            continue
+        call = calls.get(str(event.get("tool_use_id") or ""), {})
+        command = str(call.get("command") or "").strip()
+        label = "Tool output" if event.get("status") == "ok" else "Tool error"
+        title = f"{label} ({command}):" if command else f"{label} ({event.get('tool')}):"
+        outputs.append(f"{title}\\n{content}")
+    return outputs
 
 
 def _latest_run_end_status(events: list[dict[str, object]]) -> str | None:
@@ -2677,6 +2810,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
     read_prompt, save_history = _make_chat_prompt(history_path)
     sys.stderr.write("VG Agent chat mode. Type /help for commands.\\n")
     conversation: list[dict[str, Any]] = []
+    last_intent_prompt = ""
     try:
         while True:
             try:
@@ -2722,6 +2856,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 sys.stdout.write(SLASH_COMMAND_HELP + "\\n")
                 continue
             start_idx = len(recorder.events)
+            literal_prompt = last_intent_prompt if _is_ack_prompt(prompt) and last_intent_prompt else prompt
             if args.live_model:
                 try:
                     client = LiveModelClient.from_env(recorder=recorder)
@@ -2734,7 +2869,13 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             answer = _latest_parent_answer(recorder.events, start_idx)
             if answer:
                 sys.stdout.write(answer + "\\n")
+            literal_outputs = _literal_tool_outputs(recorder.events, start_idx, literal_prompt, answer)
+            for output in literal_outputs:
+                sys.stdout.write(output + "\\n")
+            if answer or literal_outputs:
                 sys.stdout.flush()
+            if not _is_ack_prompt(prompt):
+                last_intent_prompt = prompt
     finally:
         save_history()
     return 0
@@ -2801,6 +2942,8 @@ def main(argv: list[str] | None = None) -> int:
     answer = _latest_parent_answer(recorder.events)
     if answer:
         print(answer)
+    for output in _literal_tool_outputs(recorder.events, 0, args.task, answer):
+        print(output)
     if args.trace:
         print(render_tree(recorder.events))
         print(f"trace: {recorder.path}")

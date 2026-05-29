@@ -19,6 +19,35 @@ Exactly one of these modes is required:
 - `--seed-fixture` — write the deterministic fixture repository into the
   current workspace, then exit.
 
+## Live chat slash commands
+
+Slash commands are available only inside `--chat`. They are handled locally by
+the CLI before any prompt is dispatched to the agent, so they do not consume a
+model step.
+
+| Command | Behavior |
+|---|---|
+| `/exit` | End the chat process cleanly. |
+| `/quit` | Alias for `/exit`. |
+| `/budget` | Print the current session budget counters: steps, tokens, USD spend, and daily remaining USD. |
+| `/status` | Print the same compact chat statusline on demand, including mode, model, context estimate, token/step usage, USD spend, approval count, and latest run state. |
+| `/finops` | Print a per-agent-type FinOps table for the session, including input/output/total tokens, model-call count, tool-call count, and USD spend. |
+| `/approvals` | Print the session approval history and any cached reusable approval scopes. |
+| `/reset` | Clear cached approval scopes, reset the session budget guard, clear conversation history, and emit a `session_reset` trace event. |
+| `/show-context N` | Print the parent-visible context at parent step `N` as formatted JSON. If `N` is omitted, step `0` is used. |
+| `/help` | Print the available slash commands in their compact help form. |
+
+Interactive TTY chat provides arrow-key autocomplete only while the current
+input starts with a slash command token, and completions include short command
+and parameter help.
+Non-TTY chat keeps the newline-driven input path used by scripted demos.
+
+For direct read-style prompts (`read`, `show`, `cat`, `list`, `pwd`, etc.),
+chat prints the parent tool output after the assistant answer when the answer
+does not already include it. Failed parent read/inspection tools are printed as
+`Tool error (...)` with the tool's refusal/error text, so a refused read does
+not collapse into only a final `tool_error` run state.
+
 ## Flags
 
 | Flag | Default | Behavior |

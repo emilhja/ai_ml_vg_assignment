@@ -450,21 +450,41 @@ def test_live_chat_statusline_shows_context_and_budget(tmp_path: Path) -> None:
     assert "1.3k/10.0k tok" in line
     assert "steps 1/5" in line
     assert "usd $" in line
+    assert "errors 0" in line
     assert _chat_statusline_color(line, use_color=True).startswith("\x1b[32m[live]")
     assert _chat_statusline_color(line, use_color=True).endswith("\x1b[0m")
+
+    recorder.emit(
+        "tool_result",
+        tool="read_file",
+        tool_use_id="bad-read",
+        result_full="sensitive path '.env' is on the read/write denylist",
+        status="error",
+    )
+    error_line = _format_chat_statusline(recorder, guard, live_model=True, width=200)
+    assert "errors 1" in error_line
+    assert _chat_statusline_color(error_line, use_color=True).startswith("\x1b[31m[live]")
 
 
 def test_chat_slash_command_completer_matches_prefixes() -> None:
     from prompt_toolkit.completion import CompleteEvent
     from prompt_toolkit.document import Document
-    from vg_agent.__main__ import SLASH_COMMAND_HELP, _slash_command_completer
+    from vg_agent.__main__ import SLASH_COMMAND_HELP, SLASH_COMMANDS, _slash_command_completer
 
     completer = _slash_command_completer()
+    all_commands = list(completer.get_completions(Document("/"), CompleteEvent()))
     finops = list(completer.get_completions(Document("/fin"), CompleteEvent()))
     show_context = list(completer.get_completions(Document("/show"), CompleteEvent()))
 
+    assert [completion.text for completion in all_commands] == list(SLASH_COMMANDS)
     assert [completion.text for completion in finops] == ["/finops"]
     assert [completion.text for completion in show_context] == ["/show-context"]
+    assert "N: parent step index; default 0" in show_context[0].display_meta_text
+    assert len(show_context[0].display_text) > len(show_context[0].text)
+    assert list(completer.get_completions(Document(""), CompleteEvent())) == []
+    assert list(completer.get_completions(Document(" "), CompleteEvent())) == []
+    assert list(completer.get_completions(Document("hello "), CompleteEvent())) == []
+    assert list(completer.get_completions(Document("/show-context "), CompleteEvent())) == []
     assert "/show-context N" in SLASH_COMMAND_HELP
 
 
@@ -959,6 +979,36 @@ def test_literal_tool_output_fallback_for_listing_requests(tmp_path: Path) -> No
 
     outputs = _literal_tool_outputs(recorder.events, 0, "list all files", "Here is the list of files.")
     assert outputs == ["Tool output (ls -l):\ntotal 1\n-rw-r--r-- 1 user user 7 app.py"]
+
+
+def test_literal_tool_output_includes_read_errors(tmp_path: Path) -> None:
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="read .env")
+    recorder.emit("tool_call", tool="read_file", tool_use_id="read-env", args={"path": ".env"})
+    recorder.emit(
+        "tool_result",
+        tool="read_file",
+        tool_use_id="read-env",
+        result_full="sensitive path '.env' is on the read/write denylist",
+        bytes=52,
+        tokens=8,
+        latency_ms=1,
+        status="error",
+    )
+    recorder.emit(
+        "assistant_step",
+        assistant_text="I could not read that file.",
+        tool_calls=[],
+        stop_reason="end_turn",
+    )
+
+    from vg_agent.__main__ import _format_progress_event, _literal_tool_outputs, _progress_event_color
+
+    outputs = _literal_tool_outputs(recorder.events, 0, "read .env", "I could not read that file.")
+    assert outputs == ["Tool error (read_file):\nsensitive path '.env' is on the read/write denylist"]
+    tool_event = next(event for event in recorder.events if event["kind"] == "tool_result")
+    assert "sensitive path" in str(_format_progress_event(tool_event))
+    assert _progress_event_color(tool_event, use_color=True) == "\x1b[31m"
 
 
 def test_chat_persists_budget_and_approvals_across_turns(tmp_path: Path) -> None:
