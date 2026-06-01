@@ -22,13 +22,17 @@ Either layer alone fails. Deny-only blocks legitimate edits. Approval-only
 trusts a tired demo operator. Together they're the same pattern Claude Code
 itself uses.
 
+**Pytest:** do not add `pytest` or `python -m pytest` to the `run_bash`
+allowlist. Verification uses the dedicated `run_tests(path)` tool, which runs
+a fixed subprocess argv under workspace path validation (see `specs/20_tools.md`).
+
 ## 2. Command taxonomy
 
 ### Always-denied command tokens (with rationale by family)
 
 | Family | Tokens | Why |
 | --- | --- | --- |
-| Mutation | `rm`, `del`, `erase`, `rmdir`, `Remove-Item`, `ri`, `rd`, `mv`, `move`, `cp`, `copy`, `dd` | Direct workspace mutation. |
+| Mutation | `del`, `erase`, `rmdir`, `Remove-Item`, `ri`, `rd`, `mv`, `move`, `cp`, `copy`, `dd` | Direct workspace mutation. `rm` and `mkdir` are gated exceptions — see `specs/20_tools.md`. |
 | Privilege | `chmod`, `chown`, `mkfs` | Privilege change / filesystem damage. |
 | Egress | `curl`, `wget`, `nc`, `ncat`, `netcat`, `ssh`, `scp`, `sftp`, `rsync`, `ftp`, `telnet`, `socat` | Data exfiltration channels. |
 | Code | `pip`, `npm`, `pnpm`, `yarn`, `uv`, `python`, `powershell`, `pwsh`, `cmd` | Arbitrary code execution / dependency tampering. |
@@ -55,6 +59,12 @@ itself uses.
 
 `grep`, `rg`, `find`, `ls`, `pwd`, `cat`, `head`, `tail`, `wc`. They remain
 read-only because:
+
+### Allowed workspace-scoped mutations
+
+`mkdir [-p] <dir>` and `rm <file>` — syntax-checked, path-resolved under the
+workspace root, and unit-tested. `mkdir` accepts only `-p`; `rm` accepts no
+flags and only regular files.
 
 - No redirection (`>`, `<`), pipes (`|`), command separators (`;`, `&&`,
   `||`), backticks, or `$(…)` substitution is permitted in the command

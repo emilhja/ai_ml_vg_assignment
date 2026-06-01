@@ -9,6 +9,9 @@ The agent has a single runtime path: a live OpenRouter-backed loop (via LiteLLM)
 where the parent model decides each turn whether to call a tool, spawn a typed
 sub-agent, or yield. It requires `OPENROUTER_API_KEY`.
 
+Runtime dependencies include **pytest** (for the `run_tests` tool). Dev-only
+extras such as `httpx` remain under `[project.optional-dependencies] dev`.
+
 ## Recommended Run Path: Docker
 
 Use Docker Compose for demos and grading. The single `vg-agent` service has
@@ -89,6 +92,11 @@ Test locally (no network; live loop is exercised with an injected fake client):
 python scripts/generate_project.py --clean
 uv run pytest
 ```
+
+`vg_agent.egg-info/` appears after a local install (`uv sync`, `pip install -e .`).
+It is setuptools metadata (version, entry points, top-level packages such as
+`vg_agent` and `dashboard`), not source code. It is gitignored and safe to
+delete; the next install recreates it.
 
 ## Model configuration
 

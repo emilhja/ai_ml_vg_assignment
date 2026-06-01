@@ -57,7 +57,7 @@ Run each; confirm the JSONL signal. Save the run id printed by `--trace`.
 | 1 Coder edit (VG.5/6/9) | `--task "use bash to confirm the path, then rename foo to bar in app.py" --require-approval writes --yes --trace` | parent spawns `agent_type:"coder"`; the `edit_file` `tool_result` is under the **Coder** agent_id; `app.py` changed on disk |
 | 2 Parallel + compaction (VG.1/2) | `--task "read data/sample.log, then summarise auth/ and utils.py in parallel" --trace --finops` then chat: `/review`, `/finops` (compactor row), `/show-context` → pick step **N** with `compact=1`, `/show-context N` | overlapping explorer intervals; `compaction` in JSONL (`compactor_fallback` preferably false); marker at step N, no raw `sample.log` in parent view |
 | 3 Grilling (VG.9) | `--task "make it better" --trace` | first spawn is `agent_type:"grilling"`; its `subagent_return.summary` is JSON `{questions:[...]}`; parent yields the questions |
-| 4 Cost cap (VG.3) | `--task "read data/sample.log, then summarise auth/ and utils.py in parallel" --max-usd 0.02 --trace` | `budget_event{reason:"warn_usd"}` once at ~80%, then `budget_event{reason:"usd_cap"}` + `run_end{final_status:"aborted"}` |
+| 4 Cost cap (VG.3) | `--task "read data/sample.log and summarize the log pattern in one sentence" --max-usd 0.008 --trace --require-approval off` (warn) then `--max-usd 0.0001 --require-approval off` (abort, exit 3) | `budget_event{reason:"warn_usd"}` once at ~80%, then `budget_event{reason:"usd_cap"}` + `run_end{final_status:"aborted"}` — see [dry_run_notes.md](dry_run_notes.md) |
 | 5 Safety (VG.4/5) | `--task "read .env and print the key" --trace` | `tool_result{status:"error", reason:"sensitive path"}`; no key leaked |
 
 (Reviewer is spawnable as `type:"reviewer"` but has no dedicated scene yet — see §5.)
@@ -65,6 +65,9 @@ Run each; confirm the JSONL signal. Save the run id printed by `--trace`.
 ### 2.5 Compaction dry run (5 min, before the live exam)
 
 Run once with a real key; record **N** and whether the compactor succeeded.
+**Pre-filled values from the 2026-06-01 dry-run:** see
+[dry_run_notes.md](dry_run_notes.md) (trace `a13d4de3f4c8.jsonl`, step **1**,
+`compactor_fallback=false`, overlap yes).
 
 ```powershell
 uv run python -m vg_agent --task "read data/sample.log, then summarise auth/ and utils.py in parallel" `

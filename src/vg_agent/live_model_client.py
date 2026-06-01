@@ -58,6 +58,10 @@ class LiveModelError(RuntimeError):
 class LiveModelRateLimitError(LiveModelError):
     retryable = True
 
+    def __init__(self, message: str, *, provider_detail: str | None = None) -> None:
+        super().__init__(message)
+        self.provider_detail = provider_detail
+
 
 @dataclass
 class ToolCall:
@@ -152,7 +156,10 @@ class LiveModelClient:
                 response = litellm.completion(**completion_kwargs)
             except Exception as exc:
                 if _is_rate_limit_error(exc):
-                    raise LiveModelRateLimitError(_rate_limit_message(model)) from exc
+                    raise LiveModelRateLimitError(
+                        _rate_limit_message(model),
+                        provider_detail=_provider_error_detail(exc),
+                    ) from exc
                 raise
             finally:
                 stdout_filter.flush()
@@ -296,6 +303,21 @@ def _rate_limit_message(model: str) -> str:
         f"live model provider rate-limited {model}. Retry shortly, switch models, "
         "or add your own provider key in OpenRouter integrations."
     )
+
+
+def _provider_error_detail(exc: BaseException) -> str | None:
+    flag = os.environ.get("VG_PROVIDER_ERROR_DETAIL", "").strip().lower()
+    if flag not in {"1", "true", "yes", "on"}:
+        return None
+    text = str(exc).strip()
+    if not text:
+        return None
+    if len(text) > 4000:
+        text = text[:4000] + "…"
+    from .trace import _redact
+
+    redacted, _ = _redact(text)
+    return redacted
 
 
 def _normalise_response(response: Any, requested_model: str) -> ModelTurn:

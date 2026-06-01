@@ -113,6 +113,9 @@ export default function EventRow({
         {event.kind === "budget_event" && event.payload.budget_reason != null && (
           <span className="text-amber-300/90">{String(event.payload.budget_reason)}</span>
         )}
+        {event.kind === "model_error" && event.payload.retryable === true && (
+          <span className="text-amber-300/80 text-[10px]">retryable</span>
+        )}
         {returnDetail && returnDetail.status !== "ok" && (
           <span className="text-red-400">{returnDetail.status}</span>
         )}
@@ -145,6 +148,9 @@ export default function EventRow({
       )}
       {event.kind === "user_prompt" && event.payload.prompt != null && (
         <p className="mt-1 text-slate-200 line-clamp-2">{String(event.payload.prompt)}</p>
+      )}
+      {event.kind === "model_error" && !open && event.payload.message != null && (
+        <p className="mt-1 text-red-300/90 text-[11px] line-clamp-3">{String(event.payload.message)}</p>
       )}
       {event.kind === "tool_result" && !open && (
         <p className="mt-1 text-slate-400 line-clamp-1 text-[11px]">

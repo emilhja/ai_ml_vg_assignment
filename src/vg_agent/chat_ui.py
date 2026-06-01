@@ -165,6 +165,24 @@ def _tool_error_count(events: list[dict[str, object]]) -> int:
     )
 
 
+def _parent_tool_error_count(events: list[dict[str, object]], *, since_event_idx: int = 0) -> int:
+    return sum(
+        1
+        for event in events[since_event_idx:]
+        if event.get("kind") == "tool_result"
+        and event.get("status") != "ok"
+        and event.get("agent_id") == "parent"
+    )
+
+
+def _subagent_failure_count(events: list[dict[str, object]], *, since_event_idx: int = 0) -> int:
+    return sum(
+        1
+        for event in events[since_event_idx:]
+        if event.get("kind") == "subagent_return" and event.get("status") != "ok"
+    )
+
+
 def _status_token(
     events: list[dict[str, object]],
     *,
@@ -175,14 +193,18 @@ def _status_token(
         return "\u2026", "running", "yellow"
     status = _latest_run_state(events, since_event_idx=since_event_idx)
     lowered = status.lower()
-    turn_errors = _tool_error_count(events[since_event_idx:])
+    turn_parent_errors = _parent_tool_error_count(events, since_event_idx=since_event_idx)
+    subagent_failures = _subagent_failure_count(events, since_event_idx=since_event_idx)
     if (
-        turn_errors > 0
+        turn_parent_errors > 0
+        or subagent_failures > 0
         or "tool_error" in lowered
         or "model_error" in lowered
         or "aborted" in lowered
         or "error" in lowered
     ):
+        if status in {"ok", "done"} and subagent_failures > 0 and turn_parent_errors == 0:
+            return "\u2717", "partial", "red"
         label = status if status != "ready" else "error"
         return "\u2717", label, "red"
     if any(marker in lowered for marker in ("warn", "cap", "budget")):

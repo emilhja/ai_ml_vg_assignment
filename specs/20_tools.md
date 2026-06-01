@@ -33,19 +33,48 @@ Tool semantics:
   is the canonical partial-edit operation for VG.6 and the operation
   Coder is instructed to prefer (`PROMPTS.md`).
 - `run_bash(command)` — see Windows/Git Bash rules below.
+- `run_tests(path)` — run pytest on a workspace-relative test file or
+  directory. See `run_tests` rules below. Parent and Coder only; not
+  Explorer or Reviewer.
+
+`run_tests` rules:
+
+- `run_tests(path)` invokes a fixed subprocess:
+  `[sys.executable, "-m", "pytest", <resolved_path>, "-q", "--tb=short"]`
+  with `cwd` set to the workspace root. No shell, no user-supplied flags,
+  no `-c`, no plugins configuration from the model.
+- `path` must resolve under the workspace root (same rules as file tools:
+  no absolute paths, no `..` traversal, no sensitive paths).
+- `path` must exist and match `**/test_*.py`, `**/tests/**`, or be a
+  directory containing tests. Reject arbitrary non-test paths.
+- Exit code 0 → `tool_result.status = "ok"`; non-zero → `status = "error"`.
+  stdout/stderr are captured and truncated to `MAX_TOOL_RESULT_BYTES`.
+- Timeout: `TOOL_TIMEOUT` seconds (same as other tools).
+- Use `run_tests` for pytest verification. Do **not** call `run_bash` with
+  `pytest`, `python -m pytest`, or `python -c`.
 
 Windows/Git Bash rules:
 
 - `run_bash` invokes `bash -c`.
 - `run_bash` is deny-by-default for command families that can mutate or
-  destroy the workspace. It accepts only simple read-only inspection commands:
+  destroy the workspace. It accepts simple read-only inspection commands:
   `grep`, `rg`, `find`, `ls`, `pwd`, `cat`, `head`, `tail`, and `wc`. `sed` is
   intentionally excluded because `sed -i` mutates files in place.
+- `run_bash` also accepts narrowly scoped workspace mutations:
+  - `mkdir [-p] <dir> [<dir> ...]` — creates directories only under the
+    workspace root. Only the `-p` flag is allowed. Targets must be relative,
+    must not use globs or `..` traversal, and must not name sensitive paths.
+    When every target already exists as a directory, `run_bash` returns `ok`
+    with `mkdir: directory already exists: …` instead of shelling out (plain
+    `mkdir` without `-p` would otherwise fail with "File exists").
+  - `rm <file>` — deletes exactly one existing regular file under the workspace
+    root (no flags, no directories, no globs). See runtime validation in
+    `validate_shell_command` / `validate_shell_command_for_workspace`.
 - `run_bash` rejects shell control operators and redirection (`;`, `&&`, `||`,
   pipes, `>`, `<`, backticks, and command substitution) so a safe-looking first
   command cannot hide a destructive second command.
 - `run_bash` rejects destructive tokens anywhere in the parsed command,
-  including `rm`, `del`, `erase`, `rmdir`, `Remove-Item`, `mv`, `move`, `cp`,
+  including `del`, `erase`, `rmdir`, `Remove-Item`, `mv`, `move`, `cp`,
   `copy`, `chmod`, `chown`, `mkfs`, `dd`, package installers (`pip`, `npm`,
   `pnpm`, `yarn`, `uv`), foreign code runners (`python`, `powershell`, `pwsh`,
   `cmd`), and any egress utility (`curl`, `wget`, `nc`, `ncat`, `netcat`,
@@ -100,7 +129,7 @@ Approval policy (see `specs/10_main_agent.md` and `specs/30_runtime_governance.m
 
 - Tools are grouped into approval categories: `reads` (`read_file`,
   `read_file_range`, `run_bash`) and `writes` (`write_file`, `edit_file`,
-  `run_bash` when it would mutate — not currently reachable, but
+  `run_tests`, `run_bash` when it would mutate — not currently reachable, but
   `spawn_subagent` and `spawn_subagents` are also gated because they consume
   budget).
 - The runtime exposes `--require-approval [off|writes|all]` and `--yes`.

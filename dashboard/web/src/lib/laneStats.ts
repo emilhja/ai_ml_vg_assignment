@@ -324,6 +324,18 @@ function egressOrRedactionDetail(event: EventItem): ExpandableEventDetail | null
   };
 }
 
+function modelErrorDetail(event: EventItem): ExpandableEventDetail | null {
+  if (event.kind !== "model_error") return null;
+  const message = String(event.payload.message ?? "").trim();
+  const detail = String(event.payload.provider_detail ?? "").trim();
+  if (!message && !detail) return null;
+  const sections: ExpandableSection[] = [];
+  if (message) sections.push({ heading: "Message", body: message });
+  if (detail) sections.push({ heading: "Provider detail (redacted)", body: detail });
+  sections.push(section("Trace fields", event.payload));
+  return { toggleLabel: "error", sections };
+}
+
 export function expandableEventDetail(event: EventItem): ExpandableEventDetail | null {
   if (event.kind === "subagent_return") {
     const detail = subagentReturnDetail(event);
@@ -343,5 +355,6 @@ export function expandableEventDetail(event: EventItem): ExpandableEventDetail |
   if (event.kind === "approval") return approvalDetail(event);
   if (event.kind === "user_prompt") return userPromptDetail(event);
   if (event.kind === "egress_blocked" || event.kind === "redaction") return egressOrRedactionDetail(event);
+  if (event.kind === "model_error") return modelErrorDetail(event);
   return null;
 }

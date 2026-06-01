@@ -751,6 +751,10 @@ class LiveModelError(RuntimeError):
 class LiveModelRateLimitError(LiveModelError):
     retryable = True
 
+    def __init__(self, message: str, *, provider_detail: str | None = None) -> None:
+        super().__init__(message)
+        self.provider_detail = provider_detail
+
 
 @dataclass
 class ToolCall:
@@ -845,7 +849,10 @@ class LiveModelClient:
                 response = litellm.completion(**completion_kwargs)
             except Exception as exc:
                 if _is_rate_limit_error(exc):
-                    raise LiveModelRateLimitError(_rate_limit_message(model)) from exc
+                    raise LiveModelRateLimitError(
+                        _rate_limit_message(model),
+                        provider_detail=_provider_error_detail(exc),
+                    ) from exc
                 raise
             finally:
                 stdout_filter.flush()
@@ -991,6 +998,21 @@ def _rate_limit_message(model: str) -> str:
     )
 
 
+def _provider_error_detail(exc: BaseException) -> str | None:
+    flag = os.environ.get("VG_PROVIDER_ERROR_DETAIL", "").strip().lower()
+    if flag not in {"1", "true", "yes", "on"}:
+        return None
+    text = str(exc).strip()
+    if not text:
+        return None
+    if len(text) > 4000:
+        text = text[:4000] + "…"
+    from .trace import _redact
+
+    redacted, _ = _redact(text)
+    return redacted
+
+
 def _normalise_response(response: Any, requested_model: str) -> ModelTurn:
     choices = _value(response, "choices", []) or []
     choice = choices[0] if choices else {}
@@ -1073,11 +1095,15 @@ from __future__ import annotations
 import re
 import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 
+TOOL_TIMEOUT = 30
+MAX_TOOL_RESULT_BYTES = 1_048_576
 
-SAFE_COMMANDS = {"grep", "rg", "find", "ls", "pwd", "cat", "head", "tail", "wc", "rm"}
+
+SAFE_COMMANDS = {"grep", "rg", "find", "ls", "pwd", "cat", "head", "tail", "wc", "rm", "mkdir"}
 DESTRUCTIVE_TOKENS = {
     "del", "erase", "rmdir", "remove-item", "ri", "rd",
     "mv", "move", "cp", "copy", "chmod", "chown", "mkfs", "dd",
@@ -1169,7 +1195,7 @@ def _path_token_error(token: str) -> str | None:
     if not looks_like_path:
         return None
     candidate = Path(token)
-    if candidate.is_absolute() or token.startswith("~"):
+    if candidate.is_absolute() or token.startswith("~") or token.startswith("/"):
         return f"path token {token!r} must stay inside the workspace"
     if ".." in candidate.parts:
         return f"path token {token!r} escapes the workspace root"
@@ -1207,6 +1233,61 @@ def _validate_rm_tokens(tokens: list[str]) -> str | None:
     return _path_token_error(target)
 
 
+def _mkdir_paths_from_tokens(tokens: list[str]) -> tuple[list[str], str | None]:
+    if len(tokens) < 2:
+        return [], "mkdir requires at least one directory path"
+    paths: list[str] = []
+    for token in tokens[1:]:
+        if token == "-p":
+            continue
+        if token.startswith("-"):
+            return [], "mkdir accepts only the -p flag"
+        paths.append(token)
+    if not paths:
+        return [], "mkdir requires at least one directory path"
+    return paths, None
+
+
+def _validate_mkdir_target(target: str) -> str | None:
+    if target in {"..", "../"}:
+        return "mkdir target must stay inside the workspace"
+    if any(marker in target for marker in GLOB_MARKERS):
+        return "mkdir glob patterns are not allowed"
+    sensitive = validate_sensitive_path(target)
+    if sensitive:
+        return sensitive
+    return _path_token_error(target)
+
+
+def _validate_mkdir_tokens(tokens: list[str]) -> str | None:
+    paths, error = _mkdir_paths_from_tokens(tokens)
+    if error:
+        return error
+    for target in paths:
+        target_error = _validate_mkdir_target(target)
+        if target_error:
+            return target_error
+    return None
+
+
+def mkdir_create_targets(command: str) -> list[str] | None:
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    head = Path(tokens[0]).name.lower()
+    if head.endswith(".exe"):
+        head = head[:-4]
+    if head != "mkdir":
+        return None
+    paths, error = _mkdir_paths_from_tokens(tokens)
+    if error:
+        return None
+    return paths
+
+
 def validate_shell_command(command: str) -> str | None:
     lowered = command.lower()
     for marker in SHELL_CONTROL_MARKERS:
@@ -1226,6 +1307,8 @@ def validate_shell_command(command: str) -> str | None:
         normalized.append(base)
     if normalized[0] == "rm":
         return _validate_rm_tokens(tokens)
+    if normalized[0] == "mkdir":
+        return _validate_mkdir_tokens(tokens)
     if normalized[0] not in SAFE_COMMANDS:
         return f"command {normalized[0]!r} is not in the read-only allowlist"
     for token in normalized:
@@ -1247,16 +1330,28 @@ def validate_shell_command_for_workspace(root: Path, command: str) -> str | None
     if syntax_error:
         return syntax_error
     target = rm_delete_target(command)
-    if target is None:
+    if target is not None:
+        try:
+            path = resolve_workspace_path(root, target)
+        except ValueError as exc:
+            return str(exc)
+        if not path.exists():
+            return f"rm target {target!r} does not exist"
+        if not path.is_file():
+            return "rm may delete only regular files"
         return None
-    try:
-        path = resolve_workspace_path(root, target)
-    except ValueError as exc:
-        return str(exc)
-    if not path.exists():
-        return f"rm target {target!r} does not exist"
-    if not path.is_file():
-        return "rm may delete only regular files"
+    mkdir_targets = mkdir_create_targets(command)
+    if mkdir_targets is not None:
+        for rel_target in mkdir_targets:
+            if rel_target in {".", "./"}:
+                continue
+            try:
+                path = resolve_workspace_path(root, rel_target)
+            except ValueError as exc:
+                return str(exc)
+            if path.exists() and not path.is_dir():
+                return f"mkdir target {rel_target!r} exists and is not a directory"
+        return None
     return None
 
 
@@ -1335,10 +1430,86 @@ def run_bash(root: Path, command: str, tool_use_id: str) -> dict[str, object]:
     safety_error = validate_shell_command_for_workspace(root, command)
     if safety_error:
         return _result(tool_use_id, "run_bash", f"run_bash blocked: {safety_error}", "error", started)
-    completed = subprocess.run(["bash", "-c", command], cwd=root, text=True, capture_output=True, timeout=30)
+    mkdir_targets = mkdir_create_targets(command)
+    if mkdir_targets is not None:
+        rel_targets = [target for target in mkdir_targets if target not in {".", "./"}]
+        if rel_targets:
+            existing: list[str] = []
+            for rel_target in rel_targets:
+                try:
+                    path = resolve_workspace_path(root, rel_target)
+                except ValueError:
+                    existing = []
+                    break
+                if path.is_dir():
+                    existing.append(rel_target)
+                else:
+                    existing = []
+                    break
+            if existing and len(existing) == len(rel_targets):
+                joined = ", ".join(existing)
+                return _result(
+                    tool_use_id,
+                    "run_bash",
+                    f"mkdir: directory already exists: {joined}",
+                    "ok",
+                    started,
+                )
+    completed = subprocess.run(["bash", "-c", command], cwd=root, text=True, capture_output=True, timeout=TOOL_TIMEOUT)
     content = completed.stdout + completed.stderr
     status = "ok" if completed.returncode == 0 else "error"
     return _result(tool_use_id, "run_bash", content, status, started)
+
+
+def validate_run_tests_path(root: Path, rel_path: str) -> str | None:
+    refusal = validate_sensitive_path(rel_path)
+    if refusal:
+        return refusal
+    try:
+        path = resolve_workspace_path(root, rel_path)
+    except ValueError as exc:
+        return str(exc)
+    if not path.exists():
+        return f"run_tests path {rel_path!r} does not exist"
+    if path.is_file():
+        name = path.name
+        if not (name.startswith("test_") and name.endswith(".py")):
+            return f"run_tests file must match test_*.py, got {rel_path!r}"
+    elif not path.is_dir():
+        return f"run_tests path must be a test file or directory, got {rel_path!r}"
+    return None
+
+
+def run_tests(root: Path, rel_path: str, tool_use_id: str) -> dict[str, object]:
+    started = time.perf_counter()
+    path_error = validate_run_tests_path(root, rel_path)
+    if path_error:
+        return _result(tool_use_id, "run_tests", f"run_tests blocked: {path_error}", "error", started)
+    try:
+        resolved = resolve_workspace_path(root, rel_path)
+    except ValueError as exc:
+        return _result(tool_use_id, "run_tests", str(exc), "error", started)
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "pytest", str(resolved), "-q", "--tb=short"],
+            cwd=root,
+            text=True,
+            capture_output=True,
+            timeout=TOOL_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return _result(tool_use_id, "run_tests", f"run_tests timed out after {TOOL_TIMEOUT}s", "error", started)
+    content = (completed.stdout or "") + (completed.stderr or "")
+    if not content.strip():
+        content = f"pytest exit code {completed.returncode}"
+    encoded = content.encode("utf-8")
+    if len(encoded) > MAX_TOOL_RESULT_BYTES:
+        half = MAX_TOOL_RESULT_BYTES // 2
+        content = content[:half] + f"\\n[TRUNCATED at {MAX_TOOL_RESULT_BYTES} bytes]"
+    status = "ok" if completed.returncode == 0 else "error"
+    if completed.returncode != 0 and status == "error":
+        content = f"pytest exit code {completed.returncode}\\n{content}"
+    return _result(tool_use_id, "run_tests", content, status, started)
 ''',
     "trace.py": '''"""Generated JSONL trace and rendering helpers."""
 
@@ -2092,6 +2263,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -2131,7 +2303,7 @@ SUBAGENT_SYSTEM_PROMPTS = {
 SUBAGENT_TOOL_NAMES = {
     "grilling": set(),
     "explorer": {"read_file", "read_file_range", "run_bash"},
-    "coder": {"read_file", "read_file_range", "run_bash", "write_file", "edit_file"},
+    "coder": {"read_file", "read_file_range", "run_bash", "run_tests", "write_file", "edit_file"},
     "reviewer": {"read_file", "read_file_range", "run_bash"},
 }
 
@@ -2141,7 +2313,8 @@ def _normalise_agent_type(value: object) -> str:
     return text if text in config.SUBAGENT_TYPES else "explorer"
 
 
-GATED_WRITES = {"write_file", "edit_file", "run_bash", "spawn_subagent", "spawn_subagents"}
+GATED_WRITES = {"write_file", "edit_file", "run_bash", "run_tests", "spawn_subagent", "spawn_subagents"}
+SOFT_RECOVERABLE_PARENT_TOOLS = {"run_tests"}
 GATED_ALL = {"read_file", "read_file_range"} | GATED_WRITES
 BUDGET_CAP_TOOL = "budget_cap"
 
@@ -2282,6 +2455,8 @@ def _args_summary(tool: str, args: dict[str, Any]) -> str:
         return str(path)
     if tool == "run_bash":
         return str(args.get("command") or "")
+    if tool == "run_tests":
+        return str(args.get("path") or "")
     if tool == "spawn_subagent":
         return str(args.get("question") or "")[:120]
     if tool == "spawn_subagents":
@@ -2363,8 +2538,13 @@ FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "run_bash": {
         "name": "run_bash",
-        "description": "Run one simple inspection command through bash, or exactly `rm <relative-file>` for approved single-file deletion. For top-level folder listings use `find . -maxdepth 1 -type d`. No pipes, redirection, shell control, Python, pytest, package managers, network tools, command chains, rm flags, globs, or directory deletion.",
+        "description": "Run one simple inspection command through bash, or exactly `rm <relative-file>` for approved single-file deletion. For top-level folder listings use `find . -maxdepth 1 -type d`. No pipes, redirection, shell control, Python, pytest, package managers, network tools, command chains, rm flags, globs, or directory deletion. Use run_tests for pytest.",
         "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+    },
+    "run_tests": {
+        "name": "run_tests",
+        "description": "Run pytest on a workspace-relative test file (test_*.py) or test directory. Fixed invocation only; do not use run_bash for pytest.",
+        "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
     },
 }
 
@@ -2373,6 +2553,10 @@ _SUBAGENT_REQUEST_SCHEMA = {
     "properties": {
         "type": {"type": "string", "enum": list(config.SUBAGENT_TYPES)},
         "question": {"type": "string"},
+        "review_agent_id": {
+            "type": "string",
+            "description": "Optional coder agent id (e.g. coder-2) whose JSONL slice Reviewer receives. Defaults to the most recent Coder in the trace.",
+        },
     },
     "required": ["type", "question"],
 }
@@ -2413,6 +2597,7 @@ PARENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     FILE_TOOL_SCHEMAS["read_file"],
     FILE_TOOL_SCHEMAS["read_file_range"],
     FILE_TOOL_SCHEMAS["run_bash"],
+    FILE_TOOL_SCHEMAS["run_tests"],
     *SPAWN_TOOL_SCHEMAS,
 ]
 
@@ -2942,18 +3127,21 @@ def _record_model_error(
     parent_id: str | None = None,
     agent_type: str = "parent",
 ) -> None:
-    recorder.emit(
-        "model_error",
-        agent_id=agent_id,
-        parent_id=parent_id,
-        agent_type=agent_type,
-        model=model,
-        model_id=model,
-        step_idx=step_idx,
-        error_type=type(exc).__name__,
-        message=str(exc),
-        retryable=getattr(exc, "retryable", False),
-    )
+    fields: dict[str, Any] = {
+        "agent_id": agent_id,
+        "parent_id": parent_id,
+        "agent_type": agent_type,
+        "model": model,
+        "model_id": model,
+        "step_idx": step_idx,
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+        "retryable": getattr(exc, "retryable", False),
+    }
+    provider_detail = getattr(exc, "provider_detail", None)
+    if provider_detail:
+        fields["provider_detail"] = provider_detail
+    recorder.emit("model_error", **fields)
     if agent_id == "parent":
         recorder.emit(
             "run_end",
@@ -3025,6 +3213,9 @@ def _execute_live_tool(
                 return _result(call.tool_use_id, "run_bash", f"budget abort: {repeat.budget_reason}", "error", tool_started)
             guard.record_tool_signature("run_bash", command)
         return tools.run_bash(root, command, call.tool_use_id)
+    if tool_name == "run_tests":
+        test_path = str(args.get("path") or path or "")
+        return tools.run_tests(root, test_path, call.tool_use_id)
     if tool_name == "write_file":
         return tools.write_file(root, path, str(args.get("content") or ""), call.tool_use_id)
     if tool_name == "edit_file":
@@ -3032,7 +3223,19 @@ def _execute_live_tool(
     if tool_name == "spawn_subagent":
         child_type = _normalise_agent_type(args.get("type"))
         question = str(args.get("question") or "")
-        outcome = _spawn_one(root, child_type, question, recorder, client, guard, started, policy)
+        review_slice = None
+        if child_type == "reviewer":
+            coder_id = _resolve_review_coder_id(recorder, args.get("review_agent_id"))
+            if not coder_id:
+                return _result(
+                    call.tool_use_id,
+                    "spawn_subagent",
+                    "Reviewer requires a prior Coder run in this session; spawn Explorer for read-only review.",
+                    "error",
+                    tool_started,
+                )
+            review_slice = _build_review_slice(recorder, coder_id)
+        outcome = _spawn_one(root, child_type, question, recorder, client, guard, started, policy, review_slice)
         return _result(call.tool_use_id, "spawn_subagent", json.dumps(outcome, ensure_ascii=False), "ok", tool_started)
     if tool_name == "spawn_subagents":
         raw_requests = args.get("requests") or []
@@ -3048,6 +3251,54 @@ def _next_child_id(recorder: TraceRecorder, agent_type: str) -> str:
     return f"{agent_type}-{n}"
 
 
+def _resolve_review_coder_id(recorder: TraceRecorder, requested: object) -> str | None:
+    if requested is not None and str(requested).strip():
+        return str(requested).strip()
+    coder_ids: list[str] = []
+    for event in recorder.events:
+        if event.get("kind") != "subagent_spawn" or event.get("agent_type") != "coder":
+            continue
+        child_id = event.get("child_agent_id") or event.get("agent_id")
+        if child_id:
+            coder_ids.append(str(child_id))
+    return coder_ids[-1] if coder_ids else None
+
+
+def _build_review_slice(recorder: TraceRecorder, coder_agent_id: str, max_bytes: int = 8192) -> str:
+    matched: list[dict[str, object]] = []
+    for event in recorder.events:
+        agent_id = str(event.get("agent_id") or "")
+        child_id = str(event.get("child_agent_id") or "")
+        if agent_id == coder_agent_id or child_id == coder_agent_id:
+            matched.append(event)
+    body = "\\n".join(json.dumps(event, ensure_ascii=False, sort_keys=True) for event in matched)
+    encoded = body.encode("utf-8")
+    if len(encoded) > max_bytes:
+        body = body[: max_bytes // 2] + "\\n[review slice truncated]"
+    return body
+
+
+def _is_reviewer_verdict(text: str) -> bool:
+    stripped = (text or "").strip()
+    upper = stripped.upper()
+    return upper.startswith("PASS:") or upper.startswith("FAIL:")
+
+
+def _question_requires_tests(question: str) -> bool:
+    lowered = question.lower()
+    return "test_" in lowered or "pytest" in lowered or re.search(r"\\btests?\\b", lowered) is not None
+
+
+def _is_test_file_path(path: str) -> bool:
+    name = Path(str(path).replace("\\\\", "/")).name
+    return name.startswith("test_") and name.endswith(".py")
+
+
+def _is_impl_file_path(path: str) -> bool:
+    name = Path(str(path).replace("\\\\", "/")).name
+    return name.endswith(".py") and not name.startswith("test_")
+
+
 def _run_live_subagent(
     root: Path,
     agent_type: str,
@@ -3059,8 +3310,8 @@ def _run_live_subagent(
     started: float,
     policy: ApprovalPolicy,
     review_slice: str | None = None,
-) -> tuple[str, str]:
-    """Run one typed sub-agent loop. Returns (summary, status)."""
+) -> tuple[str, str, int, int]:
+    """Run one typed sub-agent loop. Returns (summary, status, writes_ok, reads_ok)."""
     system_prompt = SUBAGENT_SYSTEM_PROMPTS[agent_type]
     model = config.SUBAGENT_MODEL_IDS[agent_type]
     tool_schemas = _subagent_tool_schemas(agent_type)
@@ -3071,6 +3322,14 @@ def _run_live_subagent(
         messages = [{"role": "user", "content": question}]
     final_summary = ""
     status = "ok"
+    had_tool_error = False
+    completed = False
+    writes_ok = 0
+    reads_ok = 0
+    read_tools_ok = 0
+    verdict_retry_used = False
+    require_impl_read = agent_type == "coder" and _question_requires_tests(question)
+    impl_read_ok = False
 
     for local_step in range(1, config.MAX_SUBAGENT_STEPS + 1):
         if _wall_clock_exceeded(started, guard):
@@ -3167,37 +3426,98 @@ def _run_live_subagent(
         messages.append({"role": "assistant", "content": _assistant_content(turn)})
         if not turn.tool_calls:
             final_summary = turn.assistant_text[:2048]
+            if agent_type == "reviewer":
+                if read_tools_ok == 0:
+                    if not verdict_retry_used:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": "You must read_file or read_file_range the changed file on disk before returning a verdict.",
+                            }
+                        )
+                        verdict_retry_used = True
+                        continue
+                    status = "tool_error"
+                    final_summary = "Reviewer returned without reading workspace."
+                    completed = True
+                    break
+                if not _is_reviewer_verdict(final_summary):
+                    if not verdict_retry_used:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": "Return exactly one line starting with PASS: or FAIL: after verifying the file on disk.",
+                            }
+                        )
+                        verdict_retry_used = True
+                        continue
+                    status = "tool_error"
+                    final_summary = "Reviewer returned without PASS:/FAIL: verdict."
+                    completed = True
+                    break
+            completed = True
             break
         tool_blocks: list[dict[str, Any]] = []
-        had_error = False
         for c in turn.tool_calls:
-            result = _execute_live_tool(
-                root=root,
-                call=c,
-                recorder=recorder,
-                client=client,
-                guard=guard,
-                allowed_tools=allowed,
-                started=started,
-                policy=policy,
-                agent_id=child_id,
-                parent_id="parent",
-                agent_type=agent_type,
-            )
+            if (
+                agent_type == "coder"
+                and require_impl_read
+                and not impl_read_ok
+                and c.name == "write_file"
+                and _is_test_file_path(str(c.args.get("path") or ""))
+            ):
+                result = _result(
+                    c.tool_use_id,
+                    "write_file",
+                    "read the implementation module with read_file before writing test_*.py",
+                    "error",
+                    time.perf_counter(),
+                )
+            else:
+                result = _execute_live_tool(
+                    root=root,
+                    call=c,
+                    recorder=recorder,
+                    client=client,
+                    guard=guard,
+                    allowed_tools=allowed,
+                    started=started,
+                    policy=policy,
+                    agent_id=child_id,
+                    parent_id="parent",
+                    agent_type=agent_type,
+                )
             recorder.emit("tool_result", agent_id=child_id, parent_id="parent", agent_type=agent_type, **result)
             tool_blocks.append({"type": "tool_result", "tool_use_id": c.tool_use_id, "content": str(result["result_full"]), "is_error": result["status"] != "ok"})
+            if result["status"] == "ok":
+                if c.name in {"write_file", "edit_file"}:
+                    writes_ok += 1
+                if c.name in {"read_file", "read_file_range"}:
+                    reads_ok += 1
+                    read_tools_ok += 1
+                    read_path = str(c.args.get("path") or c.args.get("rel_path") or "")
+                    if _is_impl_file_path(read_path):
+                        impl_read_ok = True
+                if c.name == "run_bash":
+                    reads_ok += 1
+                    if agent_type == "reviewer":
+                        read_tools_ok += 1
             if result["status"] != "ok":
-                final_summary = str(result["result_full"])[:2048]
-                status = "tool_error"
-                had_error = True
+                had_tool_error = True
                 break
         messages.append({"role": "user", "content": tool_blocks})
-        if had_error:
-            break
 
     if not final_summary:
         final_summary = f"{agent_type} stopped before producing a final summary."
-    return final_summary, status
+    if not completed and status == "ok" and had_tool_error:
+        status = "tool_error"
+    if agent_type == "coder" and completed and status == "ok" and writes_ok == 0:
+        status = "tool_error"
+        final_summary = "Coder returned without writing or editing any file."
+    if agent_type == "coder" and completed and status == "ok" and require_impl_read and writes_ok > 0 and not impl_read_ok:
+        status = "tool_error"
+        final_summary = "Coder wrote tests without reading the implementation file first."
+    return final_summary, status, writes_ok, reads_ok
 
 
 def _spawn_one(
@@ -3234,7 +3554,7 @@ def _spawn_one(
         except threading.BrokenBarrierError:
             pass
     run_started_at = now_iso()
-    summary, status = _run_live_subagent(root, agent_type, question, recorder, client, guard, child_id, started, policy, review_slice)
+    summary, status, writes_ok, reads_ok = _run_live_subagent(root, agent_type, question, recorder, client, guard, child_id, started, policy, review_slice)
     ended_at = now_iso()
     recorder.emit(
         "subagent_return",
@@ -3244,12 +3564,21 @@ def _spawn_one(
         child_agent_id=child_id,
         status=status,
         summary=summary,
+        writes_ok=writes_ok,
+        reads_ok=reads_ok,
         started_at=run_started_at,
         ended_at=ended_at,
         child_total_cost_usd=round(guard.running_usd - cost_before, 6),
         child_total_tokens=guard.running_tokens - tok_before,
     )
-    return {"agent_id": child_id, "agent_type": agent_type, "status": status, "payload": summary}
+    return {
+        "agent_id": child_id,
+        "agent_type": agent_type,
+        "status": status,
+        "payload": summary,
+        "writes_ok": writes_ok,
+        "reads_ok": reads_ok,
+    }
 
 
 def _spawn_many(
@@ -3261,35 +3590,52 @@ def _spawn_many(
     started: float,
     policy: ApprovalPolicy,
 ) -> list[dict[str, object]]:
-    parsed: list[tuple[str, str]] = []
+    parsed: list[tuple[str, str, str | None]] = []
     for raw in raw_requests:
         if isinstance(raw, dict):
-            parsed.append((_normalise_agent_type(raw.get("type")), str(raw.get("question") or "")))
+            review_id = raw.get("review_agent_id")
+            review_key = str(review_id).strip() if review_id is not None and str(review_id).strip() else None
+            parsed.append((_normalise_agent_type(raw.get("type")), str(raw.get("question") or ""), review_key))
     accepted = parsed[: config.MAX_PARALLEL_SUBAGENTS]
     overflow = parsed[config.MAX_PARALLEL_SUBAGENTS :]
 
     # Coders never run concurrently with another Coder (overlapping write paths):
     # the runtime serialises them and reports `conflict` for the second.
-    runnable: list[tuple[int, str, str, str]] = []  # (slot, child_id, type, question)
+    runnable: list[tuple[int, str, str, str, str | None]] = []  # (slot, child_id, type, question, review_agent_id)
     conflicts: list[dict[str, object]] = []
     seen_coder = False
-    for slot, (atype, question) in enumerate(accepted):
+    for slot, (atype, question, review_agent_id) in enumerate(accepted):
         child_id = _next_child_id(recorder, atype) + f".{slot}"
         if atype == "coder" and seen_coder:
             conflicts.append({"agent_id": child_id, "agent_type": atype, "status": "conflict", "payload": "serialised: another Coder in the same batch holds the write lock", "slot": slot})
             continue
         if atype == "coder":
             seen_coder = True
-        runnable.append((slot, child_id, atype, question))
+        if atype == "reviewer" and _resolve_review_coder_id(recorder, review_agent_id) is None:
+            conflicts.append(
+                {
+                    "agent_id": child_id,
+                    "agent_type": atype,
+                    "status": "tool_error",
+                    "payload": "Reviewer requires a prior Coder run in this session; spawn Explorer for read-only review.",
+                    "slot": slot,
+                }
+            )
+            continue
+        runnable.append((slot, child_id, atype, question, review_agent_id))
 
     results_by_slot: dict[int, dict[str, object]] = {}
     barrier = threading.Barrier(len(runnable)) if len(runnable) > 1 else None
     if runnable:
         with ThreadPoolExecutor(max_workers=len(runnable)) as pool:
-            futures = {
-                pool.submit(_spawn_one, root, atype, question, recorder, client, guard, started, policy, None, child_id, barrier): slot
-                for (slot, child_id, atype, question) in runnable
-            }
+            futures = {}
+            for slot, child_id, atype, question, review_agent_id in runnable:
+                review_slice = None
+                if atype == "reviewer":
+                    coder_id = _resolve_review_coder_id(recorder, review_agent_id)
+                    if coder_id:
+                        review_slice = _build_review_slice(recorder, coder_id)
+                futures[pool.submit(_spawn_one, root, atype, question, recorder, client, guard, started, policy, review_slice, child_id, barrier)] = slot
             for future, slot in futures.items():
                 out = future.result()
                 out["slot"] = slot
@@ -3298,7 +3644,7 @@ def _spawn_many(
         results_by_slot[int(conflict["slot"])] = conflict
 
     summaries = [results_by_slot[slot] for slot in sorted(results_by_slot)]
-    for slot, (atype, question) in enumerate(overflow, start=len(accepted)):
+    for slot, (atype, question, _review_agent_id) in enumerate(overflow, start=len(accepted)):
         summaries.append({"agent_id": f"{atype}-overflow-{slot}", "agent_type": atype, "status": "tool_error", "payload": "parallel cap exceeded"})
     for entry in summaries:
         entry.pop("slot", None)
@@ -3460,14 +3806,15 @@ def run_live_task(
                 )
             tool_blocks.append({"type": "tool_result", "tool_use_id": call.tool_use_id, "content": content, "is_error": result["status"] != "ok"})
             if result["status"] != "ok":
-                recorder.emit(
-                    "run_end",
-                    final_status="tool_error",
-                    total_cost_usd=round(guard.running_usd, 6),
-                    total_tokens=guard.running_tokens,
-                    duration_s=round(time.perf_counter() - started, 3),
-                )
-                return recorder
+                if call.name not in SOFT_RECOVERABLE_PARENT_TOOLS:
+                    recorder.emit(
+                        "run_end",
+                        final_status="tool_error",
+                        total_cost_usd=round(guard.running_usd, 6),
+                        total_tokens=guard.running_tokens,
+                        duration_s=round(time.perf_counter() - started, 3),
+                    )
+                    return recorder
         messages.append({"role": "user", "content": tool_blocks})
 ''',
     "__main__.py": '''"""Generated CLI."""
@@ -3719,6 +4066,12 @@ def _print_chat_status_report(
     final_status = _latest_run_end_status(recorder.events)
     if final_status:
         sys.stdout.write(f"last_run: {final_status}\\n")
+    model_error = _latest_model_error(recorder.events)
+    if model_error:
+        sys.stdout.write(f"last_model_error: {model_error.get('message')}\\n")
+        detail = model_error.get("provider_detail")
+        if detail:
+            sys.stdout.write(f"provider_detail: {detail}\\n")
 
 
 SLASH_COMMANDS = (
@@ -3986,6 +4339,11 @@ def clarify_tool_error(tool: str, message: str) -> str:
         return f"{tool} cancelled - approval prompt returned abort"
     if text.startswith("path ") and "escapes the workspace root" in text:
         return text.replace("path ", "blocked path ", 1)
+    if "No module named pytest" in text:
+        return (
+            "run_tests: pytest is not installed in the agent venv; "
+            "reinstall the package with pytest in runtime dependencies."
+        )
     return text
 
 
@@ -4142,7 +4500,11 @@ def _format_progress_event(event: dict[str, object]) -> str | None:
         return f"[budget] {reason}"
     if kind == "model_error":
         retry = " retryable" if event.get("retryable") else ""
-        return f"[llm] {agent} step {event.get('step_idx')} failed{retry}: {event.get('message')}"
+        line = f"[llm] {agent} step {event.get('step_idx')} failed{retry}: {event.get('message')}"
+        detail = event.get("provider_detail")
+        if detail:
+            line += f" | provider_detail: {detail}"
+        return line
     if kind == "egress_blocked":
         return f"[network] blocked host={event.get('host')}"
     if kind == "run_end":
@@ -4378,6 +4740,13 @@ def _turn_subagent_failure_notices(events: list[dict[str, object]], start_idx: i
         summary = clarify_tool_error("subagent", str(event.get("summary") or child_status))
         notices.append(f"Sub-agent {child} failed: {summary}")
     return notices
+
+
+def _latest_model_error(events: list[dict[str, object]]) -> dict[str, object] | None:
+    for event in reversed(events):
+        if event.get("kind") == "model_error":
+            return event
+    return None
 
 
 def _latest_run_end_status(events: list[dict[str, object]]) -> str | None:

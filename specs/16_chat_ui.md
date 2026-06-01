@@ -40,7 +40,8 @@ unaffected.
      (no `(next ~$…)` from the unknown-model fallback).
    - `📊 {steps}/{max_steps} steps` — prefix `!` when `steps == max_steps - 1`
      (one step remaining before hard `step_cap`).
-   - `{status_icon} {status}` — `✓ ready` | `… running` | `⚠ warn` | `✗ error`.
+   - `{status_icon} {status}` — `✓ ready` | `✓ ok` | `… running` | `⚠ warn` |
+     `✗ error` | `✗ partial` (sub-agent failed but parent `run_end` is `ok`).
 5. **Hint line** — dim: `/help for commands · /status to refresh session` (once
    per screen; not duplicated in the welcome panel).
    - On first welcome panel only: if any configured role model lacks local pricing,

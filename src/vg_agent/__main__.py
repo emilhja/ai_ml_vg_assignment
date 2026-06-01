@@ -247,6 +247,12 @@ def _print_chat_status_report(
     final_status = _latest_run_end_status(recorder.events)
     if final_status:
         sys.stdout.write(f"last_run: {final_status}\n")
+    model_error = _latest_model_error(recorder.events)
+    if model_error:
+        sys.stdout.write(f"last_model_error: {model_error.get('message')}\n")
+        detail = model_error.get("provider_detail")
+        if detail:
+            sys.stdout.write(f"provider_detail: {detail}\n")
 
 
 SLASH_COMMANDS = (
@@ -514,6 +520,11 @@ def clarify_tool_error(tool: str, message: str) -> str:
         return f"{tool} cancelled - approval prompt returned abort"
     if text.startswith("path ") and "escapes the workspace root" in text:
         return text.replace("path ", "blocked path ", 1)
+    if "No module named pytest" in text:
+        return (
+            "run_tests: pytest is not installed in the agent venv; "
+            "reinstall the package with pytest in runtime dependencies."
+        )
     return text
 
 
@@ -670,7 +681,11 @@ def _format_progress_event(event: dict[str, object]) -> str | None:
         return f"[budget] {reason}"
     if kind == "model_error":
         retry = " retryable" if event.get("retryable") else ""
-        return f"[llm] {agent} step {event.get('step_idx')} failed{retry}: {event.get('message')}"
+        line = f"[llm] {agent} step {event.get('step_idx')} failed{retry}: {event.get('message')}"
+        detail = event.get("provider_detail")
+        if detail:
+            line += f" | provider_detail: {detail}"
+        return line
     if kind == "egress_blocked":
         return f"[network] blocked host={event.get('host')}"
     if kind == "run_end":
@@ -906,6 +921,13 @@ def _turn_subagent_failure_notices(events: list[dict[str, object]], start_idx: i
         summary = clarify_tool_error("subagent", str(event.get("summary") or child_status))
         notices.append(f"Sub-agent {child} failed: {summary}")
     return notices
+
+
+def _latest_model_error(events: list[dict[str, object]]) -> dict[str, object] | None:
+    for event in reversed(events):
+        if event.get("kind") == "model_error":
+            return event
+    return None
 
 
 def _latest_run_end_status(events: list[dict[str, object]]) -> str | None:

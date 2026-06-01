@@ -10,6 +10,7 @@ Tools available to the parent:
 - `read_file`
 - `read_file_range`
 - `run_bash`
+- `run_tests`
 - `spawn_subagent`
 - `spawn_subagents`
 
@@ -21,7 +22,8 @@ Approval policy:
 
 - Gated tools are `spawn_subagent` / `spawn_subagents` (always — consume
   budget) and any
-  mutating tool *inside* a Coder sub-agent (`write_file`, `edit_file`).
+  mutating tool *inside* a Coder sub-agent (`write_file`, `edit_file`) or
+  parent/Coder verification (`run_tests`).
   Parent reads remain ungated in `writes` mode. The policy is consulted
   before the tool runs and emits an `approval` trace event regardless of
   outcome.
@@ -64,6 +66,10 @@ Parent loop (the only runtime path):
   `egress_blocked` in the trace.
 - Sends the parent system prompt, task, and compacted parent context to
   OpenRouter through LiteLLM using `PARENT_MODEL_ID`.
+- **Soft tool errors:** `run_tests` failures return `tool_result.status="error"`
+  to the parent model without ending the turn. The parent may re-spawn Coder
+  with the failure output. Other parent tool errors still end the turn with
+  `run_end{final_status:"tool_error"}` unless approval was aborted.
 - Executes model-requested tool calls, appends `assistant_step`,
   `tool_call`, and `tool_result` events to JSONL, and sends only
   parent-visible results back into the next model turn.

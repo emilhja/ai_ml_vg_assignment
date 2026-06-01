@@ -1,3 +1,7 @@
+# STILL TESTING
+make a calculator in tkinter in subfolder tkinter_calc
+
+
 # Final Demo Live Chat Script
 
 Goal: pass the VG live-demo requirement by proving every hard gate and all nine
@@ -37,6 +41,10 @@ Have these visible and ready:
   `scripts/generate_project.py` — no hand-written solution code.
 - Docker available; `.env` exists with a real `OPENROUTER_API_KEY`.
 - A clean fixture workspace seeded before starting chat.
+- Pre-recorded dry-run values: [dry_run_notes.md](dry_run_notes.md) (step **N**,
+  trace paths, `warn_usd` / hard-cap commands).
+- HG-1 approval checklist: [hg1_requirement_spec_status.md](hg1_requirement_spec_status.md).
+- HG-2 session exports: [hg2_prompt_evidence.md](hg2_prompt_evidence.md).
 
 Setup commands:
 

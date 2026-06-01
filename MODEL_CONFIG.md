@@ -36,6 +36,34 @@ whitelist — see `docs/PRICE.md`).
 They are not test requirements. Select via `--parent-model` when supported by
 the CLI.
 
+## Recommended model tiers
+
+Use different models per role when quality matters more than uniform cost:
+
+| Role | Suggested model | Notes |
+| --- | --- | --- |
+| Parent (orchestrate) | `openrouter/anthropic/claude-sonnet-4.6` or `openrouter/google/gemini-2.5-flash` | Sonnet for stricter pipeline; flash for low cost |
+| Coder (mutate) | `openrouter/qwen/qwen3-coder-30b-a3b-instruct` or `openrouter/deepseek/deepseek-v4-flash` | Anchored edits, fewer hallucinated APIs |
+| Explorer / Grilling | `openrouter/google/gemini-2.5-flash-lite` | Read-only; lite is sufficient |
+| Reviewer (verify) | `openrouter/anthropic/claude-haiku-4.5` or same tier as parent — **not lite** | Must read files and return PASS/FAIL |
+| Compactor | `openrouter/google/gemini-2.5-flash-lite` | Summarisation only |
+
+**Active demo profile (Sonnet parent + Haiku reviewer):**
+
+```yaml
+VG_PARENT_MODEL: openrouter/anthropic/claude-sonnet-4.6
+VG_REVIEWER_MODEL: openrouter/anthropic/claude-haiku-4.5
+VG_CODER_MODEL: openrouter/google/gemini-2.5-flash
+VG_EXPLORER_MODEL: openrouter/google/gemini-2.5-flash-lite
+VG_GRILLING_MODEL: openrouter/google/gemini-2.5-flash-lite
+VG_COMPACTOR_MODEL: openrouter/google/gemini-2.5-flash-lite
+```
+
+Raise `VG_MAX_USD_PER_RUN` when using Sonnet on the parent for multi-spawn flows.
+
+Override via `VG_PARENT_MODEL`, `VG_CODER_MODEL`, `VG_REVIEWER_MODEL`, etc.
+(see `specs/50_packaging.md`).
+
 ## Egress Pin
 
 The LiteLLM OpenRouter client refuses to call any other host. The endpoint is

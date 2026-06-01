@@ -20,6 +20,8 @@ from vg_agent.agent import (
     ApprovalRequest,
     PARENT_SYSTEM_PROMPT,
     PARENT_TOOL_SCHEMAS,
+    _build_review_slice,
+    _resolve_review_coder_id,
     run_live_task,
 )
 from vg_agent.live_model_client import (
@@ -35,6 +37,8 @@ from vg_agent.tools import (
     edit_file,
     read_file,
     run_bash,
+    run_tests,
+    validate_run_tests_path,
     validate_sensitive_path,
     validate_shell_command,
     write_file,
@@ -162,6 +166,22 @@ def test_budget_guard_reasons_and_costs() -> None:
     assert guard.record_model_call("openrouter/example/unknown", 10, 10, cost_usd=0.01) == pytest.approx(0.01)
     with pytest.raises(PricingUnavailable):
         guard.record_model_call("openrouter/example/unknown", 10, 10)
+
+
+def test_budget_guard_warn_usd_emits_once_at_eighty_percent() -> None:
+    # VG.3 soft warning: crossing 80% of max_usd emits warn_usd once; run continues.
+    max_usd = 1.0
+    guard = BudgetGuard(max_usd=max_usd)
+    threshold = config.WARN_USD_FRACTION * max_usd
+    guard.record_model_call(config.PARENT_MODEL_ID, 10, 10, cost_usd=threshold - 0.01)
+    assert guard.pending_warnings() == []
+    guard.record_model_call(config.PARENT_MODEL_ID, 10, 10, cost_usd=0.02)
+    warnings = guard.pending_warnings()
+    assert len(warnings) == 1
+    assert warnings[0].budget_reason == "warn_usd"
+    assert warnings[0].allowed is True
+    assert warnings[0].details["running_usd"] >= threshold
+    assert guard.pending_warnings() == []
 
 
 def _log_then_explorer_client() -> PipelineClient:
@@ -609,6 +629,26 @@ def test_run_bash_rejects_dangerous_commands(tmp_path: Path) -> None:
     assert "regular files" in str(result["result_full"])
     assert folder.exists()
 
+    assert validate_shell_command("mkdir -p tkinter_calc") is None
+    assert validate_shell_command("mkdir -m 700 secret") is not None
+    assert validate_shell_command("mkdir -p ../outside") is not None
+    assert validate_shell_command("mkdir -p .env") is not None
+
+    nested = tmp_path / "tkinter_calc"
+    assert not nested.exists()
+    result = run_bash(tmp_path, "mkdir -p tkinter_calc", "safe-mkdir")
+    assert result["status"] == "ok"
+    assert nested.is_dir()
+
+    result = run_bash(tmp_path, "mkdir tkinter_calc", "existing-mkdir")
+    assert result["status"] == "ok"
+    assert "directory already exists" in str(result["result_full"])
+    result = run_bash(tmp_path, "mkdir -p tkinter_calc", "existing-mkdir-p")
+    assert result["status"] == "ok"
+    assert "directory already exists" in str(result["result_full"])
+
+    assert validate_shell_command("mkdir -p /tmp/outside-mkdir-test") is not None
+
 
 def test_live_model_cli_requires_openrouter_key(tmp_path: Path) -> None:
     env = os.environ.copy()
@@ -891,6 +931,102 @@ def test_parent_has_no_write_tools_and_coder_is_sole_mutation_path(tmp_path: Pat
     edit_results = [e for e in events if e["kind"] == "tool_result" and e["tool"] == "edit_file"]
     assert edit_results and edit_results[0]["agent_id"] == coder_spawn["child_agent_id"]
     assert events[-1]["final_status"] == "ok"
+
+
+def test_coder_subagent_recovers_after_tool_error(tmp_path: Path) -> None:
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Create the file via Coder.",
+                [ToolCall("spawn-coder", "spawn_subagent", {"type": "coder", "question": "create tkinter_calc/calc.py"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("Created tkinter_calc/calc.py.", input_tokens=100, output_tokens=20),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn(
+                    "Try edit first.",
+                    [ToolCall("coder-edit", "edit_file", {"path": "tkinter_calc/calc.py", "old": "missing", "new": "x"})],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn(
+                    "Write the new file.",
+                    [ToolCall("coder-write", "write_file", {"path": "tkinter_calc/calc.py", "content": "x = 1\n"})],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn("tkinter_calc/calc.py: created new file", input_tokens=40, output_tokens=10),
+            ],
+        },
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "create tkinter_calc/calc.py", recorder, client=client)
+    assert (tmp_path / "tkinter_calc" / "calc.py").read_text(encoding="utf-8") == "x = 1\n"
+    coder_return = next(event for event in read_events(recorder.path) if event["kind"] == "subagent_return")
+    assert coder_return["status"] == "ok"
+
+
+def test_parent_retries_after_subagent_tool_error(tmp_path: Path) -> None:
+    fail_turns = [
+        ModelTurn(
+            f"attempt {index}",
+            [ToolCall(f"edit-{index}", "edit_file", {"path": "missing.py", "old": "x", "new": "y"})],
+            stop_reason="tool_use",
+            input_tokens=60,
+            output_tokens=20,
+        )
+        for index in range(config.MAX_SUBAGENT_STEPS)
+    ]
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "spawn coder",
+                [ToolCall("spawn-1", "spawn_subagent", {"type": "coder", "question": "edit missing.py"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn(
+                "retry coder",
+                [ToolCall("spawn-2", "spawn_subagent", {"type": "coder", "question": "write app.py with x=1"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("app.py created.", input_tokens=100, output_tokens=20),
+        ],
+        by_type={
+            "coder": fail_turns
+            + [
+                ModelTurn(
+                    "write file",
+                    [ToolCall("write", "write_file", {"path": "app.py", "content": "x = 1\n"})],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn("app.py: created file", input_tokens=40, output_tokens=10),
+            ],
+        },
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "create app.py", recorder, client=client)
+    events = read_events(recorder.path)
+    spawns = [event for event in events if event["kind"] == "subagent_spawn" and event["agent_type"] == "coder"]
+    assert len(spawns) == 2
+    first_return = next(
+        event
+        for event in events
+        if event["kind"] == "subagent_return" and event["child_agent_id"] == spawns[0]["child_agent_id"]
+    )
+    assert first_return["status"] == "tool_error"
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "x = 1\n"
 
 
 def test_trace_event_sink_receives_progress_events(tmp_path: Path) -> None:
@@ -1573,6 +1709,30 @@ def test_endpoint_host_pinned(tmp_path: Path) -> None:
     assert recorder.events[-1]["host"] == "evil.example"
 
 
+def test_live_client_maps_litellm_429_provider_detail_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RateLimitError(Exception):
+        status_code = 429
+
+    def completion(**_kwargs: object) -> object:
+        raise RateLimitError(
+            "429 Too Many Requests temporarily rate-limited upstream key sk-or-v1-AbCdEf-12"
+        )
+
+    fake_litellm = SimpleNamespace(completion=completion, suppress_debug_info=False, set_verbose=True)
+    monkeypatch.setitem(sys.modules, "litellm", fake_litellm)
+    monkeypatch.setenv("VG_PROVIDER_ERROR_DETAIL", "1")
+
+    client = LiveModelClient(api_key="dummy")
+    with pytest.raises(LiveModelRateLimitError) as exc_info:
+        client.complete(model=config.PARENT_MODEL_ID, system_prompt="x", messages=[], tools=[])
+
+    assert exc_info.value.provider_detail is not None
+    assert "sk-or-v1" not in exc_info.value.provider_detail
+    assert "rate-limited" in exc_info.value.provider_detail
+
+
 def test_live_client_maps_litellm_429_to_readable_error(monkeypatch: pytest.MonkeyPatch) -> None:
     class RateLimitError(Exception):
         status_code = 429
@@ -1922,6 +2082,26 @@ def test_chat_ui_status_bar_segments(tmp_path: Path, monkeypatch: pytest.MonkeyP
     )
     assert "\u2717" in turn_line
     assert "tool_error" in turn_line
+
+
+def test_chat_status_shows_partial_when_subagent_failed_but_run_ok(tmp_path: Path) -> None:
+    from vg_agent.chat_ui import build_status_bar_text
+
+    recorder = TraceRecorder(tmp_path)
+    guard = BudgetGuard.for_workspace(tmp_path)
+    start = len(recorder.events)
+    recorder.emit("subagent_return", child_agent_id="coder-1", status="tool_error", summary="mkdir failed")
+    recorder.emit("assistant_step", agent_id="parent", step_idx=1, assistant_text="partial", tool_calls=[])
+    recorder.emit("run_end", final_status="ok")
+    line = build_status_bar_text(
+        root=tmp_path,
+        recorder=recorder,
+        guard=guard,
+        live_model=True,
+        since_event_idx=start,
+    )
+    assert "\u2717" in line
+    assert "partial" in line
 
 
 def test_chat_ui_session_status_emits_statusline(tmp_path: Path) -> None:
@@ -2489,3 +2669,337 @@ def test_chat_slash_new_starts_fresh_trace_and_live_history(
     assert not any(e["kind"] == "session_new" for e in first_trace)
     assert any(e.get("prompt") == "second turn" for e in second_trace)
     assert not any(e.get("prompt") == "remember first turn" for e in second_trace)
+
+
+def test_parent_tool_schemas_include_run_tests() -> None:
+    names = {schema["name"] for schema in PARENT_TOOL_SCHEMAS}
+    assert "run_tests" in names
+    assert "write_file" not in names
+
+
+def test_run_tests_blocks_non_test_paths(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    assert validate_run_tests_path(tmp_path, "app.py") is not None
+    assert validate_run_tests_path(tmp_path, "../outside.py") is not None
+    result = run_tests(tmp_path, "app.py", "bad-path")
+    assert result["status"] == "error"
+    assert "run_tests blocked" in str(result["result_full"])
+
+
+def test_run_tests_runs_pytest_on_test_file(tmp_path: Path) -> None:
+    test_dir = tmp_path / "tkinter_calc"
+    test_dir.mkdir()
+    (test_dir / "test_sample.py").write_text(
+        "def test_ok():\n    assert 1 + 1 == 2\n",
+        encoding="utf-8",
+    )
+    result = run_tests(tmp_path, "tkinter_calc/test_sample.py", "pytest-1")
+    assert result["status"] == "ok", result["result_full"]
+    (test_dir / "test_fail.py").write_text(
+        "def test_bad():\n    assert False\n",
+        encoding="utf-8",
+    )
+    fail = run_tests(tmp_path, "tkinter_calc/test_fail.py", "pytest-2")
+    assert fail["status"] == "error"
+
+
+def test_coder_read_only_exit_is_tool_error(tmp_path: Path) -> None:
+    write_fixture(tmp_path)
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Spawn coder to add tests.",
+                [ToolCall("spawn", "spawn_subagent", {"type": "coder", "question": "add test_foo.py"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("Coder did not write.", input_tokens=100, output_tokens=20),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn(
+                    "Read only.",
+                    [ToolCall("read", "read_file", {"path": "app.py"})],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn("app.py looks fine.", input_tokens=40, output_tokens=10),
+            ],
+        },
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "add tests for app.py", recorder, client=client)
+    returns = [e for e in read_events(recorder.path) if e["kind"] == "subagent_return" and e["agent_type"] == "coder"]
+    assert returns
+    assert returns[-1]["status"] == "tool_error"
+    assert returns[-1]["writes_ok"] == 0
+
+
+def test_reviewer_spawn_includes_review_slice(tmp_path: Path) -> None:
+    write_fixture(tmp_path)
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Coder then reviewer.",
+                [ToolCall("spawn-c", "spawn_subagent", {"type": "coder", "question": "rename foo to baz in app.py"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn(
+                "Review coder.",
+                [ToolCall("spawn-r", "spawn_subagent", {"type": "reviewer", "question": "verify app.py edit"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("Review complete.", input_tokens=100, output_tokens=20),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn(
+                    "Edit.",
+                    [ToolCall("edit", "edit_file", {"path": "app.py", "old": "foo", "new": "baz"})],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn("app.py: renamed foo to baz", input_tokens=40, output_tokens=10),
+            ],
+            "reviewer": [
+                ModelTurn(
+                    "Read and pass.",
+                    [ToolCall("read", "read_file", {"path": "app.py"})],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn("PASS: baz present on disk", input_tokens=40, output_tokens=10),
+            ],
+        },
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "rename and review app.py", recorder, client=client)
+    reviewer_calls = [
+        c for c in client.calls if "You are Reviewer" in str(c.get("system_prompt") or "")
+    ]
+    assert reviewer_calls
+    first_user = str((reviewer_calls[0].get("messages") or [{}])[0].get("content") or "")
+    assert "Coder run under review" in first_user
+    assert "subagent_spawn" in first_user
+    rev_return = next(
+        e for e in read_events(recorder.path) if e["kind"] == "subagent_return" and e["agent_type"] == "reviewer"
+    )
+    assert rev_return["status"] == "ok"
+    assert rev_return["reads_ok"] >= 1
+
+
+def test_reviewer_no_read_is_tool_error(tmp_path: Path) -> None:
+    write_fixture(tmp_path)
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Coder.",
+                [ToolCall("spawn-c", "spawn_subagent", {"type": "coder", "question": "touch app.py comment"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn(
+                "Review.",
+                [ToolCall("spawn-r", "spawn_subagent", {"type": "reviewer", "question": "verify"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("Done.", input_tokens=100, output_tokens=20),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn(
+                    "Edit.",
+                    [ToolCall("edit", "edit_file", {"path": "app.py", "old": "foo", "new": "baz"})],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn("app.py: edit", input_tokens=40, output_tokens=10),
+            ],
+            "reviewer": [
+                ModelTurn("PASS: looks good", input_tokens=40, output_tokens=10),
+            ],
+        },
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "review without read", recorder, client=client)
+    rev_return = next(
+        e for e in read_events(recorder.path) if e["kind"] == "subagent_return" and e["agent_type"] == "reviewer"
+    )
+    assert rev_return["status"] == "tool_error"
+
+
+def test_build_review_slice_and_resolve_coder_id(tmp_path: Path) -> None:
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("subagent_spawn", agent_id="coder-1", agent_type="coder", child_agent_id="coder-1", question="q")
+    recorder.emit("tool_call", agent_id="coder-1", tool="edit_file", tool_use_id="e1")
+    recorder.emit("subagent_return", agent_id="coder-1", agent_type="coder", child_agent_id="coder-1", status="ok")
+    assert _resolve_review_coder_id(recorder, None) == "coder-1"
+    assert _resolve_review_coder_id(recorder, "coder-1") == "coder-1"
+    slice_text = _build_review_slice(recorder, "coder-1")
+    assert "subagent_spawn" in slice_text
+    assert "edit_file" in slice_text
+
+
+def test_pytest_importable_in_runtime() -> None:
+    import pytest as pytest_mod
+
+    assert pytest_mod.__version__
+
+
+def test_run_tests_soft_error_continues_parent_loop(tmp_path: Path) -> None:
+    write_fixture(tmp_path)
+    test_dir = tmp_path / "tkinter_calc"
+    test_dir.mkdir(exist_ok=True)
+    (test_dir / "test_fail.py").write_text(
+        "def test_bad():\n    assert False\n",
+        encoding="utf-8",
+    )
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Run tests.",
+                [ToolCall("rt", "run_tests", {"path": "tkinter_calc/test_fail.py"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn(
+                "Tests failed; spawn coder to fix.",
+                [ToolCall("spawn", "spawn_subagent", {"type": "coder", "question": "fix test_fail.py"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("Recovery complete.", input_tokens=100, output_tokens=20),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn(
+                    "Fix.",
+                    [ToolCall("edit", "edit_file", {"path": "tkinter_calc/test_fail.py", "old": "False", "new": "True"})],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn("tkinter_calc/test_fail.py: fixed assertion", input_tokens=40, output_tokens=10),
+            ],
+        },
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "run tests and recover", recorder, client=client)
+    events = read_events(recorder.path)
+    run_test_results = [e for e in events if e.get("kind") == "tool_result" and e.get("tool") == "run_tests"]
+    assert run_test_results
+    assert run_test_results[0]["status"] == "error"
+    run_end = next(e for e in events if e.get("kind") == "run_end")
+    assert run_end["final_status"] != "tool_error"
+    assert len(client.calls) >= 3
+
+
+def test_reviewer_spawn_without_coder_returns_error(tmp_path: Path) -> None:
+    write_fixture(tmp_path)
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Review existing code.",
+                [ToolCall("spawn-r", "spawn_subagent", {"type": "reviewer", "question": "review app.py"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("Use explorer instead.", input_tokens=100, output_tokens=20),
+        ],
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "review app.py without coder", recorder, client=client)
+    spawn_results = [
+        e
+        for e in read_events(recorder.path)
+        if e.get("kind") == "tool_result" and e.get("tool") == "spawn_subagent"
+    ]
+    assert spawn_results
+    assert spawn_results[0]["status"] == "error"
+    assert "Explorer" in str(spawn_results[0]["result_full"])
+    reviewer_spawns = [e for e in read_events(recorder.path) if e.get("kind") == "subagent_spawn" and e.get("agent_type") == "reviewer"]
+    assert not reviewer_spawns
+
+
+def test_coder_read_before_test_guard(tmp_path: Path) -> None:
+    write_fixture(tmp_path)
+    calc_dir = tmp_path / "tkinter_calc"
+    calc_dir.mkdir(exist_ok=True)
+    (calc_dir / "calculator.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Add pytest.",
+                [
+                    ToolCall(
+                        "spawn",
+                        "spawn_subagent",
+                        {"type": "coder", "question": "add test_calculator.py for calculator.py"},
+                    )
+                ],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("Coder blocked on test write.", input_tokens=100, output_tokens=20),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn(
+                    "Write test without reading impl.",
+                    [
+                        ToolCall(
+                            "write",
+                            "write_file",
+                            {
+                                "path": "tkinter_calc/test_calculator.py",
+                                "content": "from calculator import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
+                            },
+                        )
+                    ],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn("Could not write tests yet.", input_tokens=40, output_tokens=10),
+            ],
+        },
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "add pytest for calculator", recorder, client=client)
+    coder_returns = [
+        e for e in read_events(recorder.path) if e.get("kind") == "subagent_return" and e.get("agent_type") == "coder"
+    ]
+    assert coder_returns
+    assert coder_returns[-1]["status"] == "tool_error"
+    blocked = [
+        e
+        for e in read_events(recorder.path)
+        if e.get("kind") == "tool_result"
+        and e.get("tool") == "write_file"
+        and "read the implementation" in str(e.get("result_full") or "")
+    ]
+    assert blocked
+
+
+def test_clarify_tool_error_pytest_missing() -> None:
+    from vg_agent.__main__ import clarify_tool_error
+
+    msg = clarify_tool_error("run_tests", "No module named pytest")
+    assert "pytest" in msg.lower()
+    assert "venv" in msg.lower() or "runtime" in msg.lower()

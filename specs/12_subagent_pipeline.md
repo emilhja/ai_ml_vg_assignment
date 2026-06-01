@@ -9,7 +9,7 @@ right type for each step.
 |---|---|---|---|---|
 | `grilling` | none | none | no | `GRILLING_MODEL_ID` |
 | `explorer` | `read_file`, `read_file_range`, `run_bash` (read-only allowlist) | none | no | `EXPLORER_MODEL_ID` |
-| `coder` | Explorer's tools | `write_file`, `edit_file` | no | `CODER_MODEL_ID` |
+| `coder` | Explorer's tools plus `run_tests` | `write_file`, `edit_file` | no | `CODER_MODEL_ID` |
 | `reviewer` | Explorer's tools, plus the JSONL slice of the Coder run under review | none | no | `REVIEWER_MODEL_ID` |
 
 - `MAX_SUBAGENT_DEPTH = 1` applies to every type. No sub-agent may call
@@ -33,12 +33,51 @@ For a given user turn the parent decides per step which type to spawn:
 2. **Explorer** — bounded repository inspection. Sequential by default. See
    parallel fan-out below.
 3. **Coder** — invoked when the refined task requires a file mutation.
-4. **Reviewer** — optional. Invoked after Coder when the parent wants a second
-   pass; required when the Coder edit touches >1 file or the parent's
-   confidence is low.
+   Coder must call `write_file` or `edit_file` successfully at least once
+   before returning; a read-only exit is reported as
+   `subagent_return{status:"tool_error"}`.
+4. **Reviewer** — invoked **after every successful Coder** on fix/review tasks
+   (not before Coder; Reviewer verifies Coder output, not pre-fix exploration).
+   Optional only for trivial single-line edits the parent is confident about.
 
 The parent decides each transition autonomously (VG.9). The pipeline is a
 guideline encoded in the parent system prompt, not a fixed Python switch.
+
+### Reviewer JSONL slice (runtime)
+
+When the parent spawns `type:"reviewer"`, the runtime automatically attaches
+the JSONL trace slice for the Coder run under review:
+
+- `SubagentRequest` may include optional `review_agent_id` (e.g. `"coder-2"`).
+  When omitted, the runtime uses the most recent `coder-*` child in the
+  current run trace.
+- `_build_review_slice(recorder, coder_agent_id)` serialises events where
+  `agent_id == coder_agent_id`, capped at ~8 KB, and injects them into the
+  Reviewer's first user message.
+- Reviewer must call at least one read tool (`read_file`, `read_file_range`,
+  or allowlisted `run_bash`) before returning; text-only exits are
+  `tool_error`.
+- Reviewer final message must start with `PASS:` or `FAIL:`.
+- Spawning `reviewer` without a prior Coder in the current run trace returns
+  `tool_error` with guidance to use Explorer for read-only review.
+
+### Coder test guard
+
+When the spawn `question` mentions `test_*.py`, pytest, or tests, Coder must
+successfully `read_file` or `read_file_range` an implementation `.py` (non-test)
+before `write_file` on a test file. Violations are `tool_error`.
+
+### Verify loop (fix + test)
+
+After Reviewer `PASS:` and when tests exist, the parent calls
+`run_tests("<path>")` — never `run_bash pytest`. On `run_tests` failure, the
+parent receives the error as a **soft tool result** (the turn continues so
+the parent can re-spawn Coder with the traceback). Hard `run_end{final_status:
+"tool_error"}` is reserved for approval abort, budget deny, and non-recoverable
+tool blocks.
+
+`subagent_return` events for Coder include `writes_ok` and `reads_ok` counts
+so the parent can detect empty Coder returns.
 
 ## Parallel fan-out
 
@@ -83,7 +122,7 @@ Every `subagent_return` has a `status` field. The parent must branch on it.
 | `ok` | normal return ≤2 KB | use payload |
 | `timeout` | wall-clock exceeded `TOOL_TIMEOUT` | retry once with reduced scope, then yield with error |
 | `oversize` | return >2 KB after one retry instruction | use truncated payload, mark in final answer |
-| `tool_error` | a tool inside the sub-agent failed | parent reads `reason`, decides retry vs. yield |
+| `tool_error` | a tool inside the sub-agent failed and the sub-agent exhausted `MAX_SUBAGENT_STEPS` without completing | sub-agent may retry within `MAX_SUBAGENT_STEPS` after a tool error; parent reads `reason`, decides retry vs. yield |
 | `conflict` | Coder write-path conflict | serialise: re-spawn after the prior Coder returns |
 | `parallel_aborted` | budget slice exceeded | yield with `run_end{final_status:"aborted"}` |
 
