@@ -39,6 +39,7 @@ class SessionSummary(BaseModel):
     has_tool_compaction: bool = False
     has_context_compaction_auto: bool = False
     has_context_compaction_manual: bool = False
+    agent_types_present: list[str] = Field(default_factory=list)
 
 
 class SessionListResponse(BaseModel):

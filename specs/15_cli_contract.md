@@ -42,7 +42,7 @@ model step.
 | `/show-context` | Print a **step overview**: per parent step, context message count, tools invoked that step, visible tool-result count, compaction count, and parallel sub-agent notes when `spawn_subagents` ran. |
 | `/show-context N` | Print the parent-visible context at parent step `N` as formatted JSON (same as `--show-context N`). |
 | `/show-context overview` | Alias for `/show-context` (overview only). |
-| `/compact` | Manually fold older in-memory conversation turns via `COMPACTOR_MODEL_ID`; emits `context_compaction{reason:"manual"}`. Recent turns stay verbatim. |
+| `/compact` | Manually fold older in-memory conversation turns via `COMPACTOR_MODEL_ID`; emits `context_compaction{reason:"manual"}`. Recent turns stay verbatim. If folding is unnecessary (too few user turns, or parent context already below the auto-fold threshold), prints a `[context] /compact skipped: …` warning and does **not** call the compactor. |
 | `/help` | Print the available slash commands in their compact help form. |
 
 Interactive TTY chat provides arrow-key autocomplete only while the current

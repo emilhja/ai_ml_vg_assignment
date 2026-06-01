@@ -11,6 +11,10 @@ approval policy) holds regardless of Docker.
 - Install `uv` from the official wheel; do not call `pip` directly.
 - Non-root user `vg` (uid 1000); workdir `/workspace`.
 - Copy `pyproject.toml`, `uv.lock`, then `uv sync --frozen`.
+- Copy every repo-root file listed in `SOURCE_INPUTS` inside
+  `scripts/generate_project.py` (`MODEL_CONFIG.md`, `PROMPTS.md`,
+  `CONTEXT_WINDOWS.md`) plus `specs/` before running
+  `python scripts/generate_project.py --clean` at image build time.
 - Copy `src/` last so source edits invalidate fewer cache layers.
 - Default entrypoint: `python -m vg_agent`. `CMD` left empty so the user
   passes the task on the command line.

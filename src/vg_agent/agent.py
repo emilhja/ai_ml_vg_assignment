@@ -551,6 +551,62 @@ def compact_conversation(
     )
 
 
+def conversation_compact_skip_reason(
+    messages: list[dict[str, Any]],
+    parent_model_id: str,
+) -> str | None:
+    """Return a skip reason when manual compact is unnecessary; None if folding may proceed."""
+    if not messages:
+        return "no_history"
+    user_turns = sum(1 for message in messages if message.get("role") == "user")
+    split = _split_messages_for_conversation_compaction(messages)
+    if split is None:
+        if user_turns <= config.COMPACT_KEEP_RECENT_TURNS:
+            return "too_few_user_turns"
+        return "no_foldable_head"
+    before = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
+    window = _context_window_for_model(parent_model_id)
+    threshold = int(window * _compact_fraction_for_model(parent_model_id))
+    if before <= threshold:
+        return "below_auto_threshold"
+    return None
+
+
+def format_manual_compact_skip_warning(
+    reason: str,
+    messages: list[dict[str, Any]],
+    parent_model_id: str,
+) -> str:
+    """Human-readable warning when /compact is skipped as unnecessary."""
+    keep = config.COMPACT_KEEP_RECENT_TURNS
+    if reason == "no_history":
+        return "[context] /compact skipped: no conversation history yet — run a task first."
+    if reason == "too_few_user_turns":
+        user_turns = sum(1 for message in messages if message.get("role") == "user")
+        return (
+            f"[context] /compact skipped: only {user_turns} user turn(s) in chat memory; "
+            f"need more than {keep} to fold older turns while keeping the last {keep} verbatim. "
+            "Large tool results are still compacted automatically (see /review)."
+        )
+    if reason == "no_foldable_head":
+        return (
+            f"[context] /compact skipped: nothing to fold before the last {keep} user turns."
+        )
+    if reason == "below_auto_threshold":
+        before = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
+        window = _context_window_for_model(parent_model_id)
+        fraction = _compact_fraction_for_model(parent_model_id)
+        threshold = int(window * fraction)
+        pct = int(before / window * 100) if window else 0
+        return (
+            f"[context] /compact skipped: parent context is ~{before:,} tokens "
+            f"({pct}% of {window:,} window) — below the "
+            f"auto-fold threshold ({threshold:,} = {fraction:.0%} of window). "
+            "Folding would save little. Tool-result compaction already applied on large reads."
+        )
+    return f"[context] /compact skipped: {reason}."
+
+
 def _result(tool_use_id: str, tool: str, content: str, status: str, started: float) -> dict[str, object]:
     return {
         "tool_use_id": tool_use_id,

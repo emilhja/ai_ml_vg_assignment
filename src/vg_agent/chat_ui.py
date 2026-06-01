@@ -487,7 +487,7 @@ def format_statusline_compact(status: SessionStatus, *, width: int | None = None
         usd_part += f" (next ~{_format_usd(status.usd_projected)})"
     line = (
         f"[{status.mode}] {status.model} | {status.ctx_display()} | "
-        f"run {status.token_bar} {_format_compact_number(status.running_tokens)}/"
+        f"session {status.token_bar} {_format_compact_number(status.running_tokens)}/"
         f"{_format_compact_number(status.max_tokens)} tok | "
         f"{_steps_status_segment(status)} | "
         f"{usd_part} | "

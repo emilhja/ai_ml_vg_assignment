@@ -1,4 +1,5 @@
 import type { SessionSummary } from "../api";
+import { KNOWN_AGENT_TYPES, type AgentNavType } from "./agentNav";
 
 export type SessionSubagentFilter = "parallel" | "sequential" | "any_subagents" | "no_subagents";
 
@@ -7,7 +8,12 @@ export type SessionCompactionFilter =
   | "context_compaction_auto"
   | "context_compaction_manual";
 
-export type SessionHistoryFilter = SessionSubagentFilter | SessionCompactionFilter;
+export type SessionAgentFilter = `agent:${AgentNavType}`;
+
+export type SessionHistoryFilter =
+  | SessionSubagentFilter
+  | SessionCompactionFilter
+  | SessionAgentFilter;
 
 const STORAGE_KEY = "vg-dashboard-history-filters";
 
@@ -24,7 +30,15 @@ const COMPACTION_FILTERS: SessionCompactionFilter[] = [
   "context_compaction_manual",
 ];
 
-const ALL_FILTERS: SessionHistoryFilter[] = [...SUBAGENT_FILTERS, ...COMPACTION_FILTERS];
+const AGENT_FILTERS: SessionAgentFilter[] = KNOWN_AGENT_TYPES.map(
+  (t) => `agent:${t}` as SessionAgentFilter,
+);
+
+const ALL_FILTERS: SessionHistoryFilter[] = [
+  ...SUBAGENT_FILTERS,
+  ...COMPACTION_FILTERS,
+  ...AGENT_FILTERS,
+];
 
 export function loadSessionFilters(): Set<SessionHistoryFilter> {
   try {
@@ -50,6 +64,10 @@ export function saveSessionFilters(filters: Set<SessionHistoryFilter>): void {
   }
 }
 
+function agentTypeFromFilter(id: SessionAgentFilter): AgentNavType {
+  return id.slice("agent:".length) as AgentNavType;
+}
+
 export function filterSessions(
   items: SessionSummary[],
   active: Set<SessionHistoryFilter>,
@@ -63,6 +81,11 @@ export function filterSessions(
     if (active.has("tool_compaction") && s.has_tool_compaction) return true;
     if (active.has("context_compaction_auto") && s.has_context_compaction_auto) return true;
     if (active.has("context_compaction_manual") && s.has_context_compaction_manual) return true;
+    for (const id of AGENT_FILTERS) {
+      if (!active.has(id)) continue;
+      const type = agentTypeFromFilter(id);
+      if (s.agent_types_present?.includes(type)) return true;
+    }
     return false;
   });
 }
@@ -115,6 +138,16 @@ export const SESSION_COMPACTION_FILTER_OPTIONS: {
     hint: "Manual /compact conversation compaction (context_compaction, reason manual) — forward-compatible",
   },
 ];
+
+export const SESSION_AGENT_FILTER_OPTIONS: {
+  id: SessionAgentFilter;
+  label: string;
+  hint: string;
+}[] = KNOWN_AGENT_TYPES.map((type) => ({
+  id: `agent:${type}` as SessionAgentFilter,
+  label: type,
+  hint: `Sessions with ${type} agent activity`,
+}));
 
 /** @deprecated use SESSION_SUBAGENT_FILTER_OPTIONS */
 export const SESSION_FILTER_OPTIONS = SESSION_SUBAGENT_FILTER_OPTIONS;

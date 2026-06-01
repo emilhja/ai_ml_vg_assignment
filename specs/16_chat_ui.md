@@ -28,8 +28,10 @@ unaffected.
    - `📁 {workspace_dir_name}` or `dir:` when `NO_EMOJI` is set.
    - `🤖 {short_model}` or `mdl:` — from latest parent `llm_start` or config default.
    - `{mode}` — always `live` (the agent has a single live runtime path).
-   - `ctx {tokens}` or `ctx {tokens}/{window} ({pct}%)` — parent-visible context
-     token estimate from `show_context`, not raw `llm_start.tokens_in`.
+   - `ctx {tokens}` or `ctx {tokens}/{window} ({pct}%)` — **parent-visible** context
+     for the next parent prompt (`show_context` at the latest step), not session spend.
+   - `session … {running}/{max} tok` — **session budget** counter (`BudgetGuard.running_tokens`:
+     cumulative tokens across parent, compactor, and sub-agents). Distinct from `ctx`.
    - `⚠️ 🪙 ${running}/${cap}` (or `! usd:` without emoji) — session spend vs cap; **bold red**
      when the next model step is projected to exceed `--max-usd`, **yellow** with the same
      warning icon at the 80% warn threshold (`WARN_USD_FRACTION`). May append

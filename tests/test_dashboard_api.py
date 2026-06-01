@@ -460,6 +460,64 @@ def test_compaction_flags_from_jsonl_tool_event() -> None:
     assert empty == CompactionFlags()
 
 
+def test_session_agent_types_present(dashboard_client: TestClient, tmp_path: Path) -> None:
+    import json
+
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="agent type tags")
+    recorder.emit("assistant_step", agent_id="parent", agent_type="parent", step_idx=1)
+    session_id = str(recorder.session_id)
+    run_id = str(recorder.run_id)
+
+    jsonl_path = tmp_path / "traces" / f"{session_id}.jsonl"
+    extras = [
+        {
+            "agent_id": "explorer-1.0",
+            "agent_type": "explorer",
+            "child_agent_id": "explorer-1.0",
+            "event_idx": 50,
+            "kind": "subagent_spawn",
+            "parent_id": "parent",
+            "run_id": run_id,
+            "session_id": session_id,
+            "timestamp_iso": "2026-06-01T12:00:01+00:00",
+            "turn_id": f"{session_id}:turn:1",
+            "turn_index": 1,
+        },
+        {
+            "agent_id": "parent",
+            "agent_type": "compactor",
+            "event_idx": 51,
+            "kind": "llm_start",
+            "parent_id": "parent",
+            "run_id": run_id,
+            "session_id": session_id,
+            "timestamp_iso": "2026-06-01T12:00:02+00:00",
+        },
+        {
+            "agent_id": "parent",
+            "event_idx": 52,
+            "kind": "context_compaction",
+            "parent_id": "parent",
+            "reason": "auto",
+            "run_id": run_id,
+            "session_id": session_id,
+            "timestamp_iso": "2026-06-01T12:00:03+00:00",
+        },
+    ]
+    with jsonl_path.open("a", encoding="utf-8") as handle:
+        for row in extras:
+            handle.write(json.dumps(row) + "\n")
+
+    listed = dashboard_client.get("/api/v1/sessions")
+    assert listed.status_code == 200
+    row = next(item for item in listed.json()["items"] if item["session_id"] == session_id)
+    types = row["agent_types_present"]
+    assert "parent" in types
+    assert "explorer" in types
+    assert "compactor" in types
+
+
 def test_history_filter_tool_compaction(dashboard_client: TestClient, tmp_path: Path) -> None:
     recorder = TraceRecorder(tmp_path)
     run_live_task(

@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api";
 import EventFeed from "../components/EventFeed";
@@ -6,6 +7,8 @@ import { SessionCard } from "../components/SessionCards";
 import { useSessionStream } from "../hooks/useSessionStream";
 
 export default function CurrentSessionPage() {
+  const [highlightEventIdx, setHighlightEventIdx] = useState<number | null>(null);
+
   const { data, isLoading, error, isError } = useQuery({
     queryKey: ["activeSession"],
     queryFn: api.activeSession,
@@ -90,7 +93,12 @@ export default function CurrentSessionPage() {
       )}
       <section className="flex flex-col flex-1 min-h-0">
         <h2 className="shrink-0 text-sm font-medium text-muted mb-2">Event stream</h2>
-        <EventFeed events={displayEvents} parallel={parallel ?? null} />
+        <EventFeed
+          events={displayEvents}
+          parallel={parallel ?? null}
+          highlightEventIdx={highlightEventIdx}
+          onHighlightEventIdx={setHighlightEventIdx}
+        />
       </section>
     </div>
   );

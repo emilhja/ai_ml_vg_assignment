@@ -12,6 +12,7 @@ These files are human-/agent-edited sources of truth:
   observability, and demo behavior.
 - `PROMPTS.md` — parent and sub-agent prompts compiled into runtime code.
 - `MODEL_CONFIG.md` — exact model IDs, endpoint host, and pricing constants.
+- `CONTEXT_WINDOWS.md` — per-model context window and auto-compact fraction.
 - `scripts/generate_project.py` — generated-code templates.
 - Top-level packaging/docs that are not generated: `Dockerfile`,
   `docker-compose.yml`, `.env.example`, `config.example.toml`, `README.md`,

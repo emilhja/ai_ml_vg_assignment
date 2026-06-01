@@ -12,6 +12,7 @@ from ..config import jsonl_path_for_session
 from ..db import get_engine
 from ..metadata import load_all_display_names, set_display_name
 from ..paths import all_traces_dirs, find_jsonl_path, mtime_iso
+from .session_agent_types import bulk_agent_types
 from .session_compaction_tags import bulk_compaction_flags
 from .session_tags import bulk_subagent_flags
 from .trace_backfill import ensure_session_mirrored
@@ -244,11 +245,13 @@ def list_sessions(
     session_ids = [item.session_id for item in merged]
     flags_by_id = bulk_subagent_flags(db, session_ids)
     compaction_by_id = bulk_compaction_flags(db, session_ids)
+    agent_types_by_id = bulk_agent_types(db, session_ids)
     enriched: list[SessionSummary] = []
     for item in merged:
         flags = flags_by_id.get(item.session_id)
         compaction = compaction_by_id.get(item.session_id)
-        updates: dict[str, bool] = {}
+        agent_types = agent_types_by_id.get(item.session_id)
+        updates: dict[str, object] = {}
         if flags is not None:
             updates.update(
                 {
@@ -265,6 +268,8 @@ def list_sessions(
                     "has_context_compaction_manual": compaction.has_context_compaction_manual,
                 }
             )
+        if agent_types is not None:
+            updates["agent_types_present"] = agent_types
         enriched.append(item.model_copy(update=updates) if updates else item)
     total = len(enriched)
     page = enriched[offset : offset + limit]

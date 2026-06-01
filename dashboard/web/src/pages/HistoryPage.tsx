@@ -6,10 +6,30 @@ import {
   filterSessions,
   loadSessionFilters,
   saveSessionFilters,
+  SESSION_AGENT_FILTER_OPTIONS,
   SESSION_COMPACTION_FILTER_OPTIONS,
   SESSION_SUBAGENT_FILTER_OPTIONS,
   type SessionHistoryFilter,
 } from "../lib/sessionFilters";
+
+function AgentBadges({ session }: { session: SessionSummary }) {
+  const types = session.agent_types_present ?? [];
+  if (!types.length) {
+    return <span className="text-[10px] text-muted">—</span>;
+  }
+  return (
+    <span className="flex flex-wrap gap-1">
+      {types.map((t) => (
+        <span
+          key={t}
+          className="text-[10px] uppercase tracking-wide px-1 py-0.5 rounded bg-cyan-500/20 text-cyan-200"
+        >
+          {t}
+        </span>
+      ))}
+    </span>
+  );
+}
 
 function SubagentBadges({ session }: { session: SessionSummary }) {
   if (!session.has_subagents) {
@@ -148,6 +168,29 @@ export default function HistoryPage() {
           </div>
         </div>
         <div className="space-y-2">
+          <p className="text-xs text-muted">Agents:</p>
+          <div className="flex flex-wrap gap-2">
+            {SESSION_AGENT_FILTER_OPTIONS.map((opt) => {
+              const on = activeFilters.has(opt.id);
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  title={opt.hint}
+                  onClick={() => toggleFilter(opt.id)}
+                  className={`px-3 py-1.5 rounded-full text-xs border transition-colors ${
+                    on
+                      ? "bg-cyan-500/20 border-cyan-500/50 text-cyan-200"
+                      : "bg-panel/60 border-slate-700/50 text-muted hover:border-slate-500 hover:text-white"
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <div className="space-y-2">
           <p className="text-xs text-muted">Compaction:</p>
           <div className="flex flex-wrap gap-2">
             {SESSION_COMPACTION_FILTER_OPTIONS.map((opt) => {
@@ -194,6 +237,7 @@ export default function HistoryPage() {
             <tr>
               <th className="px-4 py-2">Session</th>
               <th className="px-4 py-2">Sub-agents</th>
+              <th className="px-4 py-2">Agents</th>
               <th className="px-4 py-2">Compaction</th>
               <th className="px-4 py-2">Last seen</th>
               <th className="px-4 py-2">Status</th>
@@ -219,6 +263,9 @@ export default function HistoryPage() {
                 </td>
                 <td className="px-4 py-2">
                   <SubagentBadges session={s} />
+                </td>
+                <td className="px-4 py-2">
+                  <AgentBadges session={s} />
                 </td>
                 <td className="px-4 py-2">
                   <CompactionBadges session={s} />

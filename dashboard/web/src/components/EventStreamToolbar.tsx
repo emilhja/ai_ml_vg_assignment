@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import type { EventViewMode } from "../lib/groupEvents";
 import WideScreenToggle from "./WideScreenToggle";
 
@@ -7,6 +8,7 @@ type Props = {
   parallelColumns: boolean;
   onParallelColumnsChange: (enabled: boolean) => void;
   showParallelToggle: boolean;
+  agentNav?: ReactNode;
 };
 
 const MODES: { id: EventViewMode; label: string }[] = [
@@ -21,6 +23,7 @@ export default function EventStreamToolbar({
   parallelColumns,
   onParallelColumnsChange,
   showParallelToggle,
+  agentNav,
 }: Props) {
   return (
     <div className="flex flex-wrap items-center gap-2 mb-3">
@@ -51,7 +54,8 @@ export default function EventStreamToolbar({
           Parallel columns
         </button>
       )}
-      <WideScreenToggle className="ml-auto" />
+      {agentNav}
+      <WideScreenToggle className={agentNav ? "" : "ml-auto"} />
     </div>
   );
 }

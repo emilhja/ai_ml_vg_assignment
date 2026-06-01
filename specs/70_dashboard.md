@@ -51,7 +51,7 @@ such as `workspace/workspace/traces/` is discoverable without manual copy.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | DB reachable, workspace path |
-| GET | `/sessions` | Paginated session list; each item includes sub-agent and compaction flags for History filters (see **History sub-agent badges** and **History compaction filters** below) |
+| GET | `/sessions` | Paginated session list; each item includes sub-agent, compaction, and `agent_types_present` for History filters (see **History sub-agent badges**, **History compaction filters**, **History agent filters** below) |
 | GET | `/sessions/active` | Active session snapshot |
 | GET | `/sessions/{session_id}` | Session + runs + turns summary |
 | PATCH | `/sessions/{session_id}` | Set/clear user `display_name` (body: `{ "display_name": string \| null }`; max 120 chars); `session_id` unchanged |
@@ -124,6 +124,26 @@ from `GET /runs/{run_id}/parallel`, overlapping sub-agent timestamp ranges, or a
 `spawn_subagents` tool call with 2+ sub-agent lanes / `subagent_spawn` events
 (even before `subagent_return`).
 
+### Agent navigation (Current + Events tab)
+
+Toolbar chips (**Agents:** `parent`, `explorer`, `compactor`, …) appear for each
+agent type present in the loaded event list (one chip per type; parallel explorer
+lanes share a single **explorer** chip).
+
+- Clicking a chip scrolls to the **next** matching event by `event_idx` (wraps to
+  the first match after the last).
+- Collapsed turn sections auto-expand when the target event is inside them.
+- Session detail: jumps set `?tab=events&eventIdx=N` for shareable deep links
+  (same scroll/highlight behaviour as manual `eventIdx` links).
+
+Matching rules (aligned with `dashboard/api/services/session_agent_types.py`):
+
+| Type | Matches |
+|------|---------|
+| `parent` | Parent-scoped events (`agent_id == "parent"`, etc.) |
+| `explorer`, `grilling`, `coder`, `reviewer` | `agent_type` on event or payload |
+| `compactor` | `agent_type == compactor` or `kind == context_compaction` |
+
 ### History sub-agent badges
 
 `has_parallel_subagents` / `has_sequential_subagents` on the session list use **JSONL**
@@ -155,6 +175,21 @@ SQLite `compactions` / `events` tables are used only when no JSONL file is prese
 
 Matching any selected filter shows the session (same OR semantics as sub-agent filters).
 Select none to show all sessions.
+
+### History agent filters
+
+`agent_types_present` on each `SessionSummary` lists distinct agent types seen in the
+session (canonical order: `parent`, `explorer`, `grilling`, `coder`, `reviewer`,
+`compactor`). Derived from **JSONL** when `<traces_dir>/<session_id>.jsonl` exists;
+otherwise SQLite `events` / `subagents` rows.
+
+| UI | Behaviour |
+|----|-----------|
+| **Agents** filter chips | OR-match sessions whose `agent_types_present` includes the type |
+| **Agents** table column | Compact badge per type on each session row |
+
+Filter persistence: `localStorage` key `vg-dashboard-history-filters` (shared with
+sub-agent and compaction filters).
 
 ### Verifying compaction on a session
 

@@ -10,7 +10,7 @@ RUN useradd --create-home --uid 1000 vg
 
 WORKDIR /app
 
-COPY pyproject.toml uv.lock README.md MODEL_CONFIG.md PROMPTS.md ./
+COPY pyproject.toml uv.lock README.md MODEL_CONFIG.md PROMPTS.md CONTEXT_WINDOWS.md ./
 COPY specs ./specs
 COPY scripts ./scripts
 COPY src ./src

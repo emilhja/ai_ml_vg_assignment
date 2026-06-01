@@ -2322,6 +2322,62 @@ def compact_conversation(
     )
 
 
+def conversation_compact_skip_reason(
+    messages: list[dict[str, Any]],
+    parent_model_id: str,
+) -> str | None:
+    """Return a skip reason when manual compact is unnecessary; None if folding may proceed."""
+    if not messages:
+        return "no_history"
+    user_turns = sum(1 for message in messages if message.get("role") == "user")
+    split = _split_messages_for_conversation_compaction(messages)
+    if split is None:
+        if user_turns <= config.COMPACT_KEEP_RECENT_TURNS:
+            return "too_few_user_turns"
+        return "no_foldable_head"
+    before = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
+    window = _context_window_for_model(parent_model_id)
+    threshold = int(window * _compact_fraction_for_model(parent_model_id))
+    if before <= threshold:
+        return "below_auto_threshold"
+    return None
+
+
+def format_manual_compact_skip_warning(
+    reason: str,
+    messages: list[dict[str, Any]],
+    parent_model_id: str,
+) -> str:
+    """Human-readable warning when /compact is skipped as unnecessary."""
+    keep = config.COMPACT_KEEP_RECENT_TURNS
+    if reason == "no_history":
+        return "[context] /compact skipped: no conversation history yet — run a task first."
+    if reason == "too_few_user_turns":
+        user_turns = sum(1 for message in messages if message.get("role") == "user")
+        return (
+            f"[context] /compact skipped: only {user_turns} user turn(s) in chat memory; "
+            f"need more than {keep} to fold older turns while keeping the last {keep} verbatim. "
+            "Large tool results are still compacted automatically (see /review)."
+        )
+    if reason == "no_foldable_head":
+        return (
+            f"[context] /compact skipped: nothing to fold before the last {keep} user turns."
+        )
+    if reason == "below_auto_threshold":
+        before = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
+        window = _context_window_for_model(parent_model_id)
+        fraction = _compact_fraction_for_model(parent_model_id)
+        threshold = int(window * fraction)
+        pct = int(before / window * 100) if window else 0
+        return (
+            f"[context] /compact skipped: parent context is ~{before:,} tokens "
+            f"({pct}% of {window:,} window) — below the "
+            f"auto-fold threshold ({threshold:,} = {fraction:.0%} of window). "
+            "Folding would save little. Tool-result compaction already applied on large reads."
+        )
+    return f"[context] /compact skipped: {reason}."
+
+
 def _result(tool_use_id: str, tool: str, content: str, status: str, started: float) -> dict[str, object]:
     return {
         "tool_use_id": tool_use_id,
@@ -3078,6 +3134,8 @@ from .agent import (
     ApprovalPolicy,
     ApprovalRequest,
     compact_conversation,
+    conversation_compact_skip_reason,
+    format_manual_compact_skip_warning,
     run_live_task,
 )
 from .live_model_client import LiveModelClient, MissingOpenRouterKey
@@ -3158,7 +3216,7 @@ def _print_budget(guard: BudgetGuard) -> None:
 
     sys.stdout.write(
         f"steps {guard.step_count}/{guard.max_steps}  "
-        f"tokens {guard.running_tokens}/{guard.max_tokens}  "
+        f"session_tokens {guard.running_tokens}/{guard.max_tokens}  "
         f"usd {format_usd_number(guard.running_usd)}/{format_usd_number(guard.max_usd)}  "
         f"daily_remaining {format_usd_number(guard.daily_remaining_usd)}\\n"
     )
@@ -3238,6 +3296,8 @@ def _print_chat_status_report(
     *,
     since_event_idx: int = 0,
 ) -> None:
+    from .chat_ui import estimate_parent_ctx_tokens
+
     line = _format_chat_statusline(
         recorder,
         guard,
@@ -3245,6 +3305,11 @@ def _print_chat_status_report(
         since_event_idx=since_event_idx,
     )
     sys.stdout.write(line + "\\n")
+    parent_ctx = estimate_parent_ctx_tokens(recorder.events)
+    sys.stdout.write(
+        f"parent_ctx {parent_ctx:,} tokens (next parent prompt via show_context) | "
+        f"session_tokens {guard.running_tokens:,} (all models, budget cap)\\n"
+    )
     _print_budget(guard)
     sys.stdout.write(f"trace: {recorder.path}\\n")
     final_status = _latest_run_end_status(recorder.events)
@@ -4117,8 +4182,16 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                     )
                 continue
             if prompt == "/compact" or prompt.startswith("/compact "):
-                if not conversation:
-                    sys.stdout.write("No conversation history to compact yet.\\n")
+                skip_reason = conversation_compact_skip_reason(
+                    conversation, config.PARENT_MODEL_ID
+                )
+                if skip_reason is not None:
+                    sys.stdout.write(
+                        format_manual_compact_skip_warning(
+                            skip_reason, conversation, config.PARENT_MODEL_ID
+                        )
+                        + "\\n"
+                    )
                     continue
                 try:
                     compact_client = LiveModelClient.from_env(recorder=recorder)
@@ -4135,7 +4208,12 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                     deterministic=False,
                 )
                 if compact_event is None:
-                    sys.stdout.write("Nothing to fold (history too short).\\n")
+                    sys.stdout.write(
+                        format_manual_compact_skip_warning(
+                            "no_foldable_head", conversation, config.PARENT_MODEL_ID
+                        )
+                        + "\\n"
+                    )
                 else:
                     banner = format_compaction_banner(compact_event)
                     if banner:

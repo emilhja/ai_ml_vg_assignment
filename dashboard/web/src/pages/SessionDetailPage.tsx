@@ -117,6 +117,18 @@ export default function SessionDetailPage() {
     return () => window.clearTimeout(timer);
   }, [tab, highlight, timeline]);
 
+  const handleHighlightEventIdx = (eventIdx: number) => {
+    setSearchParams(
+      (prev) => {
+        const p = new URLSearchParams(prev);
+        p.set("tab", "events");
+        p.set("eventIdx", String(eventIdx));
+        return p;
+      },
+      { replace: true },
+    );
+  };
+
   useEffect(() => {
     if (tab !== "events" || highlightEventIdx == null) return;
     const el = document.getElementById(`event-${highlightEventIdx}`);
@@ -459,6 +471,7 @@ export default function SessionDetailPage() {
             parallel={parallel ?? null}
             turns={detail.turns}
             highlightEventIdx={highlightEventIdx}
+            onHighlightEventIdx={handleHighlightEventIdx}
           />
         </div>
       )}

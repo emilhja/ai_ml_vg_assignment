@@ -17,6 +17,7 @@ export type SessionSummary = {
   has_tool_compaction?: boolean;
   has_context_compaction_auto?: boolean;
   has_context_compaction_manual?: boolean;
+  agent_types_present?: string[];
 };
 
 export type EventItem = {

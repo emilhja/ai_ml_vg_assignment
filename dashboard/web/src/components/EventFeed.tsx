@@ -12,6 +12,7 @@ import {
   type EventViewMode,
   type TimeAnchors,
 } from "../lib/groupEvents";
+import AgentNavBar from "./AgentNavBar";
 import EventRow from "./EventRow";
 import EventStreamToolbar from "./EventStreamToolbar";
 import TurnSection from "./TurnSection";
@@ -21,6 +22,8 @@ type Props = {
   parallel?: ParallelResponse | null;
   turns?: SessionDetail["turns"];
   highlightEventIdx?: number | null;
+  onHighlightEventIdx?: (eventIdx: number) => void;
+  showAgentNav?: boolean;
 };
 
 function buildTurnRollupMap(turns: SessionDetail["turns"] | undefined): Map<string, TurnRollup> {
@@ -35,7 +38,14 @@ function buildTurnRollupMap(turns: SessionDetail["turns"] | undefined): Map<stri
   return map;
 }
 
-export default function EventFeed({ events, parallel, turns, highlightEventIdx = null }: Props) {
+export default function EventFeed({
+  events,
+  parallel,
+  turns,
+  highlightEventIdx = null,
+  onHighlightEventIdx,
+  showAgentNav = true,
+}: Props) {
   const [viewMode, setViewMode] = useState<EventViewMode>(loadEventViewMode);
   const [parallelColumns, setParallelColumns] = useState(loadParallelColumns);
 
@@ -58,6 +68,21 @@ export default function EventFeed({ events, parallel, turns, highlightEventIdx =
     saveParallelColumns(enabled);
   };
 
+  const handleAgentJump = (eventIdx: number) => {
+    onHighlightEventIdx?.(eventIdx);
+    requestAnimationFrame(() => {
+      document.getElementById(`event-${eventIdx}`)?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    });
+  };
+
+  const agentNav =
+    showAgentNav && events.length > 0 ? (
+      <AgentNavBar events={events} onJump={(idx) => handleAgentJump(idx)} />
+    ) : null;
+
   if (!events.length) {
     return <p className="text-muted text-sm">No events yet.</p>;
   }
@@ -74,6 +99,7 @@ export default function EventFeed({ events, parallel, turns, highlightEventIdx =
           parallelColumns={parallelColumns}
           onParallelColumnsChange={handleParallelColumns}
           showParallelToggle={anyOverlap}
+          agentNav={agentNav}
         />
         <ul className="flex-1 min-h-0 overflow-y-auto space-y-2 font-mono text-xs">
           {sorted.map((e) => (
@@ -101,6 +127,7 @@ export default function EventFeed({ events, parallel, turns, highlightEventIdx =
         parallelColumns={parallelColumns}
         onParallelColumnsChange={handleParallelColumns}
         showParallelToggle={anyOverlap}
+        agentNav={agentNav}
       />
       <div className="flex-1 min-h-0 overflow-y-auto space-y-4">
         {groupsChronological.map((group) => (

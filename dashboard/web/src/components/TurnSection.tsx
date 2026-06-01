@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ParallelResponse } from "../api";
 import {
   formatTurnTimeRange,
@@ -33,6 +33,14 @@ export default function TurnSection({
   defaultExpanded = true,
 }: Props) {
   const [expanded, setExpanded] = useState(defaultExpanded);
+  useEffect(() => {
+    if (
+      highlightEventIdx != null &&
+      group.events.some((e) => e.event_idx === highlightEventIdx)
+    ) {
+      setExpanded(true);
+    }
+  }, [highlightEventIdx, group.events]);
   const overlap = turnHasParallelOverlap(group.turnIndex, group.events, parallel);
   const timeRange = formatTurnTimeRange(group.startedAt, group.endedAt);
   const statsLine = formatTurnStatsLine(summarizeTurnStats(group.events, turnRollup));

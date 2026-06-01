@@ -345,6 +345,50 @@ def test_compactor_budget_recorded(tmp_path: Path) -> None:
     )
 
 
+def test_manual_compact_skip_warning_below_threshold() -> None:
+    from vg_agent.agent import conversation_compact_skip_reason, format_manual_compact_skip_warning
+
+    messages: list[dict[str, object]] = []
+    for index in range(6):
+        messages.append({"role": "user", "content": f"question {index}"})
+        messages.append({"role": "assistant", "content": f"answer {index}"})
+    reason = conversation_compact_skip_reason(messages, config.PARENT_MODEL_ID)
+    assert reason == "below_auto_threshold"
+    warning = format_manual_compact_skip_warning(reason, messages, config.PARENT_MODEL_ID)
+    assert "/compact skipped" in warning
+    assert "auto-fold threshold" in warning
+
+
+def test_manual_compact_skip_warning_too_few_turns() -> None:
+    from vg_agent.agent import conversation_compact_skip_reason, format_manual_compact_skip_warning
+
+    messages = [{"role": "user", "content": "only one turn"}]
+    reason = conversation_compact_skip_reason(messages, config.PARENT_MODEL_ID)
+    assert reason == "too_few_user_turns"
+    warning = format_manual_compact_skip_warning(reason, messages, config.PARENT_MODEL_ID)
+    assert "only 1 user turn" in warning
+
+
+def test_chat_slash_compact_warns_when_unnecessary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from vg_agent import __main__ as cli
+
+    write_fixture(tmp_path)
+    prompts = iter(["/compact", "/exit"])
+    monkeypatch.setattr(cli, "use_rich_ui", lambda: False)
+    monkeypatch.setattr(cli, "_make_chat_prompt", lambda _history_path: (lambda: next(prompts), lambda: None))
+    monkeypatch.setattr(cli, "LiveModelClient", SimpleNamespace(from_env=lambda recorder=None: object()))
+
+    args = SimpleNamespace(no_redact=False, require_approval="off", yes=False, live_model=True)
+    assert cli._chat_loop(tmp_path, args) == 0
+    out = capsys.readouterr().out
+    assert "/compact skipped" in out
+    assert "no conversation history" in out
+
+
 def test_chat_slash_compact_emits_manual_event(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -352,6 +396,8 @@ def test_chat_slash_compact_emits_manual_event(
 ) -> None:
     from vg_agent import __main__ as cli
 
+    monkeypatch.setitem(config.CONTEXT_WINDOW_TOKENS, config.PARENT_MODEL_ID, 5000)
+    monkeypatch.setitem(config.AUTO_COMPACT_FRACTION, config.PARENT_MODEL_ID, 0.5)
     write_fixture(tmp_path)
     prompts = iter(["seed turn", "/compact", "/exit"])
     compactor_client = PipelineClient(
@@ -886,7 +932,7 @@ def test_live_chat_statusline_shows_context_and_budget(tmp_path: Path) -> None:
     line = _format_chat_statusline(recorder, guard, live_model=True, width=200)
     assert "[live]" in line
     assert "ctx 1.2k" in line
-    assert "run #---------" in line
+    assert "session #---------" in line
     assert "1.3k/10.0k tok" in line
     assert "1/5 steps" in line
     assert "usd $" in line
@@ -1797,7 +1843,7 @@ def test_chat_budget_slash_sets_caps(
 
     out = capsys.readouterr().out
     assert "steps 0/100" in out
-    assert "tokens 0/200000" in out
+    assert "session_tokens 0/200000" in out
     assert "usd 0.00/10.00" in out
     assert "daily_remaining 8.00" in out
 
