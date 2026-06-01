@@ -35,12 +35,16 @@ unaffected.
    - `⚠️ 🪙 ${running}/${cap}` (or `! usd:` without emoji) — session spend vs cap; **bold red**
      when the next model step is projected to exceed `--max-usd`, **yellow** with the same
      warning icon at the 80% warn threshold (`WARN_USD_FRACTION`). May append
-     `(next ~$projected)` when over cap.
+     `(next ~$projected)` when over cap **only if** the parent model id is in
+     `PRICING_USD_PER_MTOK`. For unpriced models, append `(unpriced model)` instead
+     (no `(next ~$…)` from the unknown-model fallback).
    - `📊 {steps}/{max_steps} steps` — prefix `!` when `steps == max_steps - 1`
      (one step remaining before hard `step_cap`).
    - `{status_icon} {status}` — `✓ ready` | `… running` | `⚠ warn` | `✗ error`.
 5. **Hint line** — dim: `/help for commands · /status to refresh session` (once
    per screen; not duplicated in the welcome panel).
+   - On first welcome panel only: if any configured role model lacks local pricing,
+     add a dim line listing short model ids and `see docs/PRICE.md`.
 6. **Secondary status** (conditional):
    - When `final_status ∉ {ok, ready}` or `tool_errors > 0`: `!! {reason} — see
      progress above` in yellow accent.

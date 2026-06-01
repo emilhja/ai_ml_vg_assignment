@@ -76,6 +76,8 @@ Every event the trace recorder writes must carry these fields (or
 | `agent_type` | all | `parent` \| `grilling` \| `explorer` \| `coder` \| `reviewer` |
 | `parent_step_idx` | sub-agent events | parent step that spawned this sub-agent |
 | `model_id` | `assistant_step` and any event tied to an OpenRouter request | exact model ID used |
+| `openrouter_provider` | `assistant_step` (live OpenRouter only) | backend slug from the OR response (`novita`, `alibaba`, …); omitted when unknown |
+| `warn_expensive_provider` | `budget_event` | once per denylisted slug per run when `openrouter_provider` matches `OPENROUTER_EXPENSIVE_PROVIDERS` |
 | `tokens_in` / `tokens_out` | `assistant_step` | usage from the LiteLLM/OpenRouter response |
 | `usd` | `assistant_step` | provider-returned cost or computed from `MODEL_CONFIG.md` pricing |
 | `tool_call_index` | `tool_call`, `tool_result` | monotonically increasing per `agent_id` |

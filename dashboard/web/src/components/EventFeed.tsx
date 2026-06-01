@@ -140,6 +140,7 @@ export default function EventFeed({
             sessionStart={sessionStart}
             turnRollup={turnRollups.get(group.turnId) ?? null}
             highlightEventIdx={highlightEventIdx}
+            onHighlightEventIdx={onHighlightEventIdx}
             defaultExpanded={group.turnId === groupsChronological[0]?.turnId}
           />
         ))}

@@ -1,7 +1,7 @@
 # Final Demo Live Chat Script
 
 Goal: pass the VG live-demo requirement by proving every hard gate and all nine
-minimum features from `background/vg_assignment_grading_requirements.md` in a
+minimum features from `docs/background/vg_assignment_grading_requirements.md` in a
 single live chat session, with deterministic fallback commands ready if the live
 model or network misbehaves.
 
@@ -15,7 +15,7 @@ safety, edit a file, hard-stop on a budget cap, and decide when to yield.
 | Rubric item | Where it is proven | One-line expected outcome |
 |---|---|---|
 | VG.1 parallel sub-agents | Prompt 3 | One `spawn_subagents` launches 2 Explorers that overlap; parent merges both |
-| VG.2 context engineering | Prompt 3 + 3a + 4 (+ optional 4b) | `compaction` in `/review` or JSONL; `/finops` compactor row; `/show-context` overview → step N shows marker, not raw log |
+| VG.2 context engineering | Prompt 3 + 3a, or Prompt 3b + 4 (+ optional 4b) | `compaction` in `/review` or JSONL; `/finops` compactor row; `/show-context` overview → step N shows marker, not raw log |
 | VG.3 cost + warning + hard cap | Prompt 1 (live cost) + Prompt 8 (hard stop) | Cost ticks live; tiny cap → run aborts (exit 3), not extended |
 | VG.4 harmful-call protection | Prompt 5 + Prompt 6 | `.env` read refused, `rm -rf .` refused, denied approval blocks the edit |
 | VG.5 bash execution | Prompt 2 + Prompt 5 | `pwd` / `find` run for real; dangerous bash is blocked, safe bash works |
@@ -29,8 +29,8 @@ safety, edit a file, hard-stop on a budget cap, and decide when to yield.
 
 Have these visible and ready:
 
-- Approved requirement spec / pitch: `background/emil_pitch.md` (VG-HG-1).
-- Grading rubric: `background/vg_assignment_grading_requirements.md`.
+- Approved requirement spec / pitch: `docs/background/emil_pitch.md` (VG-HG-1).
+- Grading rubric: `docs/background/vg_assignment_grading_requirements.md`.
 - Runbook: `specs/70_demo_runbook.md`.
 - Generated-source story (VG-HG-2): `specs/` + `PROMPTS.md` + `MODEL_CONFIG.md`
   generate `src/vg_agent/` and `fixtures/demo_repo/` via
@@ -203,6 +203,74 @@ Say:
 
 ---
 
+## Prompt 3b - Alternative Direct Parent Compaction Proof (VG.2, VG.3)
+
+Use this if Prompt 3 routes the large log read through an Explorer instead of the
+parent. That still proves context isolation, but it does **not** prove the
+parent-scoped `compactor_llm`. This alternative forces the parent to read the
+large tool result directly.
+
+Type:
+
+```text
+Do not spawn a sub-agent. Use the parent read_file tool to read data/sample.log directly, then summarise the important pattern in one sentence.
+```
+
+Expected live progress lines:
+
+```text
+[llm] parent ... tools=read_file data/sample.log
+[tool] parent read_file ok tokens=133300
+[llm] compactor ... -> google/gemini-2.0-flash-001
+[context] compacted tool result 133300 -> 94 tokens
+```
+
+Then verify:
+
+```text
+/review
+```
+
+Expected `/review` evidence:
+
+```text
+Context engineering:
+  - tool_result compacted 133300 -> 94 tokens (trace event N, model=openrouter/google/gemini-2.0-flash-001, fallback=False)
+```
+
+Then:
+
+```text
+/show-context
+```
+
+Pick the final parent step with `compact=1` (for example `/show-context 3` in a
+short run), then:
+
+```text
+/show-context N
+```
+
+Expected JSON evidence:
+
+- `role: "tool"` contains `[COMPACTED tool_result for tool_use_id=...]`.
+- `compacted: true`.
+- `Original size: 133300 tokens`.
+- A trace pointer such as `38d704d33f7b:event:7`.
+- The raw log body is absent; do not see thousands of `req-00001` style lines.
+- The next parent assistant answer appears after the compacted marker, proving
+  the parent saw the shortened marker before answering.
+
+Say:
+
+> This is the direct compactor proof. The parent itself read a 133,300-token log.
+> The runtime called the compactor model, got a short summary marker, and the
+> next parent context contains only `[COMPACTED tool_result ...]` plus a trace
+> pointer, not the raw log body. `fallback=False` means this was a real live
+> compactor call, not the stub fallback.
+
+---
+
 ## Prompt 4 - Context Compaction Is Visible (VG.2)
 
 Do **not** guess a step number. Use the overview table first.
@@ -215,7 +283,7 @@ Type:
 
 Pick **N** = the highest `step` where the `compact` column is `1` (or the first
 step after the parent `read_file` on `data/sample.log`). Record **N** in your demo
-notes (from a pre-demo dry run if helpful — see `demo_review.md` §2.5).
+notes (from a pre-demo dry run if helpful — see `docs/demo/demo_review.md` §2.5).
 
 Then:
 

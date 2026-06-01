@@ -19,18 +19,13 @@ WRITE_EDIT_TOOLS = _WRITE_EDIT_TOOLS
 
 from . import config, tools
 from .budget import BudgetGuard, format_usd_display
+from .runtime_settings import models_missing_local_pricing
 from .trace import TraceRecorder, parallel_subagent_summary, show_context
 
 CHAT_PLACEHOLDER = 'Try "read data/sample.log and summarise auth/"'
 
 _WELCOME_BORDER = "rgb(224,122,95)"
 _PRODUCT_LABEL = "vg-agent"
-
-MODEL_CONTEXT_WINDOWS: dict[str, int] = {
-    "openrouter/google/gemini-2.0-flash-001": 1_048_576,
-    "openrouter/anthropic/claude-haiku-4.5": 200_000,
-    "openrouter/anthropic/claude-sonnet-4.6": 200_000,
-}
 
 _compact_dashboard = False
 
@@ -297,6 +292,7 @@ class SessionStatus:
     usd_projected: float | None = None
     usd_would_exceed: bool = False
     usd_warn: bool = False
+    model_priced: bool = True
 
     def ctx_display(self) -> str:
         compact = _format_compact_number(self.ctx_tokens)
@@ -319,7 +315,7 @@ def build_session_status(
     model_id = str((latest_llm or {}).get("model") or config.PARENT_MODEL_ID)
     model = _short_model(model_id)
     ctx_tokens = estimate_parent_ctx_tokens(recorder.events)
-    ctx_window = MODEL_CONTEXT_WINDOWS.get(model_id)
+    ctx_window = config.CONTEXT_WINDOW_TOKENS.get(model_id)
     ctx_pct = (ctx_tokens / ctx_window * 100) if ctx_window else None
     icon, status_label, status_style = _status_token(
         recorder.events, since_event_idx=since_event_idx, force_state=force_state
@@ -328,10 +324,18 @@ def build_session_status(
     approval_events = sum(1 for event in recorder.events if event.get("kind") == "approval")
     session_tool_errors = _tool_error_count(recorder.events)
     turn_tool_errors = _tool_error_count(recorder.events[since_event_idx:])
-    usd_projected = _estimate_next_step_usd(guard, model_id=model_id, ctx_tokens=ctx_tokens)
-    usd_would_exceed, usd_warn = _usd_budget_flags(
-        guard.running_usd, guard.max_usd, projected_usd=usd_projected
-    )
+    model_priced = model_id in config.PRICING_USD_PER_MTOK
+    if model_priced:
+        usd_projected = _estimate_next_step_usd(guard, model_id=model_id, ctx_tokens=ctx_tokens)
+        usd_would_exceed, usd_warn = _usd_budget_flags(
+            guard.running_usd, guard.max_usd, projected_usd=usd_projected
+        )
+    else:
+        usd_projected = None
+        usd_would_exceed = False
+        _, usd_warn = _usd_budget_flags(
+            guard.running_usd, guard.max_usd, projected_usd=None
+        )
     return SessionStatus(
         mode=mode,
         model=model,
@@ -356,6 +360,7 @@ def build_session_status(
         usd_projected=usd_projected,
         usd_would_exceed=usd_would_exceed,
         usd_warn=usd_warn,
+        model_priced=model_priced,
     )
 
 
@@ -472,6 +477,8 @@ def _usd_status_segment(
     segment = f"{prefix}{coin} {run}/{cap}".strip() if coin else f"{prefix}{run}/{cap}".strip()
     if status.usd_would_exceed and status.usd_projected is not None:
         segment += f" (next ~{_format_usd(status.usd_projected)})"
+    elif not status.model_priced:
+        segment += " (unpriced model)"
     return segment
 
 
@@ -485,6 +492,8 @@ def format_statusline_compact(status: SessionStatus, *, width: int | None = None
     usd_part = f"{usd_prefix}usd {_format_usd(status.running_usd)}/{_format_usd(status.max_usd)}"
     if status.usd_would_exceed and status.usd_projected is not None:
         usd_part += f" (next ~{_format_usd(status.usd_projected)})"
+    elif not status.model_priced:
+        usd_part += " (unpriced model)"
     line = (
         f"[{status.mode}] {status.model} | {status.ctx_display()} | "
         f"session {status.token_bar} {_format_compact_number(status.running_tokens)}/"
@@ -637,6 +646,14 @@ def print_chat_dashboard(
         welcome.append("Welcome to VG Agent!", style="bold white")
         welcome.append("\n")
         welcome.append(f"cwd: {short_cwd(root)}", style="dim")
+        missing = models_missing_local_pricing()
+        if missing:
+            short = [m.removeprefix("openrouter/") for m in missing]
+            welcome.append("\n")
+            welcome.append(
+                f"Unpriced model(s) configured — see docs/PRICE.md: {', '.join(short)}",
+                style="dim",
+            )
         console.print(Panel(welcome, border_style=_WELCOME_BORDER, padding=(0, 1)))
     _write_status_bar(
         console,

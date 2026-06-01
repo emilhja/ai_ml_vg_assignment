@@ -29,7 +29,7 @@ VG slide assertions (context engineering — VG.2):
   context contains only sub-agent return summaries, not sub-agent
   intermediate tool calls or tool results.
 
-Live demo verification (VG.2 — grader-visible, see `final_demo_live_chat_script.md`):
+Live demo verification (VG.2 — grader-visible, see `docs/demo/final_demo_live_chat_script.md`):
 
 1. After the canonical parallel+log task: `/review` shows **Context engineering**
    with `compacted before -> after` for the `sample.log` read; lines include

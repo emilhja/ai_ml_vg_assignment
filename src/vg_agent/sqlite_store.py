@@ -75,6 +75,12 @@ def _provider(model_id: Any) -> str | None:
     return text or None
 
 
+def _openrouter_provider_slug(event: dict[str, object]) -> str | None:
+    """OpenRouter backend slug from trace (novita, alibaba, …)."""
+    slug = _text(event.get("openrouter_provider"))
+    return slug or None
+
+
 def _args_summary(tool: str, args: Any) -> tuple[str | None, str | None, str | None]:
     if not isinstance(args, dict):
         return None, None, None
@@ -523,7 +529,7 @@ class SQLiteTraceStore:
                 _text(event.get("parent_id")),
                 _int(event.get("step_idx")),
                 model_id,
-                _provider(model_id),
+                _openrouter_provider_slug(event),
                 _text(event.get("endpoint_host")),
                 _int(event.get("max_tokens")),
                 _float(event.get("temperature")),
@@ -575,7 +581,7 @@ class SQLiteTraceStore:
                 _text(event.get("parent_id")),
                 _int(event.get("step_idx")),
                 model_id,
-                _provider(model_id),
+                _openrouter_provider_slug(event),
                 _int(event.get("tokens_in")),
                 _int(event.get("tokens_out")),
                 _float(event.get("cost_usd")),

@@ -76,6 +76,7 @@ class ModelTurn:
     raw_content: list[dict[str, Any]] = field(default_factory=list)
     model_id: str = ""
     cost_usd: float | None = None
+    openrouter_provider: str | None = None
 
 
 class LiveModelClient:
@@ -134,17 +135,21 @@ class LiveModelClient:
 
         stdout_filter = _LiteLLMNoiseFilter(sys.stdout)
         stderr_filter = _LiteLLMNoiseFilter(sys.stderr)
+        extra_body = _openrouter_extra_body(model)
+        completion_kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": _to_litellm_messages(system_prompt, messages),
+            "tools": _to_litellm_tools(tools) if tools else None,
+            "max_tokens": max_tokens,
+            "api_key": self.api_key,
+            "api_base": self.endpoint,
+            "extra_headers": _openrouter_headers(),
+        }
+        if extra_body is not None:
+            completion_kwargs["extra_body"] = extra_body
         with contextlib.redirect_stdout(stdout_filter), contextlib.redirect_stderr(stderr_filter):
             try:
-                response = litellm.completion(
-                    model=model,
-                    messages=_to_litellm_messages(system_prompt, messages),
-                    tools=_to_litellm_tools(tools) if tools else None,
-                    max_tokens=max_tokens,
-                    api_key=self.api_key,
-                    api_base=self.endpoint,
-                    extra_headers=_openrouter_headers(),
-                )
+                response = litellm.completion(**completion_kwargs)
             except Exception as exc:
                 if _is_rate_limit_error(exc):
                     raise LiveModelRateLimitError(_rate_limit_message(model)) from exc
@@ -167,6 +172,46 @@ def _openrouter_headers() -> dict[str, str] | None:
     if app_name:
         headers["X-Title"] = app_name
     return headers or None
+
+
+def _parse_csv_env(name: str) -> list[str] | None:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return None
+    parts = [part.strip() for part in str(raw).split(",")]
+    slugs = [part for part in parts if part]
+    return slugs or None
+
+
+def _openrouter_provider_body(model: str) -> dict[str, Any] | None:
+    model_lower = model.lower()
+    if "/deepseek/" in model_lower:
+        only_deepseek = _parse_csv_env("OPENROUTER_PROVIDER_ONLY_DEEPSEEK")
+        if only_deepseek is not None:
+            return {"only": only_deepseek}
+    provider: dict[str, Any] = {}
+    order = _parse_csv_env("OPENROUTER_PROVIDER_ORDER")
+    if order is not None:
+        provider["order"] = order
+    only = _parse_csv_env("OPENROUTER_PROVIDER_ONLY")
+    if only is not None:
+        provider["only"] = only
+    sort_raw = os.environ.get("OPENROUTER_PROVIDER_SORT")
+    if sort_raw is not None and str(sort_raw).strip():
+        provider["sort"] = str(sort_raw).strip()
+    allow_raw = os.environ.get("OPENROUTER_PROVIDER_ALLOW_FALLBACKS")
+    if allow_raw is not None and str(allow_raw).strip():
+        provider["allow_fallbacks"] = str(allow_raw).strip().lower() in ("1", "true", "yes", "on")
+    if not provider:
+        return None
+    return provider
+
+
+def _openrouter_extra_body(model: str) -> dict[str, Any] | None:
+    provider = _openrouter_provider_body(model)
+    if provider is None:
+        return None
+    return {"provider": provider}
 
 
 def _to_litellm_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -293,7 +338,30 @@ def _normalise_response(response: Any, requested_model: str) -> ModelTurn:
         raw_content=raw_content,
         model_id=requested_model,
         cost_usd=cost,
+        openrouter_provider=_extract_openrouter_provider(response),
     )
+
+
+def _extract_openrouter_provider(response: Any) -> str | None:
+    """OpenRouter backend slug (e.g. novita, alibaba) from a completion response."""
+    value = _value(response, "provider", None)
+    if value:
+        return str(value)
+    hidden = _value(response, "_hidden_params", {}) or {}
+    value = _value(hidden, "provider", None)
+    if value:
+        return str(value)
+    original = _value(hidden, "original_response", None)
+    if original is not None:
+        if isinstance(original, str):
+            try:
+                original = json.loads(original)
+            except (TypeError, ValueError):
+                original = None
+        value = _value(original, "provider", None)
+        if value:
+            return str(value)
+    return None
 
 
 def _extract_cost_usd(response: Any) -> float | None:

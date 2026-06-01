@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import type { ParallelResponse } from "../api";
 import {
   formatTurnTimeRange,
-  splitAgentLanes,
   turnHasParallelOverlap,
   type TimeAnchors,
   type TurnGroup,
@@ -19,6 +18,7 @@ type Props = {
   sessionStart: string | null;
   turnRollup?: TurnRollup | null;
   highlightEventIdx?: number | null;
+  onHighlightEventIdx?: (eventIdx: number) => void;
   defaultExpanded?: boolean;
 };
 
@@ -30,6 +30,7 @@ export default function TurnSection({
   sessionStart,
   turnRollup = null,
   highlightEventIdx = null,
+  onHighlightEventIdx,
   defaultExpanded = true,
 }: Props) {
   const [expanded, setExpanded] = useState(defaultExpanded);
@@ -78,10 +79,11 @@ export default function TurnSection({
         <div className="px-4 pb-4 pt-0">
           {viewAgents ? (
             <ParallelTurnLayout
-              lanes={splitAgentLanes(group.events)}
+              turnEvents={group.events}
               anchors={turnAnchors}
               parallelColumns={parallelColumns && overlap}
               highlightEventIdx={highlightEventIdx}
+              onHighlightEventIdx={onHighlightEventIdx}
             />
           ) : (
             <ul className="space-y-2 font-mono text-xs">

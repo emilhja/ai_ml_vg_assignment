@@ -29,8 +29,10 @@ def dashboard_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestCli
     monkeypatch.setattr("dashboard.api.paths._repo_root", lambda: tmp_path.resolve())
     import dashboard.api.db as db_module
     from dashboard.api.paths import clear_path_cache
+    from dashboard.api.runtime_config import ensure_runtime_config
     from dashboard.api.services import trace_backfill
 
+    ensure_runtime_config()
     bootstrap = TraceRecorder(tmp_path)
     bootstrap.emit("session_new")
     clear_path_cache()
@@ -176,6 +178,24 @@ def test_active_session(dashboard_client: TestClient, tmp_path: Path) -> None:
     assert body["session_id"] == recorder.session_id
 
 
+def test_stats_tolerates_null_turn_id_rows(dashboard_client: TestClient, tmp_path: Path) -> None:
+    import sqlite3
+
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="valid turn")
+    db_path = tmp_path / "traces" / "vg_agent.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO turns (turn_id, run_id, session_id, started_at, status) VALUES (NULL, ?, ?, ?, ?)",
+            (str(recorder.run_id), str(recorder.session_id), "2020-01-01T00:00:00+00:00", "ok"),
+        )
+        conn.commit()
+
+    stats = dashboard_client.get("/api/v1/stats", params={"range": "7d"})
+    assert stats.status_code == 200
+    assert stats.json()["total_turns"] >= 1
+
+
 def test_stats_extended_aggregations(dashboard_client: TestClient, tmp_path: Path) -> None:
     import sqlite3
 
@@ -263,6 +283,148 @@ def test_stats_extended_aggregations(dashboard_client: TestClient, tmp_path: Pat
     drill_body = drill.json()
     assert drill_body["total"] == 1
     assert drill_body["items"][0]["error_message"] == "run_bash blocked"
+
+
+def test_stats_model_dashboard(dashboard_client: TestClient, tmp_path: Path) -> None:
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    from dashboard.api.runtime_config import ensure_runtime_config
+    from vg_agent import config
+
+    ensure_runtime_config()
+
+    recorder = TraceRecorder(tmp_path)
+    session_id = str(recorder.session_id)
+    run_id = str(recorder.run_id)
+    now = datetime.now(timezone.utc)
+    recent = (now - timedelta(days=1)).isoformat()
+    old = (now - timedelta(days=14)).isoformat()
+
+    db_path = tmp_path / "traces" / "vg_agent.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO model_calls
+            (model_call_id, run_id, session_id, agent_id, model_id,
+             tokens_in, tokens_out, cost_usd, latency_ms, started_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "mc-parent-1",
+                    run_id,
+                    session_id,
+                    "parent",
+                    config.PARENT_MODEL_ID,
+                    100,
+                    50,
+                    0.01,
+                    200,
+                    recent,
+                    "ok",
+                ),
+                (
+                    "mc-explorer-1",
+                    run_id,
+                    session_id,
+                    "explorer-1",
+                    config.EXPLORER_MODEL_ID,
+                    80,
+                    40,
+                    0.008,
+                    150,
+                    recent,
+                    "ok",
+                ),
+                (
+                    "mc-explorer-1-slot0",
+                    run_id,
+                    session_id,
+                    "explorer-1.0",
+                    config.EXPLORER_MODEL_ID,
+                    60,
+                    30,
+                    0.005,
+                    120,
+                    recent,
+                    "ok",
+                ),
+                (
+                    "mc-haiku-old",
+                    run_id,
+                    session_id,
+                    "parent",
+                    "openrouter/anthropic/claude-haiku-4.5",
+                    20,
+                    10,
+                    0.021,
+                    100,
+                    old,
+                    "ok",
+                ),
+            ],
+        )
+        conn.execute(
+            """
+            INSERT INTO subagents
+            (subagent_id, run_id, session_id, agent_type, question, started_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (f"{run_id}:explorer-1", run_id, session_id, "explorer", "auth?", recent, "ok"),
+        )
+        conn.commit()
+
+    stats = dashboard_client.get("/api/v1/stats", params={"range": "7d"})
+    assert stats.status_code == 200
+    body = stats.json()
+
+    assert body["configured_models"]
+    parent_cfg = next(item for item in body["configured_models"] if item["role"] == "parent")
+    assert parent_cfg["model_id"] == config.PARENT_MODEL_ID
+
+    assert body["by_agent_role"]
+    role_labels = {item["label"] for item in body["by_agent_role"]}
+    assert "parent" in role_labels
+    assert "explorer" in role_labels
+    assert len(role_labels) == len(body["by_agent_role"])
+    explorer_role = next(item for item in body["by_agent_role"] if item["label"] == "explorer")
+    assert explorer_role["cost_usd"] == pytest.approx(0.013, abs=1e-6)
+    assert explorer_role["count"] == 2
+
+    assert body["models"]
+    parent_model = next(m for m in body["models"] if m["model_id"] == config.PARENT_MODEL_ID)
+    assert parent_model["call_count"] >= 1
+    assert parent_model["active_in_range"] is True
+    assert parent_model["last_used_at_all_time"]
+    parent_roles = {r["agent_role"] for r in parent_model["by_role"]}
+    assert "parent" in parent_roles
+
+    explorer_model = next(m for m in body["models"] if m["model_id"] == config.EXPLORER_MODEL_ID)
+    explorer_roles = {r["agent_role"] for r in explorer_model["by_role"]}
+    assert "explorer" in explorer_roles
+
+    haiku = next(
+        m for m in body["models"] if m["model_id"] == "openrouter/anthropic/claude-haiku-4.5"
+    )
+    assert haiku["call_count"] == 0
+    assert haiku["active_in_range"] is False
+    assert haiku["last_used_at_all_time"]
+    assert haiku["last_used_at"] is None
+
+
+def test_stats_configured_models_use_env_overrides(
+    dashboard_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    override = "openrouter/anthropic/claude-haiku-4.5"
+    monkeypatch.setenv("VG_PARENT_MODEL", override)
+    stats = dashboard_client.get("/api/v1/stats", params={"range": "7d"})
+    assert stats.status_code == 200
+    parent_cfg = next(
+        item for item in stats.json()["configured_models"] if item["role"] == "parent"
+    )
+    assert parent_cfg["model_id"] == override
 
 
 def test_session_list_subagent_flags(dashboard_client: TestClient, tmp_path: Path) -> None:

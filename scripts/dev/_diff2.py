@@ -1,7 +1,7 @@
 ﻿from pathlib import Path
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[2]
 text = (ROOT / "scripts" / "generate_project.py").read_text(encoding="utf-8")
-src = (ROOT / "_patch_all.py").read_text(encoding="utf-8")
+src = (Path(__file__).resolve().parent / "_patch_all.py").read_text(encoding="utf-8")
 start = src.index("old_loop_start = '''") + len("old_loop_start = '''")
 end = src.index("'''", start)
 old = src[start:end]

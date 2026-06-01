@@ -44,7 +44,11 @@ export function matchAgentType(event: EventItem, type: AgentNavType): boolean {
     return isParentAgent(event);
   }
   if (type === "compactor") {
-    return eventAgentType(event) === "compactor" || event.kind === "context_compaction";
+    return (
+      eventAgentType(event) === "compactor" ||
+      event.kind === "context_compaction" ||
+      event.kind === "compaction"
+    );
   }
   return eventAgentType(event) === type;
 }

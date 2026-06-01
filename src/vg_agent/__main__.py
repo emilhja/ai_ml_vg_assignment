@@ -65,6 +65,14 @@ from .agent import (
 from .live_model_client import LiveModelClient, MissingOpenRouterKey
 from .budget import BudgetGuard, format_usd_display
 from .demo_fixture import write_fixture
+from .runtime_settings import (
+    _refresh_subagent_model_ids,
+    apply_runtime_settings,
+    format_missing_pricing_warning,
+    normalize_model_id,
+    strict_model_pricing_enabled,
+    validate_configured_models,
+)
 from .workspace_paths import resolve_workspace_root
 from .trace import (
     TraceRecorder,
@@ -591,10 +599,13 @@ def _format_progress_event(event: dict[str, object]) -> str | None:
             f"in~{event.get('tokens_in')} max_out={event.get('max_tokens')}"
         )
     if kind == "assistant_step":
+        provider = event.get("openrouter_provider")
+        provider_part = f" provider={provider}" if provider else ""
         line = (
             f"[llm] {agent} step {event.get('step_idx')} done "
             f"in={event.get('tokens_in')} out={event.get('tokens_out')} "
             f"usd={float(event.get('cost_usd') or 0):.6f} stop={event.get('stop_reason')}"
+            f"{provider_part}"
         )
         tool_calls = event.get("tool_calls") or []
         if isinstance(tool_calls, list) and tool_calls:
@@ -650,7 +661,13 @@ def _format_progress_event(event: dict[str, object]) -> str | None:
             f"tokens ({event.get('percent_reduced')}% reduced); full history in trace"
         )
     if kind == "budget_event":
-        return f"[budget] {event.get('budget_reason')}"
+        reason = event.get("budget_reason")
+        details = event.get("details") or {}
+        if reason == "warn_expensive_provider" and isinstance(details, dict):
+            slug = details.get("openrouter_provider")
+            if slug:
+                return f"[budget] {reason} provider={slug} model={details.get('model_id')}"
+        return f"[budget] {reason}"
     if kind == "model_error":
         retry = " retryable" if event.get("retryable") else ""
         return f"[llm] {agent} step {event.get('step_idx')} failed{retry}: {event.get('message')}"
@@ -908,12 +925,12 @@ def _exit_code_for_final_status(status: str | None) -> int:
 
 def _apply_model_overrides(args: argparse.Namespace) -> None:
     if getattr(args, "parent_model", None):
-        config.PARENT_MODEL_ID = args.parent_model
+        config.PARENT_MODEL_ID = normalize_model_id(args.parent_model)
     if getattr(args, "subagent_model", None):
-        config.EXPLORER_MODEL_ID = args.subagent_model
-        config.COMPACTOR_MODEL_ID = args.subagent_model
-
-
+        sub_id = normalize_model_id(args.subagent_model)
+        config.EXPLORER_MODEL_ID = sub_id
+        config.COMPACTOR_MODEL_ID = sub_id
+    _refresh_subagent_model_ids()
 
 
 def _chat_ui_kwargs(
@@ -970,12 +987,16 @@ def _report_parent_session_status(
 
 
 def _guard_overrides(args: argparse.Namespace) -> dict[str, object]:
-    """Per-run budget overrides from the CLI (unset flags fall back to config)."""
+    """Per-run budget overrides from CLI or post-loader config."""
     overrides: dict[str, object] = {}
     if getattr(args, "max_usd", None) is not None:
         overrides["max_usd"] = args.max_usd
+    else:
+        overrides["max_usd"] = config.MAX_USD_PER_RUN
     if getattr(args, "max_tokens", None) is not None:
         overrides["max_tokens"] = args.max_tokens
+    else:
+        overrides["max_tokens"] = config.MAX_TOKENS_PER_RUN
     return overrides
 
 
@@ -1201,7 +1222,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--parent-model")
     parser.add_argument("--subagent-model")
     parser.add_argument("--chat", action="store_true")
-    parser.add_argument("--require-approval", choices=["off", "writes", "all"], default=config.REQUIRE_APPROVAL_DEFAULT)
+    parser.add_argument("--require-approval", choices=["off", "writes", "all"], default=None)
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--no-step-extend-prompt", action="store_true")
     parser.add_argument("--no-redact", action="store_true")
@@ -1211,12 +1232,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-tokens", type=int)
     args = parser.parse_args(argv)
     args.live_model = True
-    _apply_model_overrides(args)
 
     if args.no_redact:
         sys.stderr.write("warning: --no-redact disables trace secret redaction.\n")
 
     root = resolve_workspace_root()
+    apply_runtime_settings(workspace_root=root, cli=args)
+    if args.require_approval is None:
+        args.require_approval = config.REQUIRE_APPROVAL_DEFAULT
+    _apply_model_overrides(args)
+    missing_pricing = validate_configured_models(strict=strict_model_pricing_enabled())
+    if missing_pricing and (args.chat or args.task):
+        sys.stderr.write(format_missing_pricing_warning(missing_pricing) + "\n")
     if args.seed_fixture:
         write_fixture(root)
         print(f"seeded fixture at {root}")

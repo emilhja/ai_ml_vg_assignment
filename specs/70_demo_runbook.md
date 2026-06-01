@@ -54,7 +54,7 @@ docker compose run --rm vg-agent \
   --trace --finops
 ```
 
-**Live chat verification** (see `final_demo_live_chat_script.md` Prompts 3–4):
+**Live chat verification** (see `docs/demo/final_demo_live_chat_script.md` Prompts 3–4):
 
 1. `/review` — **Context engineering** lists compaction for the log read
    (`compactor_model`, `compactor_fallback`, summary snippet).

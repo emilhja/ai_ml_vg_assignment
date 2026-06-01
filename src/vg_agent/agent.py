@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -432,6 +433,16 @@ def _summarize_for_compactor(
         assistant_text=summary,
         tool_calls=[],
         stop_reason=turn.stop_reason,
+        openrouter_provider=turn.openrouter_provider,
+    )
+    _emit_expensive_provider_warning(
+        recorder,
+        guard,
+        openrouter_provider=turn.openrouter_provider,
+        model_id=model_id,
+        step_idx=guard.step_count,
+        agent_id="compactor",
+        cost_usd=cost,
     )
     return summary, False
 
@@ -647,6 +658,55 @@ def _assistant_content(turn: ModelTurn) -> list[dict[str, Any]]:
 
 def _estimate_message_tokens(system_prompt: str, messages: list[dict[str, Any]]) -> int:
     return tools.estimate_tokens(system_prompt + "\n" + json.dumps(messages, sort_keys=True, ensure_ascii=False))
+
+
+def _expensive_openrouter_provider_slugs() -> tuple[str, ...]:
+    raw = os.environ.get("OPENROUTER_EXPENSIVE_PROVIDERS")
+    if raw is not None and str(raw).strip():
+        parts = [part.strip().lower() for part in str(raw).split(",") if part.strip()]
+        if parts:
+            return tuple(parts)
+    return config.EXPENSIVE_OPENROUTER_PROVIDER_SLUGS
+
+
+def _is_expensive_openrouter_provider(slug: str | None) -> bool:
+    if not slug:
+        return False
+    normalized = str(slug).strip().lower()
+    for entry in _expensive_openrouter_provider_slugs():
+        if normalized == entry or normalized.startswith(f"{entry}/"):
+            return True
+    return False
+
+
+def _emit_expensive_provider_warning(
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    *,
+    openrouter_provider: str | None,
+    model_id: str,
+    step_idx: int,
+    agent_id: str,
+    cost_usd: float,
+) -> None:
+    slug = str(openrouter_provider or "").strip()
+    if not slug or not _is_expensive_openrouter_provider(slug):
+        return
+    warn_key = f"warn_expensive_provider:{slug.lower()}"
+    if warn_key in guard.warned:
+        return
+    guard.warned.add(warn_key)
+    recorder.emit(
+        "budget_event",
+        budget_reason="warn_expensive_provider",
+        details={
+            "openrouter_provider": slug,
+            "model_id": model_id,
+            "step_idx": step_idx,
+            "agent_id": agent_id,
+            "cost_usd": cost_usd,
+        },
+    )
 
 
 def _record_budget_abort(recorder: TraceRecorder, guard: BudgetGuard, decision: Any, started: float) -> None:
@@ -1006,6 +1066,16 @@ def _run_live_subagent(
             assistant_text=turn.assistant_text,
             tool_calls=[_tool_call_trace(c) for c in turn.tool_calls],
             stop_reason=turn.stop_reason,
+            openrouter_provider=turn.openrouter_provider,
+        )
+        _emit_expensive_provider_warning(
+            recorder,
+            guard,
+            openrouter_provider=turn.openrouter_provider,
+            model_id=model_id,
+            step_idx=local_step,
+            agent_id=child_id,
+            cost_usd=cost,
         )
         messages.append({"role": "assistant", "content": _assistant_content(turn)})
         if not turn.tool_calls:
@@ -1248,6 +1318,16 @@ def run_live_task(
             assistant_text=turn.assistant_text,
             tool_calls=[_tool_call_trace(call) for call in turn.tool_calls],
             stop_reason=turn.stop_reason,
+            openrouter_provider=turn.openrouter_provider,
+        )
+        _emit_expensive_provider_warning(
+            recorder,
+            guard,
+            openrouter_provider=turn.openrouter_provider,
+            model_id=model_id,
+            step_idx=step_idx,
+            agent_id="parent",
+            cost_usd=cost,
         )
         messages.append({"role": "assistant", "content": _assistant_content(turn)})
         if not turn.tool_calls:

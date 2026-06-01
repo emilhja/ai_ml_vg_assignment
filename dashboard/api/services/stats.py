@@ -11,11 +11,15 @@ from sqlalchemy.orm import Session
 from vg_agent import config as agent_config
 
 from ..config import daily_spend_path
+from ..runtime_config import ensure_runtime_config
 from ..models import ModelCallRow, RunRow, SubagentRow, ToolCallRow, TurnRow
 from ..schemas import (
+    ConfiguredModelItem,
     DailyFinOpsResponse,
     DailySeriesPoint,
     ExpensiveTurnItem,
+    ModelRoleBreakdown,
+    ModelStatsItem,
     PromptLeaderboardItem,
     StatsBreakdownItem,
     StatsResponse,
@@ -24,9 +28,11 @@ from ..schemas import (
     ToolErrorsDrillResponse,
     ToolUsageItem,
 )
+from .session_agent_types import KNOWN_AGENT_TYPES
 
 _PROMPT_SNIPPET_LEN = 120
 _OCCURRENCES_PER_TOOL = 5
+_STALE_MODEL_DAYS = 7
 
 
 def _range_start(range_key: str) -> datetime:
@@ -102,6 +108,226 @@ def _tool_error_occurrence(row: ToolCallRow) -> ToolErrorOccurrence:
     )
 
 
+def _agent_role(agent_id: str | None, subagent_types: dict[str, str]) -> str:
+    aid = (agent_id or "").strip()
+    if not aid or aid == "parent":
+        return "parent"
+    if aid == "compactor":
+        return "compactor"
+    if aid in subagent_types:
+        return subagent_types[aid]
+    if "-" in aid:
+        prefix = aid.split("-", 1)[0]
+        if prefix in KNOWN_AGENT_TYPES:
+            return prefix
+    return aid
+
+
+def _subagent_type_by_child_id(db: Session) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for row in db.scalars(select(SubagentRow)).all():
+        agent_type = (row.agent_type or "").strip()
+        if not agent_type or not row.subagent_id:
+            continue
+        if ":" in row.subagent_id:
+            child_id = row.subagent_id.rsplit(":", 1)[-1]
+            mapping[child_id] = agent_type
+    return mapping
+
+
+def _model_pricing(model_id: str) -> tuple[float | None, float | None]:
+    entry = agent_config.PRICING_USD_PER_MTOK.get(model_id)
+    if not entry:
+        return None, None
+    return float(entry.get("input", 0)), float(entry.get("output", 0))
+
+
+def _configured_role_map() -> dict[str, list[str]]:
+    role_models: list[tuple[str, str]] = [
+        ("parent", agent_config.PARENT_MODEL_ID),
+        ("grilling", agent_config.GRILLING_MODEL_ID),
+        ("explorer", agent_config.EXPLORER_MODEL_ID),
+        ("coder", agent_config.CODER_MODEL_ID),
+        ("reviewer", agent_config.REVIEWER_MODEL_ID),
+        ("compactor", agent_config.COMPACTOR_MODEL_ID),
+    ]
+    by_model: dict[str, list[str]] = {}
+    for role, model_id in role_models:
+        by_model.setdefault(model_id, []).append(role)
+    return by_model
+
+
+def _build_configured_models() -> list[ConfiguredModelItem]:
+    items: list[ConfiguredModelItem] = []
+    for role, model_id in [
+        ("parent", agent_config.PARENT_MODEL_ID),
+        ("grilling", agent_config.GRILLING_MODEL_ID),
+        ("explorer", agent_config.EXPLORER_MODEL_ID),
+        ("coder", agent_config.CODER_MODEL_ID),
+        ("reviewer", agent_config.REVIEWER_MODEL_ID),
+        ("compactor", agent_config.COMPACTOR_MODEL_ID),
+    ]:
+        price_in, price_out = _model_pricing(model_id)
+        items.append(
+            ConfiguredModelItem(
+                role=role,
+                model_id=model_id,
+                price_input_per_mtok=price_in,
+                price_output_per_mtok=price_out,
+                has_known_pricing=price_in is not None and price_out is not None,
+            )
+        )
+    return items
+
+
+def _max_ts(a: str | None, b: str | None) -> str | None:
+    if not a:
+        return b
+    if not b:
+        return a
+    return a if a >= b else b
+
+
+def _avg_latency(latencies: list[int]) -> float | None:
+    if not latencies:
+        return None
+    return round(sum(latencies) / len(latencies), 1)
+
+
+def _accumulate_model_stats(
+    model_rows: list[ModelCallRow],
+    start: datetime,
+    subagent_types: dict[str, str],
+) -> tuple[list[ModelStatsItem], list[StatsBreakdownItem]]:
+    configured_by_model = _configured_role_map()
+    last_used_all_time: dict[str, str | None] = {}
+    range_buckets: dict[str, dict[str, object]] = {}
+    all_time_models: set[str] = set()
+
+    for row in model_rows:
+        model_id = row.model_id or "unknown"
+        all_time_models.add(model_id)
+        last_used_all_time[model_id] = _max_ts(last_used_all_time.get(model_id), row.started_at)
+
+        if not _in_range(row.started_at, start):
+            continue
+
+        role = _agent_role(row.agent_id, subagent_types)
+        bucket = range_buckets.setdefault(
+            model_id,
+            {
+                "call_count": 0,
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "cost_usd": 0.0,
+                "error_count": 0,
+                "latencies": [],
+                "last_used_at": None,
+                "sample_session_id": None,
+                "roles": {},
+            },
+        )
+        bucket["call_count"] = int(bucket["call_count"]) + 1
+        bucket["tokens_in"] = int(bucket["tokens_in"]) + int(row.tokens_in or 0)
+        bucket["tokens_out"] = int(bucket["tokens_out"]) + int(row.tokens_out or 0)
+        bucket["cost_usd"] = float(bucket["cost_usd"]) + float(row.cost_usd or 0.0)
+        if row.status not in {None, "ok"}:
+            bucket["error_count"] = int(bucket["error_count"]) + 1
+        if row.latency_ms is not None:
+            cast_latencies = bucket["latencies"]
+            assert isinstance(cast_latencies, list)
+            cast_latencies.append(int(row.latency_ms))
+        prev_last = str(bucket["last_used_at"]) if bucket["last_used_at"] else None
+        bucket["last_used_at"] = _max_ts(prev_last, row.started_at)
+        if row.started_at and (prev_last is None or (row.started_at or "") >= prev_last):
+            bucket["sample_session_id"] = row.session_id
+
+        roles = bucket["roles"]
+        assert isinstance(roles, dict)
+        role_bucket = roles.setdefault(
+            role,
+            {"call_count": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "latencies": []},
+        )
+        role_bucket["call_count"] = int(role_bucket["call_count"]) + 1
+        role_bucket["tokens_in"] = int(role_bucket["tokens_in"]) + int(row.tokens_in or 0)
+        role_bucket["tokens_out"] = int(role_bucket["tokens_out"]) + int(row.tokens_out or 0)
+        role_bucket["cost_usd"] = float(role_bucket["cost_usd"]) + float(row.cost_usd or 0.0)
+        if row.latency_ms is not None:
+            cast_role_lat = role_bucket["latencies"]
+            assert isinstance(cast_role_lat, list)
+            cast_role_lat.append(int(row.latency_ms))
+
+    by_agent_role: dict[str, StatsBreakdownItem] = {}
+    for model_id, bucket in range_buckets.items():
+        roles = bucket["roles"]
+        assert isinstance(roles, dict)
+        for role, role_bucket in roles.items():
+            item = by_agent_role.setdefault(role, StatsBreakdownItem(label=role))
+            item.count += int(role_bucket["call_count"])
+            item.tokens += int(role_bucket["tokens_in"]) + int(role_bucket["tokens_out"])
+            item.cost_usd += float(role_bucket["cost_usd"])
+
+    models_in_range: list[ModelStatsItem] = []
+    for model_id, bucket in range_buckets.items():
+        price_in, price_out = _model_pricing(model_id)
+        roles = bucket["roles"]
+        assert isinstance(roles, dict)
+        by_role = [
+            ModelRoleBreakdown(
+                agent_role=role,
+                call_count=int(rb["call_count"]),
+                tokens_in=int(rb["tokens_in"]),
+                tokens_out=int(rb["tokens_out"]),
+                cost_usd=round(float(rb["cost_usd"]), 6),
+                avg_latency_ms=_avg_latency(rb["latencies"]),
+            )
+            for role, rb in sorted(roles.items(), key=lambda x: -float(x[1]["cost_usd"]))
+        ]
+        latencies = bucket["latencies"]
+        assert isinstance(latencies, list)
+        models_in_range.append(
+            ModelStatsItem(
+                model_id=model_id,
+                call_count=int(bucket["call_count"]),
+                tokens_in=int(bucket["tokens_in"]),
+                tokens_out=int(bucket["tokens_out"]),
+                cost_usd=round(float(bucket["cost_usd"]), 6),
+                avg_latency_ms=_avg_latency(latencies),
+                last_used_at=str(bucket["last_used_at"]) if bucket["last_used_at"] else None,
+                last_used_at_all_time=last_used_all_time.get(model_id),
+                active_in_range=True,
+                price_input_per_mtok=price_in,
+                price_output_per_mtok=price_out,
+                configured_roles=configured_by_model.get(model_id, []),
+                by_role=by_role,
+                sample_session_id=str(bucket["sample_session_id"])
+                if bucket.get("sample_session_id")
+                else None,
+                error_count=int(bucket["error_count"]),
+            )
+        )
+
+    for model_id in all_time_models:
+        if model_id in range_buckets:
+            continue
+        price_in, price_out = _model_pricing(model_id)
+        models_in_range.append(
+            ModelStatsItem(
+                model_id=model_id,
+                call_count=0,
+                active_in_range=False,
+                last_used_at=None,
+                last_used_at_all_time=last_used_all_time.get(model_id),
+                price_input_per_mtok=price_in,
+                price_output_per_mtok=price_out,
+                configured_roles=configured_by_model.get(model_id, []),
+            )
+        )
+
+    models_in_range.sort(key=lambda m: (-m.cost_usd, m.last_used_at_all_time or ""))
+    return models_in_range, sorted(by_agent_role.values(), key=lambda p: -p.cost_usd)
+
+
 def _failed_tool_rows(db: Session, start: datetime) -> list[ToolCallRow]:
     rows = db.scalars(select(ToolCallRow).where(ToolCallRow.status != "ok")).all()
     return [r for r in rows if _in_range(r.started_at, start)]
@@ -129,14 +355,19 @@ def compute_tool_errors_drill(
 
 
 def compute_stats(db: Session, range_key: str) -> StatsResponse:
+    ensure_runtime_config()
     start = _range_start(range_key)
     runs = db.scalars(select(RunRow)).all()
     filtered_runs = [r for r in runs if _in_range(r.started_at, start)]
 
     total_tokens = sum(int(r.total_tokens or 0) for r in filtered_runs)
     total_cost = sum(float(r.total_cost_usd or 0.0) for r in filtered_runs)
-    turns = db.scalars(select(TurnRow)).all()
-    filtered_turns = [t for t in turns if t.started_at is not None and _in_range(t.started_at, start)]
+    turns = db.scalars(select(TurnRow).where(TurnRow.turn_id.isnot(None))).all()
+    filtered_turns = [
+        t
+        for t in turns
+        if t is not None and t.started_at is not None and _in_range(t.started_at, start)
+    ]
     errors = sum(1 for t in filtered_turns if t.status not in {None, "ok", "running"})
     error_rate = (errors / len(filtered_turns)) if filtered_turns else 0.0
 
@@ -149,6 +380,10 @@ def compute_stats(db: Session, range_key: str) -> StatsResponse:
         point.cost_usd += float(run.total_cost_usd or 0.0)
 
     model_rows = db.scalars(select(ModelCallRow)).all()
+    subagent_types = _subagent_type_by_child_id(db)
+    models, by_agent_role = _accumulate_model_stats(model_rows, start, subagent_types)
+    configured_models = _build_configured_models()
+
     by_model: dict[str, StatsBreakdownItem] = {}
     for row in model_rows:
         if not _in_range(row.started_at, start):
@@ -259,7 +494,10 @@ def compute_stats(db: Session, range_key: str) -> StatsResponse:
         error_rate=round(error_rate, 4),
         by_day=sorted(by_day.values(), key=lambda p: p.date),
         by_agent_type=sorted(by_agent.values(), key=lambda p: -p.tokens)[:20],
+        by_agent_role=by_agent_role[:20],
         by_model=sorted(by_model.values(), key=lambda p: -p.cost_usd)[:20],
+        models=models,
+        configured_models=configured_models,
         tool_errors=sorted(tool_errors.values(), key=lambda p: -p.count)[:20],
         by_tool=by_tool,
         top_user_prompts=top_user_prompts,
@@ -270,6 +508,7 @@ def compute_stats(db: Session, range_key: str) -> StatsResponse:
 
 
 def daily_finops() -> DailyFinOpsResponse:
+    ensure_runtime_config()
     path = daily_spend_path()
     history: dict[str, float] = {}
     if path.is_file():

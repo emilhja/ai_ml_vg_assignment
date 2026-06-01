@@ -240,7 +240,18 @@ Quick checks:
 - http://127.0.0.1:8787/api/v1/health — `schema_ready: true`, non-empty `traces_dirs`
 - http://127.0.0.1:8787/api/v1/sessions?limit=5 — `total` should be &gt; 0 if you have JSONL traces
 
-See [`dev_docs/dangerous_cli.md`](dev_docs/dangerous_cli.md) for the *why*
+## Documentation
+
+| Topic | Path |
+|-------|------|
+| Architecture | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
+| Pricing / models | [`docs/PRICE.md`](docs/PRICE.md), [`MODEL_CONFIG.md`](MODEL_CONFIG.md) |
+| Live demo script | [`docs/demo/final_demo_live_chat_script.md`](docs/demo/final_demo_live_chat_script.md) |
+| Demo review notes | [`docs/demo/demo_review.md`](docs/demo/demo_review.md) |
+| Command safety | [`docs/dev/dangerous_cli.md`](docs/dev/dangerous_cli.md) |
+| Grading background | [`docs/background/`](docs/background/) |
+
+See [`docs/dev/dangerous_cli.md`](docs/dev/dangerous_cli.md) for the *why*
 behind every command, argument token, and path on the deny-list.
 
 Docker Compose is the canonical demo wrapper. The `vg-agent` service is the only

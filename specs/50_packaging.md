@@ -64,12 +64,12 @@ packaged configuration surface is the TOML schema below:
 
 ```toml
 [models]
-parent = "openrouter/google/gemini-2.0-flash-001"
-grilling = "openrouter/google/gemini-2.0-flash-001"
-explorer = "openrouter/google/gemini-2.0-flash-001"
-coder = "openrouter/google/gemini-2.0-flash-001"
-reviewer = "openrouter/google/gemini-2.0-flash-001"
-compactor = "openrouter/google/gemini-2.0-flash-001"
+parent = "openrouter/google/gemini-2.5-flash"
+grilling = "openrouter/google/gemini-2.5-flash"
+explorer = "openrouter/google/gemini-2.5-flash"
+coder = "openrouter/google/gemini-2.5-flash"
+reviewer = "openrouter/google/gemini-2.5-flash"
+compactor = "openrouter/google/gemini-2.5-flash"
 
 [budget]
 max_usd_per_run = 0.50
@@ -90,6 +90,33 @@ Loader precedence (highest wins):
 Secrets never appear in `config.toml`. The config loader rejects keys
 matching `*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD` with a parse error.
 
+### Loader behaviour (`runtime_settings.py`)
+
+On every `vg-agent` startup (after `argparse`, before the agent loop):
+
+1. Resolve `workspace_root` via `VG_WORKSPACE_ROOT` (default `workspace`).
+2. Resolve `repo_root`: parent of `workspace_root` when `pyproject.toml` exists
+   there, else `Path.cwd()`.
+3. Load `repo_root/.env` with `python-dotenv` (`override=False` so Docker /
+   shell exports win).
+4. Apply `workspace_root/config.toml` when present.
+5. Apply `VG_*` environment variables (see `.env.example`).
+6. Apply CLI flags last (`--parent-model`, `--subagent-model`, `--max-usd`, …).
+
+Model IDs: values without an `openrouter/` prefix are normalized by prepending
+`openrouter/` (e.g. `google/gemini-2.5-flash-lite` →
+`openrouter/google/gemini-2.5-flash-lite`).
+
+Optional compaction override: `VG_K_COMPACT` (integer token-estimate threshold
+for parent tool-result compaction; default from `specs/30_runtime_governance.md`).
+
+`--require-approval` defaults to `None` at parse time; after the loader runs,
+unset CLI uses `config.REQUIRE_APPROVAL_DEFAULT` (which env/TOML may have set).
+
+Budget caps from env/TOML mutate `config.MAX_*`; `BudgetGuard` receives explicit
+`max_usd` / `max_tokens` from `_guard_overrides` so dataclass defaults are not
+stale.
+
 ## .env.example
 
 ```ini
@@ -100,17 +127,28 @@ OPENROUTER_API_KEY=
 OPENROUTER_SITE_URL=
 OPENROUTER_APP_NAME=
 
+# Optional OpenRouter provider routing (provider-selection guide on openrouter.ai).
+# OPENROUTER_PROVIDER_ORDER=
+# OPENROUTER_PROVIDER_ONLY=
+OPENROUTER_PROVIDER_ONLY_DEEPSEEK=baidu/fp8,deepinfra/fp4
+# OPENROUTER_PROVIDER_SORT=price
+# OPENROUTER_PROVIDER_ALLOW_FALLBACKS=true
+OPENROUTER_EXPENSIVE_PROVIDERS=alibaba,morph,parasail/fp8
+
 # Optional overrides (see config.toml for the same keys).
-VG_PARENT_MODEL=openrouter/google/gemini-2.0-flash-001
-VG_GRILLING_MODEL=openrouter/google/gemini-2.0-flash-001
-VG_EXPLORER_MODEL=openrouter/google/gemini-2.0-flash-001
-VG_CODER_MODEL=openrouter/google/gemini-2.0-flash-001
-VG_REVIEWER_MODEL=openrouter/google/gemini-2.0-flash-001
-VG_COMPACTOR_MODEL=openrouter/google/gemini-2.0-flash-001
+VG_PARENT_MODEL=openrouter/google/gemini-2.5-flash
+VG_GRILLING_MODEL=openrouter/google/gemini-2.5-flash
+VG_EXPLORER_MODEL=openrouter/google/gemini-2.5-flash
+VG_CODER_MODEL=openrouter/google/gemini-2.5-flash
+VG_REVIEWER_MODEL=openrouter/google/gemini-2.5-flash
+VG_COMPACTOR_MODEL=openrouter/google/gemini-2.5-flash
 VG_MAX_USD_PER_RUN=0.50
 VG_MAX_USD_PER_DAY=5.00
 VG_MAX_TOKENS_PER_RUN=80000
 VG_APPROVAL_MODE=writes
+VG_K_COMPACT=4000
+# Exit at startup if any VG_*_MODEL lacks PRICING_USD_PER_MTOK (default: warn only).
+# VG_STRICT_MODEL_PRICING=1
 ```
 
 - `.env` is optional at Compose-parse time so `docker compose config` works
@@ -146,8 +184,27 @@ setup beyond copying `.env.example` to `.env` and filling in
 - `docker compose config` exits 0 (compose file parses).
 - `Dockerfile` builds in CI if `DOCKER_AVAILABLE=1`; otherwise the test is
   skipped with an explicit reason (no silent skips).
-- `.env.example` enumerates every variable the agent reads via
-  `os.environ.get`.
+- `.env.example` enumerates every `VG_*` variable in `KNOWN_ENV_VARS` (plus
+  `OPENROUTER_*` keys read directly by the live client).
+
+### OpenRouter provider routing (optional)
+
+The live client may read these environment variables and pass a `provider`
+object to OpenRouter via LiteLLM `extra_body` (see OpenRouter provider-selection
+docs). Slugs must match the model's Providers tab (e.g. `alibaba` for Qwen).
+
+| Variable | Purpose |
+| --- | --- |
+| `OPENROUTER_PROVIDER_ORDER` | Comma-separated slugs to try first (`order`) |
+| `OPENROUTER_PROVIDER_ONLY` | Comma-separated whitelist (`only`) for all models |
+| `OPENROUTER_PROVIDER_ONLY_DEEPSEEK` | `only` whitelist applied **only** when `model_id` contains `/deepseek/` |
+| `OPENROUTER_PROVIDER_SORT` | `price`, `throughput`, or `latency` |
+| `OPENROUTER_PROVIDER_ALLOW_FALLBACKS` | `true` or `false`; default `true` when unset |
+| `OPENROUTER_EXPENSIVE_PROVIDERS` | Comma-separated denylist; triggers `warn_expensive_provider` once per slug per run (default `alibaba,morph,parasail/fp8`) |
+
+For a **DeepSeek parent/coder + Gemini sub-agent** stack, use
+`OPENROUTER_PROVIDER_ONLY_DEEPSEEK` and leave global `OPENROUTER_PROVIDER_ORDER`
+unset so Gemini keeps default OpenRouter routing.
 - `config.example.toml` enumerates every accepted non-secret config key.
 - Real `.env` is gitignored: `git check-ignore .env` exits 0 in a fresh
   checkout.

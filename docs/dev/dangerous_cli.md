@@ -130,7 +130,7 @@ workspace root does not let the agent write `.env`.
 
 Persistence (`.vg_approvals.json`, `--save-approvals`, `--reset-approvals`)
 is documented here but not yet implemented; it is on the future-work list in
-`next_steps.md`.
+`docs/notes/next_steps.md`.
 
 ## 7. When validation can be relaxed
 

@@ -125,6 +125,9 @@ safety, cost control.
   in prose but executable selection must use LiteLLM OpenRouter IDs such as
   `openrouter/anthropic/claude-haiku-4.5`. The doc notes the current
   verification date; update it when re-verifying.
+- **Changing `VG_*_MODEL` requires pricing in `MODEL_CONFIG.md`.** Add
+  per-Mtok constants and regenerate, or startup warns (see `docs/PRICE.md` checklist);
+  optional `VG_STRICT_MODEL_PRICING=1` exits instead of warning.
 - **Windows / Git Bash environment.** This repo is developed on Windows;
   demo scripts are `.ps1`. The `run_bash` tool still shells out via
   `bash -c` and normalizes paths at tool boundaries.

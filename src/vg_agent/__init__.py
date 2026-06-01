@@ -1,5 +1,5 @@
 """Generated VG agent runtime."""
 
-SPEC_DIGEST = "5fd4adc3ffa54bd170edc9d614c27ec7d673635891a89d4502308aa9ec56b54c"
+SPEC_DIGEST = "0b251029173d03bd6f73ac3b2cee483b147a9dd7a069f912c18a17a44fbfb1dd"
 
 __all__ = ["SPEC_DIGEST"]

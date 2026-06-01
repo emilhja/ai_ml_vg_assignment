@@ -139,13 +139,25 @@ def render_tree(events: list[dict[str, object]]) -> str:
         if kind == "llm_start":
             lines.append(f"{prefix}{event['event_idx']:03d} {event['agent_id']} llm_start step {event.get('step_idx')} model={event.get('model')}")
         elif kind == "assistant_step":
-            lines.append(f"{prefix}{event['event_idx']:03d} {event['agent_id']} assistant step {event.get('step_idx')} model={event.get('model')}")
+            provider = event.get("openrouter_provider")
+            provider_suffix = f" provider={provider}" if provider else ""
+            lines.append(
+                f"{prefix}{event['event_idx']:03d} {event['agent_id']} assistant step "
+                f"{event.get('step_idx')} model={event.get('model')}{provider_suffix}"
+            )
         elif kind == "tool_result":
             lines.append(f"{prefix}{event['event_idx']:03d} {event['agent_id']} tool_result {event.get('tool')} tokens={event.get('tokens')} status={event.get('status')}")
         elif kind == "compaction":
             lines.append(f"{prefix}{event['event_idx']:03d} compacted {event.get('before_tokens')} -> {event.get('after_tokens')} tokens (tool_use {event.get('tool_use_id')})")
         elif kind == "budget_event":
-            lines.append(f"{prefix}{event['event_idx']:03d} budget_event {event.get('budget_reason')}")
+            reason = event.get("budget_reason")
+            details = event.get("details") or {}
+            extra = ""
+            if reason == "warn_expensive_provider" and isinstance(details, dict):
+                slug = details.get("openrouter_provider")
+                if slug:
+                    extra = f" provider={slug}"
+            lines.append(f"{prefix}{event['event_idx']:03d} budget_event {reason}{extra}")
         elif kind == "approval":
             lines.append(f"{prefix}{event['event_idx']:03d} approval {event.get('tool')} decision={event.get('decision')} scope={event.get('scope_key')}")
         elif kind == "model_error":

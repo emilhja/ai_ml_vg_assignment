@@ -1,8 +1,8 @@
 ﻿from pathlib import Path
 import re
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[2]
 text = (ROOT / "scripts" / "generate_project.py").read_text(encoding="utf-8")
-src = (ROOT / "_patch_all.py").read_text(encoding="utf-8")
+src = (Path(__file__).resolve().parent / "_patch_all.py").read_text(encoding="utf-8")
 
 def extract(name):
     key = f"{name} = '''"

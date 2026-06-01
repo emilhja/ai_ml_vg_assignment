@@ -16,7 +16,8 @@ These files are human-/agent-edited sources of truth:
 - `scripts/generate_project.py` — generated-code templates.
 - Top-level packaging/docs that are not generated: `Dockerfile`,
   `docker-compose.yml`, `.env.example`, `config.example.toml`, `README.md`,
-  `ARCHITECTURE.md`, and `dev_docs/*.md`.
+  and human-authored files under `docs/` (for example `docs/ARCHITECTURE.md`,
+  `docs/PRICE.md`, `docs/dev/*.md`, `docs/demo/*.md`).
 
 ## Generated artifacts
 

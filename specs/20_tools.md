@@ -2,7 +2,7 @@
 
 Tool schemas are stable, traceable, and Windows-aware. Detailed authoring
 guidance for the safety rules below — *why* each token or pattern is rejected —
-lives in `dev_docs/dangerous_cli.md`.
+lives in `docs/dev/dangerous_cli.md`.
 
 Common result fields:
 

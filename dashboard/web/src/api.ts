@@ -180,6 +180,41 @@ export type ToolErrorGroup = {
   occurrences: ToolErrorOccurrence[];
 };
 
+export type ModelRoleBreakdown = {
+  agent_role: string;
+  call_count: number;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd: number;
+  avg_latency_ms: number | null;
+};
+
+export type ModelStatsItem = {
+  model_id: string;
+  call_count: number;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd: number;
+  avg_latency_ms: number | null;
+  last_used_at: string | null;
+  last_used_at_all_time: string | null;
+  active_in_range: boolean;
+  price_input_per_mtok: number | null;
+  price_output_per_mtok: number | null;
+  configured_roles: string[];
+  by_role: ModelRoleBreakdown[];
+  sample_session_id: string | null;
+  error_count: number;
+};
+
+export type ConfiguredModelItem = {
+  role: string;
+  model_id: string;
+  price_input_per_mtok: number | null;
+  price_output_per_mtok: number | null;
+  has_known_pricing: boolean;
+};
+
 export type StatsResponse = {
   range: string;
   total_runs: number;
@@ -189,7 +224,10 @@ export type StatsResponse = {
   error_rate: number;
   by_day: { date: string; tokens: number; cost_usd: number; runs: number }[];
   by_agent_type: { label: string; tokens: number; cost_usd: number; count: number }[];
+  by_agent_role: { label: string; tokens: number; cost_usd: number; count: number }[];
   by_model: { label: string; tokens: number; cost_usd: number; count: number }[];
+  models: ModelStatsItem[];
+  configured_models: ConfiguredModelItem[];
   tool_errors: { label: string; count: number }[];
   by_tool: ToolUsageItem[];
   top_user_prompts: PromptLeaderboardItem[];

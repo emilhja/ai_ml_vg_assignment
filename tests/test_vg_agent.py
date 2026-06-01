@@ -1969,6 +1969,67 @@ def test_chat_ui_running_state(tmp_path: Path) -> None:
     assert "\u2026" in line
 
 
+QWEN_CODER_MODEL_ID = "openrouter/qwen/qwen3-coder-30b-a3b-instruct"
+
+
+def test_qwen_pricing_preflight_not_unknown_fallback() -> None:
+    guard = BudgetGuard()
+    cost = guard.estimate_cost(QWEN_CODER_MODEL_ID, 512, 4096)
+    assert cost == pytest.approx(0.00114176, rel=1e-6)
+    unknown = guard.estimate_cost("openrouter/unknown/example-model", 512, 4096)
+    assert unknown > 0.5
+    assert cost < 0.01
+
+
+UNPRICED_MODEL_ID = "openrouter/example/unpriced-model"
+
+
+def test_unpriced_model_statusline_no_next_dollar_estimate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vg_agent import chat_ui
+    from vg_agent.chat_ui import build_session_status, build_status_bar_text
+
+    monkeypatch.setattr(chat_ui, "use_emoji", lambda: True)
+    recorder = TraceRecorder(tmp_path)
+    guard = BudgetGuard(max_steps=15, max_tokens=80_000, max_usd=0.0001)
+    recorder.emit("llm_start", model=UNPRICED_MODEL_ID, step_idx=0, tokens_in=0)
+    status = build_session_status(
+        root=tmp_path, recorder=recorder, guard=guard, live_model=True
+    )
+    assert not status.model_priced
+    assert not status.usd_would_exceed
+    assert status.usd_projected is None
+    bar = build_status_bar_text(
+        root=tmp_path, recorder=recorder, guard=guard, live_model=True
+    )
+    assert "(next ~$" not in bar
+    assert "(unpriced model)" in bar
+
+
+def test_qwen_statusline_no_false_usd_cap_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vg_agent import chat_ui
+    from vg_agent.chat_ui import build_session_status, build_status_bar_text
+
+    monkeypatch.setattr(chat_ui, "use_emoji", lambda: True)
+    recorder = TraceRecorder(tmp_path)
+    guard = BudgetGuard(max_steps=15, max_tokens=80_000, max_usd=0.50)
+    recorder.emit("llm_start", model=QWEN_CODER_MODEL_ID, step_idx=0, tokens_in=0)
+    status = build_session_status(
+        root=tmp_path, recorder=recorder, guard=guard, live_model=True
+    )
+    assert not status.usd_would_exceed
+    assert status.usd_projected is not None
+    assert status.usd_projected < status.max_usd
+    bar = build_status_bar_text(
+        root=tmp_path, recorder=recorder, guard=guard, live_model=True
+    )
+    assert "(next ~$" not in bar
+    assert "\u26a0" not in bar
+
+
 def test_chat_ui_budget_warning_icon_when_next_step_exceeds_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1,13 +1,13 @@
 """Generated runtime constants from MODEL_CONFIG.md."""
 
-SPEC_DIGEST = "5fd4adc3ffa54bd170edc9d614c27ec7d673635891a89d4502308aa9ec56b54c"
+SPEC_DIGEST = "0b251029173d03bd6f73ac3b2cee483b147a9dd7a069f912c18a17a44fbfb1dd"
 
-PARENT_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
-GRILLING_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
-EXPLORER_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
-CODER_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
-REVIEWER_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
-COMPACTOR_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
+PARENT_MODEL_ID = "openrouter/google/gemini-2.5-flash"
+GRILLING_MODEL_ID = "openrouter/google/gemini-2.5-flash"
+EXPLORER_MODEL_ID = "openrouter/google/gemini-2.5-flash"
+CODER_MODEL_ID = "openrouter/google/gemini-2.5-flash"
+REVIEWER_MODEL_ID = "openrouter/google/gemini-2.5-flash"
+COMPACTOR_MODEL_ID = "openrouter/google/gemini-2.5-flash"
 
 SUBAGENT_MODEL_IDS = {
     "grilling": GRILLING_MODEL_ID,
@@ -19,22 +19,32 @@ SUBAGENT_MODEL_IDS = {
 PRICING_USD_PER_MTOK = {
     "openrouter/google/gemini-2.0-flash-001": {"input": 0.10, "output": 0.40},
     "openrouter/google/gemini-2.5-flash": {"input": 0.10, "output": 0.40},
+    "openrouter/google/gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
     "openrouter/anthropic/claude-haiku-4.5": {"input": 1.00, "output": 5.00},
     "openrouter/anthropic/claude-sonnet-4.6": {"input": 3.00, "output": 15.00},
+    "openrouter/qwen/qwen3-coder-30b-a3b-instruct": {"input": 0.07, "output": 0.27},
+    "openrouter/deepseek/deepseek-v4-flash": {"input": 0.0983, "output": 0.1966},
 }
 UNKNOWN_MODEL_ESTIMATE_USD_PER_MTOK = {"input": 30.00, "output": 120.00}
+EXPENSIVE_OPENROUTER_PROVIDER_SLUGS = ('alibaba', 'morph', 'parasail/fp8')
 
 CONTEXT_WINDOW_TOKENS = {
     "openrouter/google/gemini-2.0-flash-001": 1000000,
     "openrouter/google/gemini-2.5-flash": 1048576,
+    "openrouter/google/gemini-2.5-flash-lite": 1048576,
     "openrouter/anthropic/claude-haiku-4.5": 200000,
     "openrouter/anthropic/claude-sonnet-4.6": 200000,
+    "openrouter/qwen/qwen3-coder-30b-a3b-instruct": 160000,
+    "openrouter/deepseek/deepseek-v4-flash": 1048576,
 }
 AUTO_COMPACT_FRACTION = {
     "openrouter/google/gemini-2.0-flash-001": 0.80,
     "openrouter/google/gemini-2.5-flash": 0.80,
+    "openrouter/google/gemini-2.5-flash-lite": 0.80,
     "openrouter/anthropic/claude-haiku-4.5": 0.80,
     "openrouter/anthropic/claude-sonnet-4.6": 0.80,
+    "openrouter/qwen/qwen3-coder-30b-a3b-instruct": 0.80,
+    "openrouter/deepseek/deepseek-v4-flash": 0.80,
 }
 DEFAULT_CONTEXT_WINDOW = 128_000
 DEFAULT_COMPACT_FRACTION = 0.80

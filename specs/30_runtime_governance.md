@@ -56,7 +56,12 @@ Budget events:
 
 - `budget_reason` enum: `step_cap`, `token_cap`, `usd_cap`, `daily_cap`,
   `repetition_abort`, `timeout`, `user_abort`, `user_config`, `parallel_aborted`,
-  `warn_usd`, `warn_tokens`, `warn_steps`.
+  `warn_usd`, `warn_tokens`, `warn_steps`, `warn_expensive_provider`.
+- `warn_expensive_provider` is emitted **once per expensive OpenRouter slug per
+  run** when `assistant_step` records `openrouter_provider` matching the denylist
+  (`OPENROUTER_EXPENSIVE_PROVIDERS` or generated defaults). Does not abort.
+  Details include `openrouter_provider`, `model_id`, `step_idx`, `agent_id`,
+  `cost_usd`.
 - `warn_*` reasons are emitted **once** when their respective fraction is
   first crossed; they do not abort the run.
 - **Proactive step extend** (`step_extend`): when interactive approval is
@@ -74,6 +79,16 @@ Budget events:
   otherwise compute cost from the local pricing table for known configured
   models. Unknown live model pricing fails closed unless explicit cost is
   returned.
+- **Configured-model pricing check** (after `.env` / `config.toml` / CLI
+  model overrides): every role model id (`PARENT_MODEL_ID`, sub-agents,
+  `COMPACTOR_MODEL_ID`) should appear in `PRICING_USD_PER_MTOK` from
+  `MODEL_CONFIG.md`. If any are missing, emit a **stderr warning** on live
+  startup (`--chat` / `--task`) listing the ids and pointing to `docs/PRICE.md`.
+  When `VG_STRICT_MODEL_PRICING=1`, exit code `2` instead of continuing.
+- Preflight `usd_cap` still uses the conservative unknown-model estimate for
+  unpriced configured models (budget protection). The chat statusline must
+  **not** show `(next ~$…)` or red cap styling from that estimate when the
+  parent model is unpriced; see `specs/16_chat_ui.md`.
 
 Tool-result compaction events (`kind: compaction`):
 

@@ -34,10 +34,17 @@ def read_config() -> dict[str, str]:
         "GEMINI_2_0_FLASH_OUTPUT_PER_MTOK",
         "GEMINI_2_5_FLASH_INPUT_PER_MTOK",
         "GEMINI_2_5_FLASH_OUTPUT_PER_MTOK",
+        "GEMINI_2_5_FLASH_LITE_INPUT_PER_MTOK",
+        "GEMINI_2_5_FLASH_LITE_OUTPUT_PER_MTOK",
         "CLAUDE_SONNET_4_6_INPUT_PER_MTOK",
         "CLAUDE_SONNET_4_6_OUTPUT_PER_MTOK",
         "CLAUDE_HAIKU_4_5_INPUT_PER_MTOK",
         "CLAUDE_HAIKU_4_5_OUTPUT_PER_MTOK",
+        "QWEN3_CODER_30B_INPUT_PER_MTOK",
+        "QWEN3_CODER_30B_OUTPUT_PER_MTOK",
+        "DEEPSEEK_V4_FLASH_INPUT_PER_MTOK",
+        "DEEPSEEK_V4_FLASH_OUTPUT_PER_MTOK",
+        "EXPENSIVE_OPENROUTER_PROVIDER_SLUGS",
         "UNKNOWN_MODEL_INPUT_ESTIMATE_PER_MTOK",
         "UNKNOWN_MODEL_OUTPUT_ESTIMATE_PER_MTOK",
         "OPENROUTER_ENDPOINT_HOST",
@@ -58,10 +65,16 @@ def read_context_windows() -> dict[str, str]:
         "GEMINI_2_0_FLASH_COMPACT_FRACTION",
         "GEMINI_2_5_FLASH_CONTEXT_WINDOW",
         "GEMINI_2_5_FLASH_COMPACT_FRACTION",
+        "GEMINI_2_5_FLASH_LITE_CONTEXT_WINDOW",
+        "GEMINI_2_5_FLASH_LITE_COMPACT_FRACTION",
         "CLAUDE_HAIKU_4_5_CONTEXT_WINDOW",
         "CLAUDE_HAIKU_4_5_COMPACT_FRACTION",
         "CLAUDE_SONNET_4_6_CONTEXT_WINDOW",
         "CLAUDE_SONNET_4_6_COMPACT_FRACTION",
+        "QWEN3_CODER_30B_CONTEXT_WINDOW",
+        "QWEN3_CODER_30B_COMPACT_FRACTION",
+        "DEEPSEEK_V4_FLASH_CONTEXT_WINDOW",
+        "DEEPSEEK_V4_FLASH_COMPACT_FRACTION",
     ]
     values: dict[str, str] = {}
     for key in keys:
@@ -145,22 +158,32 @@ SUBAGENT_MODEL_IDS = {
 PRICING_USD_PER_MTOK = {
     "openrouter/google/gemini-2.0-flash-001": {"input": __GEMINI_2_0_FLASH_INPUT_PER_MTOK__, "output": __GEMINI_2_0_FLASH_OUTPUT_PER_MTOK__},
     "openrouter/google/gemini-2.5-flash": {"input": __GEMINI_2_5_FLASH_INPUT_PER_MTOK__, "output": __GEMINI_2_5_FLASH_OUTPUT_PER_MTOK__},
+    "openrouter/google/gemini-2.5-flash-lite": {"input": __GEMINI_2_5_FLASH_LITE_INPUT_PER_MTOK__, "output": __GEMINI_2_5_FLASH_LITE_OUTPUT_PER_MTOK__},
     "openrouter/anthropic/claude-haiku-4.5": {"input": __CLAUDE_HAIKU_4_5_INPUT_PER_MTOK__, "output": __CLAUDE_HAIKU_4_5_OUTPUT_PER_MTOK__},
     "openrouter/anthropic/claude-sonnet-4.6": {"input": __CLAUDE_SONNET_4_6_INPUT_PER_MTOK__, "output": __CLAUDE_SONNET_4_6_OUTPUT_PER_MTOK__},
+    "openrouter/qwen/qwen3-coder-30b-a3b-instruct": {"input": __QWEN3_CODER_30B_INPUT_PER_MTOK__, "output": __QWEN3_CODER_30B_OUTPUT_PER_MTOK__},
+    "openrouter/deepseek/deepseek-v4-flash": {"input": __DEEPSEEK_V4_FLASH_INPUT_PER_MTOK__, "output": __DEEPSEEK_V4_FLASH_OUTPUT_PER_MTOK__},
 }
 UNKNOWN_MODEL_ESTIMATE_USD_PER_MTOK = {"input": __UNKNOWN_MODEL_INPUT_ESTIMATE_PER_MTOK__, "output": __UNKNOWN_MODEL_OUTPUT_ESTIMATE_PER_MTOK__}
+EXPENSIVE_OPENROUTER_PROVIDER_SLUGS = __EXPENSIVE_OPENROUTER_PROVIDER_SLUGS_TUPLE__
 
 CONTEXT_WINDOW_TOKENS = {
     "openrouter/google/gemini-2.0-flash-001": __GEMINI_2_0_FLASH_CONTEXT_WINDOW__,
     "openrouter/google/gemini-2.5-flash": __GEMINI_2_5_FLASH_CONTEXT_WINDOW__,
+    "openrouter/google/gemini-2.5-flash-lite": __GEMINI_2_5_FLASH_LITE_CONTEXT_WINDOW__,
     "openrouter/anthropic/claude-haiku-4.5": __CLAUDE_HAIKU_4_5_CONTEXT_WINDOW__,
     "openrouter/anthropic/claude-sonnet-4.6": __CLAUDE_SONNET_4_6_CONTEXT_WINDOW__,
+    "openrouter/qwen/qwen3-coder-30b-a3b-instruct": __QWEN3_CODER_30B_CONTEXT_WINDOW__,
+    "openrouter/deepseek/deepseek-v4-flash": __DEEPSEEK_V4_FLASH_CONTEXT_WINDOW__,
 }
 AUTO_COMPACT_FRACTION = {
     "openrouter/google/gemini-2.0-flash-001": __GEMINI_2_0_FLASH_COMPACT_FRACTION__,
     "openrouter/google/gemini-2.5-flash": __GEMINI_2_5_FLASH_COMPACT_FRACTION__,
+    "openrouter/google/gemini-2.5-flash-lite": __GEMINI_2_5_FLASH_LITE_COMPACT_FRACTION__,
     "openrouter/anthropic/claude-haiku-4.5": __CLAUDE_HAIKU_4_5_COMPACT_FRACTION__,
     "openrouter/anthropic/claude-sonnet-4.6": __CLAUDE_SONNET_4_6_COMPACT_FRACTION__,
+    "openrouter/qwen/qwen3-coder-30b-a3b-instruct": __QWEN3_CODER_30B_COMPACT_FRACTION__,
+    "openrouter/deepseek/deepseek-v4-flash": __DEEPSEEK_V4_FLASH_COMPACT_FRACTION__,
 }
 DEFAULT_CONTEXT_WINDOW = 128_000
 DEFAULT_COMPACT_FRACTION = 0.80
@@ -192,6 +215,219 @@ APPROVALS_FILE = ".vg_approvals.json"
 REQUIRE_APPROVAL_DEFAULT = "off"
 STEP_EXTEND_PROMPT_ON_LAST_STEP = True
 SQLITE_TRACE_DB = "traces/vg_agent.sqlite3"
+''',
+    "runtime_settings.py": '''"""Generated runtime config loader (.env, workspace/config.toml)."""
+
+from __future__ import annotations
+
+import os
+import re
+from argparse import Namespace
+from pathlib import Path
+from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10
+    import tomli as tomllib  # type: ignore[no-redef]
+
+from dotenv import load_dotenv
+
+from . import config
+
+KNOWN_ENV_VARS: tuple[str, ...] = (
+    "VG_PARENT_MODEL",
+    "VG_GRILLING_MODEL",
+    "VG_EXPLORER_MODEL",
+    "VG_CODER_MODEL",
+    "VG_REVIEWER_MODEL",
+    "VG_COMPACTOR_MODEL",
+    "VG_MAX_USD_PER_RUN",
+    "VG_MAX_USD_PER_DAY",
+    "VG_MAX_TOKENS_PER_RUN",
+    "VG_APPROVAL_MODE",
+    "VG_K_COMPACT",
+    "VG_STRICT_MODEL_PRICING",
+)
+
+_SECRET_KEY_RE = re.compile(r"(?:_KEY|_TOKEN|_SECRET|_PASSWORD)$", re.IGNORECASE)
+
+_MODEL_TOML_KEYS: dict[str, str] = {
+    "parent": "PARENT_MODEL_ID",
+    "grilling": "GRILLING_MODEL_ID",
+    "explorer": "EXPLORER_MODEL_ID",
+    "coder": "CODER_MODEL_ID",
+    "reviewer": "REVIEWER_MODEL_ID",
+    "compactor": "COMPACTOR_MODEL_ID",
+}
+
+_ENV_MODEL_VARS: dict[str, str] = {
+    "VG_PARENT_MODEL": "PARENT_MODEL_ID",
+    "VG_GRILLING_MODEL": "GRILLING_MODEL_ID",
+    "VG_EXPLORER_MODEL": "EXPLORER_MODEL_ID",
+    "VG_CODER_MODEL": "CODER_MODEL_ID",
+    "VG_REVIEWER_MODEL": "REVIEWER_MODEL_ID",
+    "VG_COMPACTOR_MODEL": "COMPACTOR_MODEL_ID",
+}
+
+
+def normalize_model_id(raw: str) -> str:
+    text = raw.strip()
+    if not text:
+        raise ValueError("model id must not be empty")
+    if not text.startswith("openrouter/"):
+        return f"openrouter/{text}"
+    return text
+
+
+def find_repo_root(workspace: Path) -> Path:
+    parent = workspace.parent
+    if (parent / "pyproject.toml").is_file():
+        return parent.resolve()
+    return Path.cwd().resolve()
+
+
+def load_dotenv_file(repo_root: Path) -> None:
+    path = repo_root / ".env"
+    if path.is_file():
+        load_dotenv(path, override=False)
+
+
+def _reject_secret_keys(section: dict[str, Any], *, where: str) -> None:
+    for key in section:
+        if _SECRET_KEY_RE.search(key):
+            raise ValueError(f"secret-like key {key!r} not allowed in {where}")
+
+
+def load_workspace_toml(workspace: Path) -> dict[str, Any]:
+    path = workspace / "config.toml"
+    if not path.is_file():
+        return {}
+    payload = tomllib.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("config.toml root must be a table")
+    for section_name, section in payload.items():
+        if isinstance(section, dict):
+            _reject_secret_keys(section, where=f"[{section_name}]")
+    return payload
+
+
+def _set_model_attr(attr: str, value: str) -> None:
+    setattr(config, attr, normalize_model_id(value))
+
+
+def _refresh_subagent_model_ids() -> None:
+    config.SUBAGENT_MODEL_IDS.clear()
+    config.SUBAGENT_MODEL_IDS.update(
+        {
+            "grilling": config.GRILLING_MODEL_ID,
+            "explorer": config.EXPLORER_MODEL_ID,
+            "coder": config.CODER_MODEL_ID,
+            "reviewer": config.REVIEWER_MODEL_ID,
+        }
+    )
+
+
+def _apply_toml_payload(payload: dict[str, Any]) -> None:
+    models = payload.get("models")
+    if isinstance(models, dict):
+        for key, attr in _MODEL_TOML_KEYS.items():
+            if key in models:
+                _set_model_attr(attr, str(models[key]))
+
+    budget = payload.get("budget")
+    if isinstance(budget, dict):
+        _reject_secret_keys(budget, where="[budget]")
+        if "max_usd_per_run" in budget:
+            config.MAX_USD_PER_RUN = float(budget["max_usd_per_run"])
+        if "max_usd_per_day" in budget:
+            config.MAX_USD_PER_DAY = float(budget["max_usd_per_day"])
+        if "max_tokens_per_run" in budget:
+            config.MAX_TOKENS_PER_RUN = int(budget["max_tokens_per_run"])
+
+    approval = payload.get("approval")
+    if isinstance(approval, dict):
+        _reject_secret_keys(approval, where="[approval]")
+        if "mode" in approval:
+            config.REQUIRE_APPROVAL_DEFAULT = str(approval["mode"])
+
+    _refresh_subagent_model_ids()
+
+
+def _apply_env() -> None:
+    for env_var, attr in _ENV_MODEL_VARS.items():
+        value = os.environ.get(env_var, "").strip()
+        if value:
+            _set_model_attr(attr, value)
+
+    raw = os.environ.get("VG_MAX_USD_PER_RUN", "").strip()
+    if raw:
+        config.MAX_USD_PER_RUN = float(raw)
+    raw = os.environ.get("VG_MAX_USD_PER_DAY", "").strip()
+    if raw:
+        config.MAX_USD_PER_DAY = float(raw)
+    raw = os.environ.get("VG_MAX_TOKENS_PER_RUN", "").strip()
+    if raw:
+        config.MAX_TOKENS_PER_RUN = int(raw)
+    raw = os.environ.get("VG_APPROVAL_MODE", "").strip()
+    if raw:
+        config.REQUIRE_APPROVAL_DEFAULT = raw
+    raw = os.environ.get("VG_K_COMPACT", "").strip()
+    if raw:
+        config.K_COMPACT = int(raw)
+
+    _refresh_subagent_model_ids()
+
+
+def configured_model_ids() -> set[str]:
+    return {
+        config.PARENT_MODEL_ID,
+        config.GRILLING_MODEL_ID,
+        config.EXPLORER_MODEL_ID,
+        config.CODER_MODEL_ID,
+        config.REVIEWER_MODEL_ID,
+        config.COMPACTOR_MODEL_ID,
+    }
+
+
+def models_missing_local_pricing() -> list[str]:
+    return sorted(m for m in configured_model_ids() if m not in config.PRICING_USD_PER_MTOK)
+
+
+def strict_model_pricing_enabled() -> bool:
+    raw = os.environ.get("VG_STRICT_MODEL_PRICING", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def format_missing_pricing_warning(missing: list[str]) -> str:
+    short = [m.removeprefix("openrouter/") if m.startswith("openrouter/") else m for m in missing]
+    joined = ", ".join(short)
+    return (
+        f"warning: no local pricing for configured model(s): {joined}. "
+        "Preflight may block on usd_cap; statusline omits (next ~$) for unpriced models. "
+        "Add rates to MODEL_CONFIG.md, regenerate (python scripts/generate_project.py --clean), "
+        "or set VG_STRICT_MODEL_PRICING=1 to fail at startup. See docs/PRICE.md."
+    )
+
+
+def validate_configured_models(*, strict: bool = False) -> list[str]:
+    missing = models_missing_local_pricing()
+    if missing and strict:
+        raise SystemExit(format_missing_pricing_warning(missing))
+    return missing
+
+
+def apply_runtime_settings(*, workspace_root: Path, cli: Namespace | None = None) -> None:
+    del cli  # CLI overrides are applied in __main__ after this call.
+    repo_root = find_repo_root(workspace_root)
+    load_dotenv_file(repo_root)
+    try:
+        payload = load_workspace_toml(workspace_root)
+    except (ValueError, TypeError) as exc:
+        raise SystemExit(f"error: config.toml: {exc}") from exc
+    if payload:
+        _apply_toml_payload(payload)
+    _apply_env()
 ''',
     "budget.py": '''"""Generated budget guard."""
 
@@ -533,6 +769,7 @@ class ModelTurn:
     raw_content: list[dict[str, Any]] = field(default_factory=list)
     model_id: str = ""
     cost_usd: float | None = None
+    openrouter_provider: str | None = None
 
 
 class LiveModelClient:
@@ -591,17 +828,21 @@ class LiveModelClient:
 
         stdout_filter = _LiteLLMNoiseFilter(sys.stdout)
         stderr_filter = _LiteLLMNoiseFilter(sys.stderr)
+        extra_body = _openrouter_extra_body(model)
+        completion_kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": _to_litellm_messages(system_prompt, messages),
+            "tools": _to_litellm_tools(tools) if tools else None,
+            "max_tokens": max_tokens,
+            "api_key": self.api_key,
+            "api_base": self.endpoint,
+            "extra_headers": _openrouter_headers(),
+        }
+        if extra_body is not None:
+            completion_kwargs["extra_body"] = extra_body
         with contextlib.redirect_stdout(stdout_filter), contextlib.redirect_stderr(stderr_filter):
             try:
-                response = litellm.completion(
-                    model=model,
-                    messages=_to_litellm_messages(system_prompt, messages),
-                    tools=_to_litellm_tools(tools) if tools else None,
-                    max_tokens=max_tokens,
-                    api_key=self.api_key,
-                    api_base=self.endpoint,
-                    extra_headers=_openrouter_headers(),
-                )
+                response = litellm.completion(**completion_kwargs)
             except Exception as exc:
                 if _is_rate_limit_error(exc):
                     raise LiveModelRateLimitError(_rate_limit_message(model)) from exc
@@ -624,6 +865,46 @@ def _openrouter_headers() -> dict[str, str] | None:
     if app_name:
         headers["X-Title"] = app_name
     return headers or None
+
+
+def _parse_csv_env(name: str) -> list[str] | None:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return None
+    parts = [part.strip() for part in str(raw).split(",")]
+    slugs = [part for part in parts if part]
+    return slugs or None
+
+
+def _openrouter_provider_body(model: str) -> dict[str, Any] | None:
+    model_lower = model.lower()
+    if "/deepseek/" in model_lower:
+        only_deepseek = _parse_csv_env("OPENROUTER_PROVIDER_ONLY_DEEPSEEK")
+        if only_deepseek is not None:
+            return {"only": only_deepseek}
+    provider: dict[str, Any] = {}
+    order = _parse_csv_env("OPENROUTER_PROVIDER_ORDER")
+    if order is not None:
+        provider["order"] = order
+    only = _parse_csv_env("OPENROUTER_PROVIDER_ONLY")
+    if only is not None:
+        provider["only"] = only
+    sort_raw = os.environ.get("OPENROUTER_PROVIDER_SORT")
+    if sort_raw is not None and str(sort_raw).strip():
+        provider["sort"] = str(sort_raw).strip()
+    allow_raw = os.environ.get("OPENROUTER_PROVIDER_ALLOW_FALLBACKS")
+    if allow_raw is not None and str(allow_raw).strip():
+        provider["allow_fallbacks"] = str(allow_raw).strip().lower() in ("1", "true", "yes", "on")
+    if not provider:
+        return None
+    return provider
+
+
+def _openrouter_extra_body(model: str) -> dict[str, Any] | None:
+    provider = _openrouter_provider_body(model)
+    if provider is None:
+        return None
+    return {"provider": provider}
 
 
 def _to_litellm_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -750,7 +1031,30 @@ def _normalise_response(response: Any, requested_model: str) -> ModelTurn:
         raw_content=raw_content,
         model_id=requested_model,
         cost_usd=cost,
+        openrouter_provider=_extract_openrouter_provider(response),
     )
+
+
+def _extract_openrouter_provider(response: Any) -> str | None:
+    """OpenRouter backend slug (e.g. novita, alibaba) from a completion response."""
+    value = _value(response, "provider", None)
+    if value:
+        return str(value)
+    hidden = _value(response, "_hidden_params", {}) or {}
+    value = _value(hidden, "provider", None)
+    if value:
+        return str(value)
+    original = _value(hidden, "original_response", None)
+    if original is not None:
+        if isinstance(original, str):
+            try:
+                original = json.loads(original)
+            except (TypeError, ValueError):
+                original = None
+        value = _value(original, "provider", None)
+        if value:
+            return str(value)
+    return None
 
 
 def _extract_cost_usd(response: Any) -> float | None:
@@ -1177,13 +1481,25 @@ def render_tree(events: list[dict[str, object]]) -> str:
         if kind == "llm_start":
             lines.append(f"{prefix}{event['event_idx']:03d} {event['agent_id']} llm_start step {event.get('step_idx')} model={event.get('model')}")
         elif kind == "assistant_step":
-            lines.append(f"{prefix}{event['event_idx']:03d} {event['agent_id']} assistant step {event.get('step_idx')} model={event.get('model')}")
+            provider = event.get("openrouter_provider")
+            provider_suffix = f" provider={provider}" if provider else ""
+            lines.append(
+                f"{prefix}{event['event_idx']:03d} {event['agent_id']} assistant step "
+                f"{event.get('step_idx')} model={event.get('model')}{provider_suffix}"
+            )
         elif kind == "tool_result":
             lines.append(f"{prefix}{event['event_idx']:03d} {event['agent_id']} tool_result {event.get('tool')} tokens={event.get('tokens')} status={event.get('status')}")
         elif kind == "compaction":
             lines.append(f"{prefix}{event['event_idx']:03d} compacted {event.get('before_tokens')} -> {event.get('after_tokens')} tokens (tool_use {event.get('tool_use_id')})")
         elif kind == "budget_event":
-            lines.append(f"{prefix}{event['event_idx']:03d} budget_event {event.get('budget_reason')}")
+            reason = event.get("budget_reason")
+            details = event.get("details") or {}
+            extra = ""
+            if reason == "warn_expensive_provider" and isinstance(details, dict):
+                slug = details.get("openrouter_provider")
+                if slug:
+                    extra = f" provider={slug}"
+            lines.append(f"{prefix}{event['event_idx']:03d} budget_event {reason}{extra}")
         elif kind == "approval":
             lines.append(f"{prefix}{event['event_idx']:03d} approval {event.get('tool')} decision={event.get('decision')} scope={event.get('scope_key')}")
         elif kind == "model_error":
@@ -1775,6 +2091,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -2203,6 +2520,16 @@ def _summarize_for_compactor(
         assistant_text=summary,
         tool_calls=[],
         stop_reason=turn.stop_reason,
+        openrouter_provider=turn.openrouter_provider,
+    )
+    _emit_expensive_provider_warning(
+        recorder,
+        guard,
+        openrouter_provider=turn.openrouter_provider,
+        model_id=model_id,
+        step_idx=guard.step_count,
+        agent_id="compactor",
+        cost_usd=cost,
     )
     return summary, False
 
@@ -2418,6 +2745,55 @@ def _assistant_content(turn: ModelTurn) -> list[dict[str, Any]]:
 
 def _estimate_message_tokens(system_prompt: str, messages: list[dict[str, Any]]) -> int:
     return tools.estimate_tokens(system_prompt + "\\n" + json.dumps(messages, sort_keys=True, ensure_ascii=False))
+
+
+def _expensive_openrouter_provider_slugs() -> tuple[str, ...]:
+    raw = os.environ.get("OPENROUTER_EXPENSIVE_PROVIDERS")
+    if raw is not None and str(raw).strip():
+        parts = [part.strip().lower() for part in str(raw).split(",") if part.strip()]
+        if parts:
+            return tuple(parts)
+    return config.EXPENSIVE_OPENROUTER_PROVIDER_SLUGS
+
+
+def _is_expensive_openrouter_provider(slug: str | None) -> bool:
+    if not slug:
+        return False
+    normalized = str(slug).strip().lower()
+    for entry in _expensive_openrouter_provider_slugs():
+        if normalized == entry or normalized.startswith(f"{entry}/"):
+            return True
+    return False
+
+
+def _emit_expensive_provider_warning(
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    *,
+    openrouter_provider: str | None,
+    model_id: str,
+    step_idx: int,
+    agent_id: str,
+    cost_usd: float,
+) -> None:
+    slug = str(openrouter_provider or "").strip()
+    if not slug or not _is_expensive_openrouter_provider(slug):
+        return
+    warn_key = f"warn_expensive_provider:{slug.lower()}"
+    if warn_key in guard.warned:
+        return
+    guard.warned.add(warn_key)
+    recorder.emit(
+        "budget_event",
+        budget_reason="warn_expensive_provider",
+        details={
+            "openrouter_provider": slug,
+            "model_id": model_id,
+            "step_idx": step_idx,
+            "agent_id": agent_id,
+            "cost_usd": cost_usd,
+        },
+    )
 
 
 def _record_budget_abort(recorder: TraceRecorder, guard: BudgetGuard, decision: Any, started: float) -> None:
@@ -2777,6 +3153,16 @@ def _run_live_subagent(
             assistant_text=turn.assistant_text,
             tool_calls=[_tool_call_trace(c) for c in turn.tool_calls],
             stop_reason=turn.stop_reason,
+            openrouter_provider=turn.openrouter_provider,
+        )
+        _emit_expensive_provider_warning(
+            recorder,
+            guard,
+            openrouter_provider=turn.openrouter_provider,
+            model_id=model_id,
+            step_idx=local_step,
+            agent_id=child_id,
+            cost_usd=cost,
         )
         messages.append({"role": "assistant", "content": _assistant_content(turn)})
         if not turn.tool_calls:
@@ -3019,6 +3405,16 @@ def run_live_task(
             assistant_text=turn.assistant_text,
             tool_calls=[_tool_call_trace(call) for call in turn.tool_calls],
             stop_reason=turn.stop_reason,
+            openrouter_provider=turn.openrouter_provider,
+        )
+        _emit_expensive_provider_warning(
+            recorder,
+            guard,
+            openrouter_provider=turn.openrouter_provider,
+            model_id=model_id,
+            step_idx=step_idx,
+            agent_id="parent",
+            cost_usd=cost,
         )
         messages.append({"role": "assistant", "content": _assistant_content(turn)})
         if not turn.tool_calls:
@@ -3141,6 +3537,14 @@ from .agent import (
 from .live_model_client import LiveModelClient, MissingOpenRouterKey
 from .budget import BudgetGuard, format_usd_display
 from .demo_fixture import write_fixture
+from .runtime_settings import (
+    _refresh_subagent_model_ids,
+    apply_runtime_settings,
+    format_missing_pricing_warning,
+    normalize_model_id,
+    strict_model_pricing_enabled,
+    validate_configured_models,
+)
 from .workspace_paths import resolve_workspace_root
 from .trace import (
     TraceRecorder,
@@ -3667,10 +4071,13 @@ def _format_progress_event(event: dict[str, object]) -> str | None:
             f"in~{event.get('tokens_in')} max_out={event.get('max_tokens')}"
         )
     if kind == "assistant_step":
+        provider = event.get("openrouter_provider")
+        provider_part = f" provider={provider}" if provider else ""
         line = (
             f"[llm] {agent} step {event.get('step_idx')} done "
             f"in={event.get('tokens_in')} out={event.get('tokens_out')} "
             f"usd={float(event.get('cost_usd') or 0):.6f} stop={event.get('stop_reason')}"
+            f"{provider_part}"
         )
         tool_calls = event.get("tool_calls") or []
         if isinstance(tool_calls, list) and tool_calls:
@@ -3726,7 +4133,13 @@ def _format_progress_event(event: dict[str, object]) -> str | None:
             f"tokens ({event.get('percent_reduced')}% reduced); full history in trace"
         )
     if kind == "budget_event":
-        return f"[budget] {event.get('budget_reason')}"
+        reason = event.get("budget_reason")
+        details = event.get("details") or {}
+        if reason == "warn_expensive_provider" and isinstance(details, dict):
+            slug = details.get("openrouter_provider")
+            if slug:
+                return f"[budget] {reason} provider={slug} model={details.get('model_id')}"
+        return f"[budget] {reason}"
     if kind == "model_error":
         retry = " retryable" if event.get("retryable") else ""
         return f"[llm] {agent} step {event.get('step_idx')} failed{retry}: {event.get('message')}"
@@ -3984,12 +4397,12 @@ def _exit_code_for_final_status(status: str | None) -> int:
 
 def _apply_model_overrides(args: argparse.Namespace) -> None:
     if getattr(args, "parent_model", None):
-        config.PARENT_MODEL_ID = args.parent_model
+        config.PARENT_MODEL_ID = normalize_model_id(args.parent_model)
     if getattr(args, "subagent_model", None):
-        config.EXPLORER_MODEL_ID = args.subagent_model
-        config.COMPACTOR_MODEL_ID = args.subagent_model
-
-
+        sub_id = normalize_model_id(args.subagent_model)
+        config.EXPLORER_MODEL_ID = sub_id
+        config.COMPACTOR_MODEL_ID = sub_id
+    _refresh_subagent_model_ids()
 
 
 def _chat_ui_kwargs(
@@ -4046,12 +4459,16 @@ def _report_parent_session_status(
 
 
 def _guard_overrides(args: argparse.Namespace) -> dict[str, object]:
-    """Per-run budget overrides from the CLI (unset flags fall back to config)."""
+    """Per-run budget overrides from CLI or post-loader config."""
     overrides: dict[str, object] = {}
     if getattr(args, "max_usd", None) is not None:
         overrides["max_usd"] = args.max_usd
+    else:
+        overrides["max_usd"] = config.MAX_USD_PER_RUN
     if getattr(args, "max_tokens", None) is not None:
         overrides["max_tokens"] = args.max_tokens
+    else:
+        overrides["max_tokens"] = config.MAX_TOKENS_PER_RUN
     return overrides
 
 
@@ -4277,7 +4694,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--parent-model")
     parser.add_argument("--subagent-model")
     parser.add_argument("--chat", action="store_true")
-    parser.add_argument("--require-approval", choices=["off", "writes", "all"], default=config.REQUIRE_APPROVAL_DEFAULT)
+    parser.add_argument("--require-approval", choices=["off", "writes", "all"], default=None)
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--no-step-extend-prompt", action="store_true")
     parser.add_argument("--no-redact", action="store_true")
@@ -4287,12 +4704,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-tokens", type=int)
     args = parser.parse_args(argv)
     args.live_model = True
-    _apply_model_overrides(args)
 
     if args.no_redact:
         sys.stderr.write("warning: --no-redact disables trace secret redaction.\\n")
 
     root = resolve_workspace_root()
+    apply_runtime_settings(workspace_root=root, cli=args)
+    if args.require_approval is None:
+        args.require_approval = config.REQUIRE_APPROVAL_DEFAULT
+    _apply_model_overrides(args)
+    missing_pricing = validate_configured_models(strict=strict_model_pricing_enabled())
+    if missing_pricing and (args.chat or args.task):
+        sys.stderr.write(format_missing_pricing_warning(missing_pricing) + "\\n")
     if args.seed_fixture:
         write_fixture(root)
         print(f"seeded fixture at {root}")
@@ -4383,6 +4806,8 @@ def main() -> int:
 
     cfg = read_config()
     cfg.update(read_context_windows())
+    slug_parts = [part.strip() for part in cfg["EXPENSIVE_OPENROUTER_PROVIDER_SLUGS"].split(",") if part.strip()]
+    cfg["EXPENSIVE_OPENROUTER_PROVIDER_SLUGS_TUPLE"] = repr(tuple(slug_parts))
     prompts = read_prompts()
     digest = spec_digest()
     src_dir = Path(args.src_dir)

@@ -297,6 +297,41 @@ class ToolErrorsDrillResponse(BaseModel):
     items: list[ToolErrorOccurrence] = Field(default_factory=list)
 
 
+class ModelRoleBreakdown(BaseModel):
+    agent_role: str
+    call_count: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: float = 0.0
+    avg_latency_ms: float | None = None
+
+
+class ModelStatsItem(BaseModel):
+    model_id: str
+    call_count: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: float = 0.0
+    avg_latency_ms: float | None = None
+    last_used_at: str | None = None
+    last_used_at_all_time: str | None = None
+    active_in_range: bool = False
+    price_input_per_mtok: float | None = None
+    price_output_per_mtok: float | None = None
+    configured_roles: list[str] = Field(default_factory=list)
+    by_role: list[ModelRoleBreakdown] = Field(default_factory=list)
+    sample_session_id: str | None = None
+    error_count: int = 0
+
+
+class ConfiguredModelItem(BaseModel):
+    role: str
+    model_id: str
+    price_input_per_mtok: float | None = None
+    price_output_per_mtok: float | None = None
+    has_known_pricing: bool = True
+
+
 class StatsResponse(BaseModel):
     range: str
     total_runs: int = 0
@@ -306,7 +341,10 @@ class StatsResponse(BaseModel):
     error_rate: float = 0.0
     by_day: list[DailySeriesPoint] = Field(default_factory=list)
     by_agent_type: list[StatsBreakdownItem] = Field(default_factory=list)
+    by_agent_role: list[StatsBreakdownItem] = Field(default_factory=list)
     by_model: list[StatsBreakdownItem] = Field(default_factory=list)
+    models: list[ModelStatsItem] = Field(default_factory=list)
+    configured_models: list[ConfiguredModelItem] = Field(default_factory=list)
     tool_errors: list[StatsBreakdownItem] = Field(default_factory=list)
     by_tool: list[ToolUsageItem] = Field(default_factory=list)
     top_user_prompts: list[PromptLeaderboardItem] = Field(default_factory=list)

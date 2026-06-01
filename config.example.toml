@@ -1,10 +1,10 @@
 [models]
-parent = "openrouter/google/gemini-2.0-flash-001"
-grilling = "openrouter/google/gemini-2.0-flash-001"
-explorer = "openrouter/google/gemini-2.0-flash-001"
-coder = "openrouter/google/gemini-2.0-flash-001"
-reviewer = "openrouter/google/gemini-2.0-flash-001"
-compactor = "openrouter/google/gemini-2.0-flash-001"
+parent = "openrouter/google/gemini-2.5-flash"
+grilling = "openrouter/google/gemini-2.5-flash"
+explorer = "openrouter/google/gemini-2.5-flash"
+coder = "openrouter/google/gemini-2.5-flash"
+reviewer = "openrouter/google/gemini-2.5-flash"
+compactor = "openrouter/google/gemini-2.5-flash"
 
 [budget]
 max_usd_per_run = 0.50

@@ -37,6 +37,9 @@ def _log_resolved_paths() -> None:
     from .db import get_engine
     from .metadata import ensure_metadata_table
     from .paths import all_traces_dirs, resolve_sqlite_path, schema_ready
+    from .runtime_config import ensure_runtime_config
+
+    ensure_runtime_config()
 
     if schema_ready():
         try:

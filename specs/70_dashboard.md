@@ -73,6 +73,10 @@ Beyond KPIs (`total_runs`, `total_turns`, `total_tokens`, `total_cost_usd`,
 
 | Field | Meaning |
 |-------|---------|
+| `configured_models` | Effective per-role models after `runtime_settings` (repo `.env` + `workspace/config.toml` on top of generated defaults): `role`, `model_id`, `price_input_per_mtok`, `price_output_per_mtok`, `has_known_pricing` |
+| `models` | Per-model rollup: calls, tokens, cost, `avg_latency_ms`, `last_used_at` (in range), `last_used_at_all_time`, `configured_roles`, nested `by_role` (parent/explorer/compactor/…), `sample_session_id`, `error_count` |
+| `by_agent_role` | Cost/tokens/calls grouped by agent **role** (not instance id); Stats page **Cost by agent role** chart uses this (sorted by `cost_usd`) |
+| `by_agent_type` | Cost/tokens/calls grouped by `agent_id` instance (`parent`, `explorer-1`, …) — API/debug only; not shown in Stats UI |
 | `by_tool` | Top tools by call count: `tool`, `count`, `error_count`, `avg_latency_ms` |
 | `top_user_prompts` | Normalized duplicate user prompts: `label`, `count`, `sample_session_id` |
 | `top_subagent_questions` | Normalized explorer questions (same shape) |
@@ -106,7 +110,7 @@ Client tracks `last_event_idx` for idempotent resume.
 | `/` | Current session (SSE) |
 | `/history` | Session list |
 | `/history/:sessionId` | Detail: Timeline, **Parent context**, Tools, Safety, Events (`?tab`, `?runId`, `?highlight`, `?eventIdx`) |
-| `/stats` | Statistics: tool usage, prompts, expensive turns, drillable tool errors |
+| `/stats` | Statistics: model inventory (configured + usage by role), tool usage, prompts, expensive turns, drillable tool errors |
 
 ### Event stream (`EventFeed`)
 
@@ -117,6 +121,15 @@ View modes (toolbar; persisted in `localStorage`):
 | **Flat** | Newest-first list with per-event time tags |
 | **By turn** | Collapsible sections per `user_prompt` turn (chronological within turn) |
 | **Turn + agents** | Turn sections with parent lane + sub-agent lanes |
+
+**Compaction unit (Turn + agents):** Each `compaction` or `context_compaction`
+event is rendered as one amber **compaction unit** card at its chronological
+position in the parent timeline. The card header shows `before_tokens →
+after_tokens` and percent reduced; nested **compactor** `llm_start` /
+`assistant_step` rows appear inside the card (not in a separate bottom lane).
+Preceding compactor events are linked by walking backward from the compaction
+row. A footer link jumps to the original `tool_result` when
+`original_event_idx` is set. Explorers and other sub-agents keep separate lanes.
 
 Optional **Parallel columns** toggle (when parallel sub-agents are detected):
 sub-agent lanes side-by-side instead of stacked. Shown when any turn has overlap
@@ -142,7 +155,7 @@ Matching rules (aligned with `dashboard/api/services/session_agent_types.py`):
 |------|---------|
 | `parent` | Parent-scoped events (`agent_id == "parent"`, etc.) |
 | `explorer`, `grilling`, `coder`, `reviewer` | `agent_type` on event or payload |
-| `compactor` | `agent_type == compactor` or `kind == context_compaction` |
+| `compactor` | `agent_type == compactor`, or `kind` in `compaction`, `context_compaction` (scrolls to compaction unit card) |
 
 ### History sub-agent badges
 
@@ -201,7 +214,7 @@ Use any of these on `/history/:sessionId`:
 | **Events** | Rows with `kind: compaction` (expand for `original_event_idx`, `original_sha256`) |
 | **Parent context** | Step slider: tool-result **compacted** markers (`[COMPACTED tool_result…]`) and **context_compaction** meta rows (fold summary + before→after). Use **Jump to compaction step** when present. Full payloads remain in JSONL only. |
 
-Canonical live demo: task reads `data/sample.log` then parallel explorers (`demo_review.md` scene 2).
+Canonical live demo: task reads `data/sample.log` then parallel explorers (`docs/demo/demo_review.md` scene 2).
 
 ### Session display names
 

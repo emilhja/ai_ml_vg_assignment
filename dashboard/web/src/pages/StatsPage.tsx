@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   Bar,
@@ -12,13 +12,94 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { api, type ToolErrorOccurrence } from "../api";
+import { api, type ModelStatsItem, type ToolErrorOccurrence } from "../api";
 
 const RANGES = [
   { id: "today", label: "Today" },
   { id: "7d", label: "7 days" },
   { id: "30d", label: "30 days" },
 ] as const;
+
+const COST_DECIMALS = 4;
+const STALE_MODEL_DAYS = 7;
+
+function formatModelLabel(modelId: string): string {
+  return modelId.startsWith("openrouter/") ? modelId.slice("openrouter/".length) : modelId;
+}
+
+function formatTsShort(ts: string | null | undefined): string {
+  if (!ts) return "—";
+  return ts.slice(0, 16).replace("T", " ");
+}
+
+function isStaleModel(model: ModelStatsItem): boolean {
+  if (!model.last_used_at_all_time) return false;
+  const last = new Date(model.last_used_at_all_time);
+  if (Number.isNaN(last.getTime())) return false;
+  const cutoff = Date.now() - STALE_MODEL_DAYS * 24 * 60 * 60 * 1000;
+  if (last.getTime() < cutoff) return true;
+  return !model.active_in_range;
+}
+
+function formatPricePerMtok(input: number | null, output: number | null): string {
+  if (input == null || output == null) return "—";
+  return `$${input.toFixed(2)} / $${output.toFixed(2)}`;
+}
+
+function formatCostUsd(value: number): string {
+  return `$${Number(value).toFixed(COST_DECIMALS)}`;
+}
+
+function formatCostAxisTick(value: number): string {
+  return Number(value).toFixed(COST_DECIMALS);
+}
+
+const costChartTooltipProps = {
+  contentStyle: { background: "#1a2332", border: "1px solid #334155" },
+  formatter: (value: number) => [formatCostUsd(value), "Cost"],
+} as const;
+
+type CostBarDatum = { label: string; cost_usd: number };
+
+function CostBarChart({
+  data,
+  yWidth,
+  fill,
+  width,
+  height,
+}: {
+  data: CostBarDatum[];
+  yWidth: number;
+  fill: string;
+  width?: number;
+  height?: number;
+}) {
+  if (!width || !height) return null;
+  return (
+    <BarChart
+      width={width}
+      height={height}
+      data={data}
+      layout="vertical"
+      margin={{ left: 4, right: 8 }}
+    >
+      <CartesianGrid stroke="#334155" strokeDasharray="3 3" />
+      <XAxis
+        type="number"
+        tick={{ fill: "#8b9cb3", fontSize: 11 }}
+        tickFormatter={formatCostAxisTick}
+      />
+      <YAxis
+        type="category"
+        dataKey="label"
+        width={yWidth}
+        tick={{ fill: "#8b9cb3", fontSize: 10 }}
+      />
+      <Tooltip {...costChartTooltipProps} />
+      <Bar dataKey="cost_usd" fill={fill} radius={[0, 4, 4, 0]} />
+    </BarChart>
+  );
+}
 
 function toolErrorHref(occ: ToolErrorOccurrence): string {
   const params = new URLSearchParams({
@@ -42,6 +123,7 @@ function expensiveTurnHref(turn: { session_id: string; run_id: string }): string
 export default function StatsPage() {
   const [range, setRange] = useState<string>("7d");
   const [expandedTools, setExpandedTools] = useState<Set<string>>(new Set());
+  const [expandedModels, setExpandedModels] = useState<Set<string>>(new Set());
   const [drillTool, setDrillTool] = useState<string | null>(null);
 
   const { data: stats, isLoading, isError, error } = useQuery({
@@ -58,12 +140,14 @@ export default function StatsPage() {
     enabled: !!drillTool,
   });
 
-  if (isLoading || !stats) return <p className="text-muted">Loading statistics…</p>;
+  if (isLoading) return <p className="text-muted">Loading statistics…</p>;
 
-  if (isError) {
+  if (isError || !stats) {
     return (
       <div className="space-y-2">
-        <p className="text-red-400">Cannot load statistics: {(error as Error).message}</p>
+        <p className="text-red-400">
+          Cannot load statistics: {(error as Error)?.message ?? "No data returned"}
+        </p>
         <p className="text-sm text-muted">
           Is the API running on port 8787? Check http://127.0.0.1:8787/api/v1/health
         </p>
@@ -79,6 +163,24 @@ export default function StatsPage() {
       return next;
     });
   };
+
+  const toggleModel = (modelId: string) => {
+    setExpandedModels((prev) => {
+      const next = new Set(prev);
+      if (next.has(modelId)) next.delete(modelId);
+      else next.add(modelId);
+      return next;
+    });
+  };
+
+  const models = stats.models ?? [];
+  const configuredModels = stats.configured_models ?? [];
+  const byAgentRole = [...(stats.by_agent_role ?? [])]
+    .sort((a, b) => b.cost_usd - a.cost_usd)
+    .slice(0, 10);
+  const costByModel = [...stats.by_model]
+    .sort((a, b) => b.cost_usd - a.cost_usd)
+    .slice(0, 10);
 
   return (
     <div className="space-y-8">
@@ -132,48 +234,210 @@ export default function StatsPage() {
         </div>
       </section>
 
+      <section className="space-y-6">
+        <h2 className="text-base font-medium">Models</h2>
+        <p className="text-xs text-muted -mt-4">
+          Effective role models from repo <code className="text-[11px]">.env</code> and{" "}
+          <code className="text-[11px]">workspace/config.toml</code> (same loader as the agent).
+        </p>
+
+        {configuredModels.length > 0 && (
+          <div>
+            <h3 className="text-sm text-muted mb-3">Configured today</h3>
+            <div className="overflow-x-auto rounded-lg border border-slate-700/50">
+              <table className="w-full text-sm">
+                <thead className="bg-panel text-muted text-left">
+                  <tr>
+                    <th className="px-3 py-2">Role</th>
+                    <th className="px-3 py-2">Model</th>
+                    <th className="px-3 py-2">$/Mtok in / out</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {configuredModels.map((row) => (
+                    <tr key={row.role} className="border-t border-slate-700/40">
+                      <td className="px-3 py-2 capitalize">{row.role}</td>
+                      <td className="px-3 py-2 font-mono text-xs">{formatModelLabel(row.model_id)}</td>
+                      <td className="px-3 py-2 text-muted">
+                        {row.has_known_pricing
+                          ? formatPricePerMtok(row.price_input_per_mtok, row.price_output_per_mtok)
+                          : "unknown"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {models.length > 0 ? (
+          <div>
+            <h3 className="text-sm text-muted mb-3">Model usage</h3>
+            <div className="overflow-x-auto rounded-lg border border-slate-700/50">
+              <table className="w-full text-sm">
+                <thead className="bg-panel text-muted text-left">
+                  <tr>
+                    <th className="px-3 py-2 w-8" />
+                    <th className="px-3 py-2">Model</th>
+                    <th className="px-3 py-2">Calls</th>
+                    <th className="px-3 py-2">Cost</th>
+                    <th className="px-3 py-2">Tokens</th>
+                    <th className="px-3 py-2">Avg latency</th>
+                    <th className="px-3 py-2">Last (range)</th>
+                    <th className="px-3 py-2">Last (all)</th>
+                    <th className="px-3 py-2">Roles</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {models.map((model) => {
+                    const expanded = expandedModels.has(model.model_id);
+                    const stale = isStaleModel(model);
+                    const rolesLabel =
+                      model.configured_roles.length > 0
+                        ? model.configured_roles.join(", ")
+                        : model.by_role.map((r) => r.agent_role).join(", ") || "—";
+                    return (
+                      <Fragment key={model.model_id}>
+                        <tr className="border-t border-slate-700/40">
+                          <td className="px-3 py-2">
+                            {model.by_role.length > 0 ? (
+                              <button
+                                type="button"
+                                onClick={() => toggleModel(model.model_id)}
+                                className="text-muted hover:text-white text-xs"
+                                aria-label={expanded ? "Collapse" : "Expand"}
+                              >
+                                {expanded ? "▼" : "▶"}
+                              </button>
+                            ) : null}
+                          </td>
+                          <td className="px-3 py-2">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="font-mono text-xs" title={model.model_id}>
+                                {formatModelLabel(model.model_id)}
+                              </span>
+                              {model.configured_roles.length > 0 && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-accent/15 text-accent">
+                                  configured
+                                </span>
+                              )}
+                              {stale && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300">
+                                  stale
+                                </span>
+                              )}
+                              {!model.active_in_range && model.last_used_at_all_time && !stale && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-600/30 text-muted">
+                                  not in range
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-[10px] text-muted mt-0.5">
+                              {formatPricePerMtok(model.price_input_per_mtok, model.price_output_per_mtok)} / Mtok
+                            </p>
+                          </td>
+                          <td className="px-3 py-2">{model.call_count}</td>
+                          <td className="px-3 py-2 font-mono">{formatCostUsd(model.cost_usd)}</td>
+                          <td className="px-3 py-2">
+                            {(model.tokens_in + model.tokens_out).toLocaleString()}
+                          </td>
+                          <td className="px-3 py-2 text-muted">
+                            {model.avg_latency_ms != null ? `${model.avg_latency_ms}ms` : "—"}
+                          </td>
+                          <td className="px-3 py-2 text-muted text-xs">
+                            {formatTsShort(model.last_used_at)}
+                          </td>
+                          <td className="px-3 py-2 text-muted text-xs">
+                            {formatTsShort(model.last_used_at_all_time)}
+                          </td>
+                          <td className="px-3 py-2 text-xs capitalize">{rolesLabel}</td>
+                        </tr>
+                        {expanded && model.by_role.length > 0 && (
+                          <tr className="border-t border-slate-700/20 bg-panel/30">
+                            <td colSpan={9} className="px-3 py-2">
+                              <table className="w-full text-xs">
+                                <thead className="text-muted">
+                                  <tr>
+                                    <th className="py-1 pr-4 text-left">Role</th>
+                                    <th className="py-1 pr-4 text-left">Calls</th>
+                                    <th className="py-1 pr-4 text-left">Cost</th>
+                                    <th className="py-1 pr-4 text-left">Tokens</th>
+                                    <th className="py-1 text-left">Avg latency</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {model.by_role.map((role) => (
+                                    <tr key={role.agent_role}>
+                                      <td className="py-1 pr-4 capitalize">{role.agent_role}</td>
+                                      <td className="py-1 pr-4">{role.call_count}</td>
+                                      <td className="py-1 pr-4 font-mono">
+                                        {formatCostUsd(role.cost_usd)}
+                                      </td>
+                                      <td className="py-1 pr-4">
+                                        {(role.tokens_in + role.tokens_out).toLocaleString()}
+                                      </td>
+                                      <td className="py-1 text-muted">
+                                        {role.avg_latency_ms != null
+                                          ? `${role.avg_latency_ms}ms`
+                                          : "—"}
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                              {model.sample_session_id && (
+                                <p className="mt-2">
+                                  <Link
+                                    to={sessionHref(model.sample_session_id)!}
+                                    className="text-accent hover:underline"
+                                  >
+                                    Latest session in range
+                                  </Link>
+                                </p>
+                              )}
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ) : (
+          <p className="text-sm text-muted">No model calls recorded yet.</p>
+        )}
+      </section>
+
       <div className="grid lg:grid-cols-2 gap-8">
         <section>
           <h3 className="text-sm text-muted mb-3">Cost by model</h3>
           <div className="h-56 bg-panel/50 rounded-lg p-2">
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={stats.by_model.slice(0, 10)} layout="vertical">
-                <CartesianGrid stroke="#334155" strokeDasharray="3 3" />
-                <XAxis type="number" tick={{ fill: "#8b9cb3", fontSize: 11 }} />
-                <YAxis
-                  type="category"
-                  dataKey="label"
-                  width={180}
-                  tick={{ fill: "#8b9cb3", fontSize: 10 }}
-                />
-                <Tooltip contentStyle={{ background: "#1a2332", border: "1px solid #334155" }} />
-                <Bar dataKey="cost_usd" fill="#e07a5f" />
-              </BarChart>
+              <CostBarChart data={costByModel} yWidth={180} fill="#e07a5f" />
             </ResponsiveContainer>
           </div>
         </section>
 
-        {stats.by_agent_type.length > 0 && (
-          <section>
-            <h3 className="text-sm text-muted mb-3">Cost by agent id</h3>
+        <section>
+          <h3 className="text-sm text-muted mb-3">Cost by agent role</h3>
+          {byAgentRole.length > 0 ? (
             <div className="h-56 bg-panel/50 rounded-lg p-2">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={stats.by_agent_type.slice(0, 10)} layout="vertical">
-                  <CartesianGrid stroke="#334155" strokeDasharray="3 3" />
-                  <XAxis type="number" tick={{ fill: "#8b9cb3", fontSize: 11 }} />
-                  <YAxis
-                    type="category"
-                    dataKey="label"
-                    width={120}
-                    tick={{ fill: "#8b9cb3", fontSize: 10 }}
-                  />
-                  <Tooltip contentStyle={{ background: "#1a2332", border: "1px solid #334155" }} />
-                  <Bar dataKey="cost_usd" fill="#818cf8" />
-                </BarChart>
+                <CostBarChart data={byAgentRole} yWidth={100} fill="#818cf8" />
               </ResponsiveContainer>
             </div>
-          </section>
-        )}
+          ) : stats.by_agent_type.length > 0 ? (
+            <p className="text-sm text-muted">
+              Role rollups unavailable — restart the dashboard API to load{" "}
+              <code className="text-[11px]">by_agent_role</code>.
+            </p>
+          ) : (
+            <p className="text-sm text-muted">No agent cost data in this range.</p>
+          )}
+        </section>
       </div>
 
       {stats.by_tool.length > 0 && (
