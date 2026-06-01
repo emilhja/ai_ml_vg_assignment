@@ -533,7 +533,7 @@ def test_chat_slash_command_completer_matches_prefixes() -> None:
     assert [completion.text for completion in new_session] == ["/new"]
     assert [completion.text for completion in show_context] == ["/show-context"]
     assert "fresh chat session" in new_session[0].display_meta_text
-    assert "N: parent step index; default 0" in show_context[0].display_meta_text
+    assert "Overview" in show_context[0].display_meta_text
     assert len(show_context[0].display_text) > len(show_context[0].text)
     assert list(completer.get_completions(Document(""), CompleteEvent())) == []
     assert list(completer.get_completions(Document(" "), CompleteEvent())) == []
@@ -647,6 +647,230 @@ def test_parallel_cap_and_coder_conflict(tmp_path: Path) -> None:
     assert "conflict" in statuses  # second Coder serialised
     assert "tool_error" in statuses  # fifth request over the cap
     assert any(item["payload"] == "parallel cap exceeded" for item in payload)
+
+
+def test_literal_tool_output_tail_preview_large_file(tmp_path: Path) -> None:
+    from vg_agent.__main__ import _literal_tool_outputs
+    from vg_agent.chat_ui import format_literal_tool_body
+
+    body = "\n".join(f"line-{index}" for index in range(500))
+    preview = format_literal_tool_body(
+        body,
+        tool="read_file",
+        path="data/big.txt",
+        event_idx=42,
+        trace_path=tmp_path / "traces" / "abc.jsonl",
+    )
+    assert "500 lines" in preview
+    assert "line-499" in preview
+    assert "line-0" not in preview
+    assert "470 earlier lines" in preview
+    assert "read_file_range data/big.txt" in preview
+
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="read data/big.txt")
+    recorder.emit("tool_call", tool="read_file", tool_use_id="read-big", args={"path": "data/big.txt"})
+    recorder.emit(
+        "tool_result",
+        tool="read_file",
+        tool_use_id="read-big",
+        result_full=body,
+        bytes=len(body.encode()),
+        tokens=5000,
+        latency_ms=1,
+        status="ok",
+    )
+    recorder.emit("assistant_step", assistant_text="Read complete.", tool_calls=[], stop_reason="end_turn")
+    outputs = _literal_tool_outputs(
+        recorder.events, 0, "read data/big.txt", "Read complete.", trace_path=recorder.path
+    )
+    assert len(outputs) == 1
+    assert "470 earlier lines" in outputs[0]
+
+
+def test_literal_tool_output_compacted_read(tmp_path: Path) -> None:
+    from vg_agent.__main__ import _literal_tool_outputs
+
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="read data/sample.log")
+    recorder.emit("tool_call", tool="read_file", tool_use_id="read-log", args={"path": "data/sample.log"})
+    recorder.emit(
+        "tool_result",
+        tool="read_file",
+        tool_use_id="read-log",
+        result_full="request_id=req-00001 route=/health\n" * 100,
+        bytes=4000,
+        tokens=9000,
+        latency_ms=1,
+        status="ok",
+    )
+    recorder.emit(
+        "compaction",
+        tool_use_id="read-log",
+        before_tokens=9000,
+        after_tokens=120,
+        summary="Large log overview",
+        original_event_idx=2,
+        run_id=recorder.run_id,
+    )
+    recorder.emit("assistant_step", assistant_text="Log scanned.", tool_calls=[], stop_reason="end_turn")
+    outputs = _literal_tool_outputs(
+        recorder.events, 0, "read data/sample.log", "Log scanned.", trace_path=recorder.path
+    )
+    assert outputs
+    assert "compacted" in outputs[0].lower() or "COMPACTED" in outputs[0]
+    assert "request_id=req-00001" not in outputs[0]
+
+
+def test_parallel_subagent_summary_overlap() -> None:
+    from vg_agent.trace import parallel_subagent_summary
+
+    events = [
+        {"kind": "subagent_spawn", "child_agent_id": "explorer.0", "question": "auth/"},
+        {
+            "kind": "subagent_return",
+            "child_agent_id": "explorer.0",
+            "agent_type": "explorer",
+            "started_at": "2026-05-10T12:00:00+00:00",
+            "ended_at": "2026-05-10T12:00:03+00:00",
+            "summary": "auth ok",
+        },
+        {"kind": "subagent_spawn", "child_agent_id": "explorer.1", "question": "utils.py"},
+        {
+            "kind": "subagent_return",
+            "child_agent_id": "explorer.1",
+            "agent_type": "explorer",
+            "started_at": "2026-05-10T12:00:01+00:00",
+            "ended_at": "2026-05-10T12:00:04+00:00",
+            "summary": "utils ok",
+        },
+    ]
+    summary = parallel_subagent_summary(events)
+    assert summary is not None
+    assert summary.overlap is True
+    assert len(summary.returns) == 2
+
+
+def test_parallel_finops_batch_lines(tmp_path: Path) -> None:
+    from vg_agent.trace import parallel_finops_batch_lines
+
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="parallel task")
+    recorder.emit(
+        "tool_result",
+        tool="spawn_subagents",
+        agent_id="parent",
+        status="ok",
+        result_full="[]",
+    )
+    recorder.emit(
+        "subagent_return",
+        child_agent_id="explorer.0",
+        agent_type="explorer",
+        started_at="2026-05-10T12:00:00+00:00",
+        ended_at="2026-05-10T12:00:02+00:00",
+    )
+    recorder.emit(
+        "subagent_return",
+        child_agent_id="explorer.1",
+        agent_type="explorer",
+        started_at="2026-05-10T12:00:01+00:00",
+        ended_at="2026-05-10T12:00:03+00:00",
+    )
+    lines = parallel_finops_batch_lines(recorder.events)
+    assert lines
+    assert "Parallel batches this session: 1" in lines[0]
+    assert "overlapping wall-clock" in lines[1]
+
+
+def test_show_context_overview_lists_steps_and_parallel() -> None:
+    from vg_agent.trace import format_show_context_overview
+
+    events = [
+        {"kind": "user_prompt", "agent_id": "parent", "prompt": "go"},
+        {
+            "kind": "assistant_step",
+            "agent_id": "parent",
+            "step_idx": 0,
+            "tool_calls": [{"name": "read_file", "args": {"path": "data/sample.log"}}],
+        },
+        {
+            "kind": "assistant_step",
+            "agent_id": "parent",
+            "step_idx": 1,
+            "tool_calls": [{"name": "spawn_subagents", "args": {"requests": []}}],
+        },
+        {
+            "kind": "subagent_return",
+            "child_agent_id": "explorer.0",
+            "agent_type": "explorer",
+            "started_at": "2026-05-10T12:00:00+00:00",
+            "ended_at": "2026-05-10T12:00:02+00:00",
+        },
+        {
+            "kind": "subagent_return",
+            "child_agent_id": "explorer.1",
+            "agent_type": "explorer",
+            "started_at": "2026-05-10T12:00:01+00:00",
+            "ended_at": "2026-05-10T12:00:03+00:00",
+        },
+        {
+            "kind": "assistant_step",
+            "agent_id": "parent",
+            "step_idx": 2,
+            "assistant_text": "done",
+            "tool_calls": [],
+        },
+    ]
+    text = format_show_context_overview(events)
+    assert "step" in text
+    assert "read_file" in text
+    assert "spawn_subagents" in text
+    assert "parallel sub-agents" in text
+    assert "overlap yes" in text
+    assert "/show-context N" in text
+
+
+def test_format_turn_review_includes_parallel_section(tmp_path: Path) -> None:
+    from vg_agent.trace import format_turn_review
+
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="summarise in parallel")
+    recorder.emit(
+        "assistant_step",
+        agent_id="parent",
+        assistant_text="",
+        tool_calls=[{"name": "spawn_subagents", "args": {"requests": []}}],
+        stop_reason="tool_use",
+    )
+    recorder.emit(
+        "subagent_return",
+        child_agent_id="explorer.0",
+        agent_type="explorer",
+        started_at="2026-05-10T12:00:00+00:00",
+        ended_at="2026-05-10T12:00:02+00:00",
+        summary="AUTH_SENTINEL",
+    )
+    recorder.emit(
+        "subagent_return",
+        child_agent_id="explorer.1",
+        agent_type="explorer",
+        started_at="2026-05-10T12:00:01+00:00",
+        ended_at="2026-05-10T12:00:03+00:00",
+        summary="UTILS_SENTINEL",
+    )
+    recorder.emit(
+        "assistant_step",
+        agent_id="parent",
+        assistant_text="Combined AUTH_SENTINEL and UTILS_SENTINEL.",
+        tool_calls=[],
+        stop_reason="end_turn",
+    )
+    text = format_turn_review(recorder.events, trace_path=recorder.path)
+    assert "summarise in parallel" in text
+    assert "overlap yes" in text
+    assert "AUTH_SENTINEL" in text
+    assert "UTILS_SENTINEL" in text
 
 
 def test_live_parent_large_tool_result_compacted_before_next_turn(tmp_path: Path) -> None:
@@ -1064,7 +1288,7 @@ def test_literal_tool_output_includes_read_errors(tmp_path: Path) -> None:
 
     outputs = _literal_tool_outputs(recorder.events, 0, "read .env", "I could not read that file.")
     assert outputs
-    assert outputs[0].startswith("Blocked (read_file):\n")
+    assert outputs[0].startswith("Blocked (.env):\n")
     assert ".env.example" in outputs[0]
     tool_event = next(event for event in recorder.events if event["kind"] == "tool_result")
     progress = str(_format_progress_event(tool_event))
@@ -1319,6 +1543,60 @@ def test_print_chat_dashboard_cleared_shows_trace_path(
     assert any("traces/abc123.jsonl" in line for line in printed)
 
 
+def test_print_chat_status_report_writes_stdout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    from vg_agent import __main__ as cli
+    from vg_agent.budget import BudgetGuard
+    from vg_agent.trace import TraceRecorder
+
+    recorder = TraceRecorder(tmp_path, run_id="run1", sqlite_enabled=False)
+    recorder.emit("run_end", final_status="ok")
+    guard = BudgetGuard.for_workspace(tmp_path)
+    args = SimpleNamespace(live_model=True)
+    buffer = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+    cli._print_chat_status_report(recorder, guard, args, since_event_idx=0)
+    out = buffer.getvalue()
+    assert "steps " in out
+    assert "trace:" in out
+    assert "last_run: ok" in out
+
+
+def test_chat_status_slash_command_writes_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    from vg_agent import __main__ as cli
+
+    monkeypatch.setattr(cli, "use_rich_ui", lambda: True)
+    dashboard_calls: list[bool] = []
+    monkeypatch.setattr(
+        cli,
+        "print_chat_dashboard_cleared",
+        lambda **_k: dashboard_calls.append(True),
+    )
+    monkeypatch.setattr(cli, "render_input_top_rule", lambda: None)
+    monkeypatch.setattr(cli, "render_input_bottom_and_footer", lambda **_k: None)
+
+    prompts = iter(["/status", "/exit"])
+    monkeypatch.setattr(cli, "_make_chat_prompt", lambda _history_path: (lambda: next(prompts), lambda: None))
+
+    buffer = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+
+    args = SimpleNamespace(
+        no_redact=False,
+        require_approval="off",
+        yes=False,
+        live_model=True,
+    )
+    assert cli._chat_loop(tmp_path, args) == 0
+    assert dashboard_calls
+    out = buffer.getvalue()
+    assert "steps " in out
+    assert "trace:" in out
+
+
 def test_chat_ui_non_tty_skips_rich(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from vg_agent import __main__ as cli
 
@@ -1366,6 +1644,48 @@ def test_chat_ui_turn_output_plain_when_non_tty(monkeypatch: pytest.MonkeyPatch)
     out = buffer.getvalue()
     assert out == "Hello\n./auth\n"
     assert "\u2500" not in out
+
+
+def test_format_response_bullets_multiline() -> None:
+    from vg_agent.chat_ui import format_response_bullets
+
+    assert format_response_bullets("only one line") == "only one line"
+    assert format_response_bullets("alpha\nbeta") == "• alpha\n• beta"
+    assert format_response_bullets("- item one\nitem two") == "- item one\n• item two"
+    assert format_response_bullets("1. first\nsecond") == "1. first\n• second"
+
+
+def test_render_input_top_rule_spacing(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vg_agent import chat_ui
+
+    printed: list[object] = []
+
+    class FakeConsole:
+        def print(self, *args: object, **kwargs: object) -> None:
+            printed.append((args, kwargs))
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    monkeypatch.setattr(chat_ui, "_console", lambda: FakeConsole())
+    chat_ui.render_input_top_rule()
+    assert len(printed) == 3
+    assert printed[0] == ((), {})
+    assert printed[1] == ((), {})
+    rule_arg = printed[2][0][0]
+    assert getattr(rule_arg, "title", None) == "input"
+
+
+def test_chat_ui_turn_output_multiline_bullets(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    from vg_agent import chat_ui
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    buffer = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+    assert chat_ui.print_turn_output(answer="line one\nline two", literal_outputs=[]) is True
+    out = buffer.getvalue()
+    assert "\u2022 line one" in out
+    assert "\u2022 line two" in out
 
 
 def test_format_unified_diff_includes_plus_minus_lines() -> None:

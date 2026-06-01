@@ -94,12 +94,17 @@ Surfaced via:
 - `--budget` CLI flag (one-shot summary at the end of a run, machine-readable
   JSON to stdout).
 - `/budget` slash command in `--chat`.
+- `/finops` in `--chat` may append a short **parallel batches** block (count of
+  `spawn_subagents` turns with overlapping `subagent_return` intervals) without
+  adding JSONL fields.
 
-## FinOps data contract (frontend deferred)
+## FinOps data contract
 
-A future FastAPI + Pydantic + React frontend must be able to render the run
-from JSONL alone, while normal dashboard queries should use the SQLite mirror.
-Store rich structured data now; do not require the frontend for v1:
+The trace analysis dashboard (`specs/70_dashboard.md`) implements the deferred
+FastAPI + Pydantic + React UI. It must be able to render a run from JSONL alone,
+while normal dashboard queries use the SQLite mirror. Agent runtime does not
+require the dashboard for v1:
+
 
 - Per-step timeline with per-agent token usage.
 - Compaction events with `original_event_idx` and `original_sha256`.

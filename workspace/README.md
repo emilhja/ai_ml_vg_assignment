@@ -1,3 +1,3 @@
-# DEMO REPO
+# Demo Repo
 
 Small auth-heavy fixture for VG Agent demos.

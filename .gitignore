@@ -22,6 +22,10 @@ id_ed25519*
 credentials
 credentials.json
 
+# Dashboard frontend
+dashboard/web/node_modules/
+dashboard/web/dist/
+
 # Agent state
 .vg_daily_spend.json
 .vg_approvals.json

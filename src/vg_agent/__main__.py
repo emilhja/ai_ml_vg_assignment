@@ -36,6 +36,7 @@ from .chat_ui import (
     capture_write_prior,
     emit_session_statusline,
     format_compaction_banner,
+    format_literal_tool_body,
     format_statusline_compact,
     mark_turn_completed,
     print_chat_dashboard_cleared,
@@ -54,7 +55,16 @@ from .agent import BUDGET_CAP_TOOL, ApprovalOutcome, ApprovalPolicy, ApprovalReq
 from .live_model_client import LiveModelClient, MissingOpenRouterKey
 from .budget import BudgetGuard
 from .demo_fixture import write_fixture
-from .trace import TraceRecorder, render_tree, show_context
+from .trace import (
+    TraceRecorder,
+    format_parallel_progress_lines,
+    format_show_context_overview,
+    format_turn_review,
+    parallel_finops_batch_lines,
+    parallel_subagent_summary,
+    render_tree,
+    show_context,
+)
 
 
 def _stdin_prompt(stream: object | None = None, *, workspace_root: Path | None = None) -> "callable":
@@ -120,6 +130,27 @@ def _print_budget(guard: BudgetGuard) -> None:
     )
 
 
+def _print_chat_status_report(
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    args: argparse.Namespace,
+    *,
+    since_event_idx: int = 0,
+) -> None:
+    line = _format_chat_statusline(
+        recorder,
+        guard,
+        live_model=bool(args.live_model),
+        since_event_idx=since_event_idx,
+    )
+    sys.stdout.write(line + "\n")
+    _print_budget(guard)
+    sys.stdout.write(f"trace: {recorder.path}\n")
+    final_status = _latest_run_end_status(recorder.events)
+    if final_status:
+        sys.stdout.write(f"last_run: {final_status}\n")
+
+
 SLASH_COMMANDS = (
     "/exit",
     "/quit",
@@ -130,21 +161,24 @@ SLASH_COMMANDS = (
     "/reset",
     "/new",
     "/show-context",
+    "/review",
     "/help",
 )
 SLASH_COMMAND_USAGE = {
     "/show-context": "/show-context N",
+    "/review": "/review [N]",
 }
 SLASH_COMMAND_META = {
     "/exit": "End chat cleanly",
     "/quit": "Alias for /exit",
     "/budget": "Show steps, tokens, USD, and daily remaining",
-    "/status": "Reprint session dashboard (TTY) or compact status + budget",
-    "/finops": "Show per-agent token, tool, and cost table",
+    "/status": "Refresh dashboard (TTY) and print session summary on stdout",
+    "/finops": "Show per-agent token, tool, and cost table (+ parallel batches)",
+    "/review": "Readable recap of a completed turn (default: last)",
     "/approvals": "Show approval history and cached scopes",
     "/reset": "Clear approvals, budget, and chat history",
     "/new": "Start a fresh chat session and trace",
-    "/show-context": "N: parent step index; default 0",
+    "/show-context": "Overview, or N for parent context JSON at step N",
     "/help": "Show slash command help",
 }
 
@@ -275,6 +309,9 @@ def _print_finops(guard: BudgetGuard, recorder: TraceRecorder | None = None) -> 
     if recorder is not None:
         user_prompts = sum(1 for event in recorder.events if event.get("kind") == "user_prompt")
         sys.stdout.write(f"user_prompts {user_prompts}\n")
+        parallel_lines = parallel_finops_batch_lines(recorder.events)
+        if parallel_lines:
+            sys.stdout.write("\n".join(parallel_lines) + "\n")
 
 
 def _print_approvals(policy: ApprovalPolicy, recorder: TraceRecorder) -> None:
@@ -554,6 +591,7 @@ def _make_progress_sink(
     on_parent_status: Any = None,
     turn_state: dict[str, Any] | None = None,
     workspace_root: Path | None = None,
+    recorder: TraceRecorder | None = None,
 ) -> "callable":
     fh = stream if stream is not None else sys.stderr
     use_color = bool(getattr(fh, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
@@ -568,6 +606,8 @@ def _make_progress_sink(
             return
         if kind == "user_prompt":
             state["turn"] = int(state.get("turn", 0)) + 1
+            if recorder is not None:
+                state["turn_list_start"] = len(recorder.events) - 1
             pending_calls.clear()
             if use_color:
                 fh.write(f"\n\x1b[90m── turn {state['turn']} ──\x1b[0m\n")
@@ -594,6 +634,26 @@ def _make_progress_sink(
         if kind == "tool_result":
             tool = str(event.get("tool") or "")
             tool_use_id = str(event.get("tool_use_id") or "")
+            if (
+                tool == "spawn_subagents"
+                and event.get("status") == "ok"
+                and event.get("agent_id") == "parent"
+                and recorder is not None
+            ):
+                since = int(state.get("turn_list_start", 0))
+                summary = parallel_subagent_summary(recorder.events, since_event_idx=since)
+                if summary is not None:
+                    spawn_payload: list[dict[str, object]] | None = None
+                    try:
+                        parsed = json.loads(str(event.get("result_full") or ""))
+                    except json.JSONDecodeError:
+                        parsed = None
+                    if isinstance(parsed, list):
+                        spawn_payload = [item for item in parsed if isinstance(item, dict)]
+                    parallel_color = "\x1b[35m" if use_color else ""
+                    for parallel_line in format_parallel_progress_lines(summary, spawn_payload=spawn_payload):
+                        fh.write(f"{parallel_color}{parallel_line}{reset}\n")
+                    fh.flush()
             if tool in WRITE_EDIT_TOOLS and event.get("status") == "ok":
                 call = pending_calls.pop(tool_use_id, None)
                 if call is not None:
@@ -665,10 +725,21 @@ def _parent_tool_calls(events: list[dict[str, object]], start_idx: int) -> dict[
     return calls
 
 
-def _literal_tool_outputs(events: list[dict[str, object]], start_idx: int, prompt: str, answer: str) -> list[str]:
+def _literal_tool_outputs(
+    events: list[dict[str, object]],
+    start_idx: int,
+    prompt: str,
+    answer: str,
+    *,
+    trace_path: Path | None = None,
+) -> list[str]:
     if not _wants_literal_tool_output(prompt):
         return []
     calls = _parent_tool_calls(events, start_idx)
+    compaction_by_tool: dict[str, dict[str, object]] = {}
+    for event in events[start_idx:]:
+        if event.get("kind") == "compaction":
+            compaction_by_tool[str(event.get("tool_use_id") or "")] = event
     outputs: list[str] = []
     answer_text = answer.strip()
     for event in events[start_idx:]:
@@ -679,11 +750,27 @@ def _literal_tool_outputs(events: list[dict[str, object]], start_idx: int, promp
         content = clarify_tool_error(str(event.get("tool") or ""), str(event.get("result_full") or "")).strip()
         if not content or (answer_text and content in answer_text):
             continue
-        call = calls.get(str(event.get("tool_use_id") or ""), {})
-        command = str(call.get("command") or "").strip()
+        tool_use_id = str(event.get("tool_use_id") or "")
+        call = calls.get(tool_use_id, {})
+        args = call.get("args") or {}
+        path = str(args.get("path") or "") if isinstance(args, dict) else ""
+        command = str(call.get("command") or "").strip() if isinstance(call, dict) else ""
+        body = format_literal_tool_body(
+            content,
+            tool=str(event.get("tool") or ""),
+            path=path,
+            compaction_event=compaction_by_tool.get(tool_use_id),
+            event_idx=int(event.get("event_idx") or 0),
+            trace_path=trace_path,
+        )
         label = "Tool output" if event.get("status") == "ok" else "Blocked"
-        title = f"{label} ({command}):" if command else f"{label} ({event.get('tool')}):"
-        outputs.append(f"{title}\n{content}")
+        if command:
+            title = f"{label} ({command}):"
+        elif path:
+            title = f"{label} ({path}):"
+        else:
+            title = f"{label} ({event.get('tool')}):"
+        outputs.append(f"{title}\n{body}")
     return outputs
 
 
@@ -796,12 +883,12 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             force_state=turn_state.get("force_state"),
         )
 
-    recorder = TraceRecorder(
-        root,
-        redact=not args.no_redact,
-        event_sink=_make_progress_sink(
-            on_parent_status=on_parent_status, turn_state=turn_state, workspace_root=root
-        ),
+    recorder = TraceRecorder(root, redact=not args.no_redact, event_sink=None)
+    recorder.event_sink = _make_progress_sink(
+        on_parent_status=on_parent_status,
+        turn_state=turn_state,
+        workspace_root=root,
+        recorder=recorder,
     )
     policy = _make_policy(args, workspace_root=root)
     history_path = root / ".vg_chat_history"
@@ -817,7 +904,6 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             try:
                 render_input_top_rule()
                 prompt = read_prompt().strip()
-                render_input_bottom_and_footer(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
             except KeyboardInterrupt:
                 recorder.emit("budget_event", budget_reason="user_abort", details={})
                 sys.stderr.write("\n")
@@ -834,11 +920,9 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 continue
             if prompt == "/status":
                 if use_rich_ui():
+                    reset_dashboard_mode()
                     print_chat_dashboard_cleared(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since), compact=False)
-                else:
-                    line = _format_chat_statusline(recorder, guard, live_model=bool(args.live_model))
-                    sys.stdout.write(line + "\n")
-                    _print_budget(guard)
+                _print_chat_status_report(recorder, guard, args, since_event_idx=ui_since)
                 continue
             if prompt == "/approvals":
                 _print_approvals(policy, recorder)
@@ -862,14 +946,12 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 ui_since = 0
                 reset_dashboard_mode()
                 turn_state["turn"] = 0
-                recorder = TraceRecorder(
-                    root,
-                    redact=not args.no_redact,
-                    event_sink=_make_progress_sink(
-                        on_parent_status=on_parent_status,
-                        turn_state=turn_state,
-                        workspace_root=root,
-                    ),
+                recorder = TraceRecorder(root, redact=not args.no_redact, event_sink=None)
+                recorder.event_sink = _make_progress_sink(
+                    on_parent_status=on_parent_status,
+                    turn_state=turn_state,
+                    workspace_root=root,
+                    recorder=recorder,
                 )
                 recorder.emit("session_new")
                 if use_rich_ui():
@@ -881,14 +963,41 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             if prompt == "/finops":
                 _print_finops(guard, recorder)
                 continue
+            if prompt.startswith("/review"):
+                parts = prompt.split()
+                turn_index: int | None = None
+                if len(parts) > 1:
+                    try:
+                        turn_index = int(parts[1])
+                    except ValueError:
+                        sys.stdout.write(f"Invalid turn index: {parts[1]!r}\n")
+                        continue
+                review_text = format_turn_review(
+                    recorder.events,
+                    turn_index=turn_index,
+                    trace_path=recorder.path,
+                    tool_summary_fn=lambda name, args: _tool_summary({"name": name, "args": args}),
+                )
+                sys.stdout.write(review_text)
+                continue
             if prompt.startswith("/show-context"):
                 parts = prompt.split()
-                step = int(parts[1]) if len(parts) > 1 else 0
-                sys.stdout.write(json.dumps(show_context(recorder.events, step), indent=2, ensure_ascii=False) + "\n")
+                if len(parts) == 1 or (len(parts) == 2 and parts[1].lower() == "overview"):
+                    sys.stdout.write(format_show_context_overview(recorder.events))
+                else:
+                    try:
+                        step = int(parts[1])
+                    except ValueError:
+                        sys.stdout.write(f"Invalid step index: {parts[1]!r}\n")
+                        continue
+                    sys.stdout.write(
+                        json.dumps(show_context(recorder.events, step), indent=2, ensure_ascii=False) + "\n"
+                    )
                 continue
             if prompt == "/help":
                 sys.stdout.write(SLASH_COMMAND_HELP + "\n")
                 continue
+            render_input_bottom_and_footer(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
             start_idx = len(recorder.events)
             turn_state["since_event_idx"] = start_idx
             turn_state["write_priors"] = {}
@@ -905,7 +1014,13 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             run_live_task(root, prompt, recorder, client=client, guard=guard, policy=policy, history=conversation)
             turn_state["force_state"] = None
             answer = _latest_parent_answer(recorder.events, start_idx)
-            literal_outputs = _literal_tool_outputs(recorder.events, start_idx, literal_prompt, answer)
+            literal_outputs = _literal_tool_outputs(
+                recorder.events,
+                start_idx,
+                literal_prompt,
+                answer,
+                trace_path=recorder.path,
+            )
             print_turn_output(
                 answer=answer,
                 literal_outputs=literal_outputs,
@@ -978,7 +1093,9 @@ def main(argv: list[str] | None = None) -> int:
     answer = _latest_parent_answer(recorder.events)
     if answer:
         print(answer)
-    for output in _literal_tool_outputs(recorder.events, 0, args.task, answer):
+    for output in _literal_tool_outputs(
+        recorder.events, 0, args.task, answer, trace_path=recorder.path
+    ):
         print(output)
     if args.trace:
         print(render_tree(recorder.events))

@@ -17,7 +17,9 @@ unaffected.
    - Line 2: `cwd: {short_cwd}` where `short_cwd` tilde-expands `$HOME`.
    - After the first completed agent turn, the welcome panel is **not** shown
      again until `/status`, `/reset`, or `/new` (compact idle chrome).
-3. **Input section** — dim `Rule`, then prompt, then dim `Rule`:
+3. **Input section** — separated from turn output and session chrome by **two
+   blank lines**, then a dim `Rule` titled **`input`**, then prompt, then dim
+   `Rule` (no title):
    - Prompt character: `> ` (not `vg>`).
    - Placeholder (empty buffer): `Try "read data/sample.log and summarise auth/"`.
    - Slash-command autocomplete unchanged (`prompt_toolkit` completer).
@@ -33,9 +35,12 @@ unaffected.
    - `{status_icon} {status}` — `✓ ready` | `… running` | `⚠ warn` | `✗ error`.
 5. **Hint line** — dim: `/help for commands · /status to refresh session` (once
    per screen; not duplicated in the welcome panel).
-6. **Secondary status** (conditional) — only when `final_status ∉ {ok, ready}`
-   or `tool_errors > 0`:
-   - `!! {reason} — see progress above` in yellow accent.
+6. **Secondary status** (conditional):
+   - When `final_status ∉ {ok, ready}` or `tool_errors > 0`: `!! {reason} — see
+     progress above` in yellow accent.
+   - When the latest completed turn had **overlapping** parallel explorers (from
+     `subagent_return` intervals): dim `last turn: N parallel explorers (overlap
+     confirmed)` (at most one line; no full `/review` dump).
 
 ## Refresh rules
 
@@ -45,9 +50,9 @@ unaffected.
 | After first turn | Compact chrome (label + status bar + hint) on idle prompts |
 | During agent run | Status bar refresh (throttled) on progress events; `… running` state |
 | After each agent turn | Status bar + hint (+ secondary if needed); `mark_turn_completed()` |
-| `/status` | Full dashboard (after screen clear) |
+| `/status` | Full dashboard (after screen clear) + `reset_dashboard_mode()`; stdout session summary (statusline, budget, trace, last run) |
 | `/reset`, `/new` | Full dashboard (after screen clear); `/new` also `reset_dashboard_mode()` |
-| Before each prompt | Top rule only; bottom rule + status bar after input |
+| Before each prompt | Two blank lines + top `Rule("input")`; bottom rule + status bar after input (slash commands handled before footer) |
 
 ### Screen clear
 
@@ -81,10 +86,14 @@ After each agent turn (not slash commands), when `use_rich_ui()` is true and
 the turn produces a parent answer and/or literal tool outputs:
 
 1. Top dim `Rule` on **stdout**.
-2. **Response** — Rich `Panel` when the parent answer is non-empty.
+2. **Response** — Rich `Panel` when the parent answer is non-empty. When the
+   body has **more than one non-empty line**, each line is prefixed with `• `
+   unless it already looks like a list item (`- `, `* `, `• `, or `N. `).
+   Single-line answers are unchanged. Tool output, Trees, Syntax, diffs, and
+   compaction banners are not bulletized.
 3. **Tool output** — optional `Panel` with `Tree` for directory listings or
    `Syntax` for multi-line file content; skip a literal block when every line
-   already appears in the answer.
+   already appears in the answer. Large reads use **File preview** (below).
 4. **Changes** (conditional) — when the turn includes a successful `edit_file` or
    `write_file` (any agent), a `Changes` panel on **stdout** lists each touched
    path once with a unified diff (see **File-edit diffs** below). Omitted when
@@ -95,6 +104,17 @@ The status bar refresh on stderr follows immediately after the framed block.
 
 Non-TTY chat keeps the current plain single-block stdout write with no rules.
 Slash-command output is never framed.
+
+## File preview (literal tool output)
+
+When chat echoes parent `read_file` / `read_file_range` results after a turn
+(`specs/15_cli_contract.md`):
+
+| Condition | TTY shows |
+|-----------|-----------|
+| Matching `compaction` for that `tool_use_id` | Compaction banner (`format_compaction_banner`), not raw body |
+| Body line count &gt; `VG_CHAT_FILE_PREVIEW_LINES` (default **30**) | Header (path, total lines, bytes, `event_idx`, trace path) + **last N lines** + footer `… M earlier lines (full payload in trace)` and `read_file_range` hint |
+| Small files / `run_bash` listings | Existing Tree or full `Syntax` behavior |
 
 ## File-edit diffs
 
@@ -143,8 +163,37 @@ When `--require-approval` is not `off` and `use_rich_ui()` is true:
 - `[agent]` lines indented under the header when grouping is enabled.
 - `compaction` and `context_compaction` events may print an extra dim banner
   (`format_compaction_banner`).
+- On successful parent `spawn_subagents` `tool_result`, print one **`[parallel]`**
+  summary line (overlap yes/no, per-child duration, truncated question snippets)
+  derived from `parallel_subagent_summary` in `trace.py`. No new JSONL kinds.
 - Successful `edit_file` / `write_file` results may print a diff panel on stderr
   (Rich TTY only; see **File-edit diffs**). No new JSONL event kinds.
+
+## `/review` output
+
+Plain stdout (optional dim Rich sections when TTY). Sections:
+
+1. **Prompt** — user text for the turn.
+2. **Parent plan** — parent `assistant_step` tool-call summaries.
+3. **Parallel** — overlap, durations, truncated explorer payloads when present.
+4. **Context engineering** — `compaction` rows with token counts and trace pointers.
+5. **Answer** — final parent `assistant_text` (truncate above ~2 KB with trace pointer).
+6. **Pointers** — JSONL path; suggest `/show-context <step>`.
+
+Complements `/show-context` (machine JSON for graders); does not replace it.
+
+## `/show-context` overview
+
+Bare `/show-context` (or `/show-context overview`) prints a table of **parent
+steps** with:
+
+- `ctx` — parent-visible message count at that step (`show_context` length)
+- `tools` — tool calls issued **in that step** (from `assistant_step.tool_calls`)
+- `results` / `compact` — cumulative tool results and compacted markers visible
+- `notes` — tool names; `N parallel sub-agents (overlap yes|no)` when
+  `spawn_subagents` ran that step
+
+Use `/show-context N` for the full JSON parent context at step `N`.
 
 ## Colors (TTY, `NO_COLOR` unset)
 
@@ -170,13 +219,15 @@ When `--require-approval` is not `off` and `use_rich_ui()` is true:
 | `NO_COLOR` | Disable Rich UI (existing). |
 | `NO_EMOJI` | ASCII status prefixes (`dir:`, `mdl:`, `usd:`, `stp:`) instead of emoji. |
 | `VG_CHAT_NO_CLEAR` | Disable TTY screen clear before dashboard refresh. |
+| `VG_CHAT_FILE_PREVIEW_LINES` | Max lines shown for large literal `read_file` bodies (default `30`). |
 
 ## Non-TTY fallback
 
 - No Rich panels or rules on stdout/stderr.
 - Single line: `VG Agent chat mode. Type /help for commands.`
 - Prompt: `> ` via `input()`; readline history when available.
-- `/status` prints the compact statusline text plus budget counters (no panel).
+- `/status` prints the compact statusline text, budget counters, trace path, and
+  last run status on stdout (no Rich panel).
 - During agent runs, one compact statusline per parent step (newline-terminated).
 
 ## Machine-readable statusline

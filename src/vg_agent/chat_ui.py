@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +19,7 @@ WRITE_EDIT_TOOLS = _WRITE_EDIT_TOOLS
 
 from . import config, tools
 from .budget import BudgetGuard
-from .trace import TraceRecorder, show_context
+from .trace import TraceRecorder, parallel_subagent_summary, show_context
 
 CHAT_PLACEHOLDER = 'Try "read data/sample.log and summarise auth/"'
 
@@ -197,11 +198,74 @@ def _status_token(
     return "\u2713", status, "green"
 
 
+def file_preview_lines() -> int:
+    try:
+        return max(1, int(os.environ.get("VG_CHAT_FILE_PREVIEW_LINES", "30")))
+    except ValueError:
+        return 30
+
+
+def format_literal_tool_body(
+    content: str,
+    *,
+    tool: str,
+    path: str = "",
+    compaction_event: dict[str, object] | None = None,
+    event_idx: int | None = None,
+    trace_path: Path | str | None = None,
+) -> str:
+    """Compaction banner, tail preview for large reads, or passthrough."""
+    if compaction_event is not None:
+        banner = format_compaction_banner(compaction_event)
+        if banner:
+            return banner
+        from .trace import compacted_marker
+
+        return compacted_marker(compaction_event)
+    if tool not in {"read_file", "read_file_range"}:
+        return content
+    lines = content.splitlines()
+    max_lines = file_preview_lines()
+    if len(lines) <= max_lines:
+        return content
+    tail = lines[-max_lines:]
+    skipped = len(lines) - max_lines
+    header_parts: list[str] = []
+    if path:
+        header_parts.append(path)
+    header_parts.append(f"{len(lines)} lines, {len(content.encode('utf-8'))} bytes")
+    if event_idx is not None:
+        header_parts.append(f"event {event_idx}")
+    if trace_path:
+        header_parts.append(f"trace: {trace_path}")
+    header = " — ".join(header_parts)
+    start_line = len(lines) - max_lines + 1
+    hint = f"read_file_range {path} {start_line} {len(lines)}" if path else ""
+    footer = f"… {skipped} earlier lines (full payload in trace)"
+    if hint:
+        footer += f" · {hint}"
+    return f"{header}\n" + "\n".join(tail) + f"\n{footer}"
+
+
+def _latest_turn_parallel_hint(events: list[dict[str, object]]) -> str | None:
+    prompt_positions = [
+        index for index, event in enumerate(events) if event.get("kind") == "user_prompt"
+    ]
+    if not prompt_positions:
+        return None
+    start = prompt_positions[-1]
+    summary = parallel_subagent_summary(events, since_event_idx=start)
+    if summary is None or not summary.overlap:
+        return None
+    return f"last turn: {len(summary.returns)} parallel explorers (overlap confirmed)"
+
+
 def _secondary_notice(events: list[dict[str, object]], *, since_event_idx: int) -> str | None:
     status = _latest_run_state(events, since_event_idx=since_event_idx)
     turn_errors = _tool_error_count(events[since_event_idx:])
     if status in {"ready", "ok"} and turn_errors == 0:
-        return None
+        parallel_hint = _latest_turn_parallel_hint(events)
+        return parallel_hint
     reason = status
     if turn_errors > 0 and status in {"ready", "ok", "done"}:
         reason = f"{turn_errors} tool error(s)"
@@ -406,7 +470,7 @@ def _write_status_bar(
 
 
 def _write_hint(console: Any) -> None:
-    console.print("[dim]/help for commands \u00b7 /status to refresh session[/dim]")
+    console.print("[dim]/help for commands \u00b7 /status to refresh dashboard and print session summary[/dim]")
 
 
 def _write_secondary(console: Any, events: list[dict[str, object]], *, since_event_idx: int) -> None:
@@ -475,12 +539,33 @@ def print_chat_dashboard_cleared(
         _console().print(f"[dim]trace: traces/{recorder.run_id}.jsonl[/dim]")
 
 
+def format_response_bullets(text: str) -> str:
+    """Prefix each line with a bullet when the response has multiple non-empty lines."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return text
+    out: list[str] = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            out.append("")
+            continue
+        if stripped.startswith(("- ", "* ", "• ")) or re.match(r"^\d+\.\s", stripped):
+            out.append(raw)
+            continue
+        out.append(f"• {stripped}")
+    return "\n".join(out)
+
+
 def render_input_top_rule() -> None:
     if not use_rich_ui():
         return
     from rich.rule import Rule
 
-    _console().print(Rule(style="dim"))
+    console = _console()
+    console.print()
+    console.print()
+    console.print(Rule("input", style="dim"))
 
 
 def render_input_bottom_and_footer(
@@ -804,7 +889,9 @@ def print_turn_output(
         console = Console(file=sys.stdout, highlight=False)
         console.print(Rule(style="dim"))
         if answer_text:
-            console.print(Panel(answer_text, title="Response", border_style="dim"))
+            console.print(
+                Panel(format_response_bullets(answer_text), title="Response", border_style="dim")
+            )
         for output in filtered_outputs:
             if "\n" in output:
                 title, _, body = output.partition(":\n")
@@ -823,7 +910,7 @@ def print_turn_output(
     else:
         parts: list[str] = []
         if answer_text:
-            parts.append(answer_text)
+            parts.append(format_response_bullets(answer_text))
         parts.extend(filtered_outputs)
         if changes:
             parts.append("Changes:")

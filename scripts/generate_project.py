@@ -1159,6 +1159,384 @@ def show_context(events: list[dict[str, object]], step_idx: int) -> list[dict[st
                 "retryable": event.get("retryable"),
             })
     return context
+
+
+def _parent_assistant_positions(events: list[dict[str, object]]) -> list[tuple[int, int]]:
+    """Return (step_idx, event_index) for each parent assistant_step, sorted by step."""
+    positions: list[tuple[int, int]] = []
+    for index, event in enumerate(events):
+        if event.get("kind") == "assistant_step" and event.get("agent_id") == "parent":
+            positions.append((int(event.get("step_idx") or 0), index))
+    return sorted(positions, key=lambda pair: pair[0])
+
+
+def _turn_start_before_event_index(events: list[dict[str, object]], event_index: int) -> int:
+    for index in range(event_index, -1, -1):
+        if events[index].get("kind") == "user_prompt":
+            return index
+    return 0
+
+
+def _event_slice_through_parent_step(events: list[dict[str, object]], step_idx: int) -> tuple[int, int]:
+    """List slice [start, end) covering the turn through completion of parent step ``step_idx``."""
+    positions = _parent_assistant_positions(events)
+    target = next((index for step, index in positions if step == step_idx), None)
+    if target is None:
+        return 0, len(events)
+    turn_start = _turn_start_before_event_index(events, target)
+    next_assistant = next((index for step, index in positions if step > step_idx), len(events))
+    return turn_start, next_assistant
+
+
+def _tool_names_from_assistant_event(event: dict[str, object]) -> list[str]:
+    names: list[str] = []
+    for call in event.get("tool_calls") or []:
+        if isinstance(call, dict):
+            names.append(str(call.get("name") or call.get("tool") or "tool"))
+    return names
+
+
+def show_context_overview(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Per parent-step summary for ``/show-context`` without a step index."""
+    rows: list[dict[str, object]] = []
+    for step_idx, event_index in _parent_assistant_positions(events):
+        context = show_context(events, step_idx)
+        tool_calls = _tool_names_from_assistant_event(events[event_index])
+        compacted = sum(1 for item in context if item.get("compacted"))
+        tool_results = sum(1 for item in context if item.get("role") == "tool")
+        parallel_note: str | None = None
+        if "spawn_subagents" in tool_calls:
+            start, end = _event_slice_through_parent_step(events, step_idx)
+            summary = parallel_subagent_summary(events, since_event_idx=start, before_event_idx=end)
+            if summary is not None:
+                overlap = "yes" if summary.overlap else "no"
+                parallel_note = f"{len(summary.returns)} parallel sub-agents (overlap {overlap})"
+        elif "spawn_subagent" in tool_calls:
+            parallel_note = "1 sub-agent"
+        rows.append(
+            {
+                "step_idx": step_idx,
+                "context_messages": len(context),
+                "tool_calls": tool_calls,
+                "tool_results_visible": tool_results,
+                "compacted_results": compacted,
+                "parallel": parallel_note,
+            }
+        )
+    return rows
+
+
+def format_show_context_overview(events: list[dict[str, object]]) -> str:
+    rows = show_context_overview(events)
+    if not rows:
+        return "No parent steps yet. Run a task first.\\n"
+    lines = [
+        "Parent context overview — use /show-context N for full JSON at step N",
+        f"{'step':>4}  {'ctx':>4}  {'tools':>5}  {'results':>7}  {'compact':>7}  notes",
+        "-" * 72,
+    ]
+    for row in rows:
+        step = int(row["step_idx"])
+        tools = row["tool_calls"]
+        tool_count = len(tools) if isinstance(tools, list) else 0
+        tool_label = ", ".join(tools) if isinstance(tools, list) and tools else "-"
+        if tool_count > 3:
+            tool_label = ", ".join(tools[:3]) + f", +{tool_count - 3} more"
+        notes: list[str] = [tool_label]
+        parallel = row.get("parallel")
+        if parallel:
+            notes.append(str(parallel))
+        lines.append(
+            f"{step:>4}  {int(row['context_messages']):>4}  {tool_count:>5}  "
+            f"{int(row['tool_results_visible']):>7}  {int(row['compacted_results']):>7}  "
+            + " · ".join(notes)
+        )
+    lines.append("")
+    return "\\n".join(lines) + "\\n"
+
+
+def _parse_iso_timestamp(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _intervals_overlap(
+    a_start: datetime,
+    a_end: datetime,
+    b_start: datetime,
+    b_end: datetime,
+) -> bool:
+    return a_start <= b_end and b_start <= a_end
+
+
+def _duration_seconds(started_at: object, ended_at: object) -> float | None:
+    start = _parse_iso_timestamp(started_at)
+    end = _parse_iso_timestamp(ended_at)
+    if start is None or end is None:
+        return None
+    return max(0.0, (end - start).total_seconds())
+
+
+@dataclass(frozen=True)
+class SubagentReturnInfo:
+    child_agent_id: str
+    agent_type: str
+    question: str
+    started_at: str
+    ended_at: str
+    status: str
+    payload_snippet: str
+    duration_sec: float | None
+
+
+@dataclass(frozen=True)
+class ParallelSubagentSummary:
+    returns: tuple[SubagentReturnInfo, ...]
+    overlap: bool
+
+
+def _spawn_questions_by_child(events: list[dict[str, object]]) -> dict[str, str]:
+    questions: dict[str, str] = {}
+    for event in events:
+        if event.get("kind") != "subagent_spawn":
+            continue
+        child = str(event.get("child_agent_id") or "")
+        if child:
+            questions[child] = str(event.get("question") or "")[:60]
+    return questions
+
+
+def parallel_subagent_summary(
+    events: list[dict[str, object]],
+    *,
+    since_event_idx: int = 0,
+    before_event_idx: int | None = None,
+) -> ParallelSubagentSummary | None:
+    """Summarise subagent_return rows in an event slice; overlap from started_at/ended_at."""
+    end = before_event_idx if before_event_idx is not None else len(events)
+    slice_events = events[since_event_idx:end]
+    questions = _spawn_questions_by_child(events[:end])
+    returns: list[SubagentReturnInfo] = []
+    for event in slice_events:
+        if event.get("kind") != "subagent_return":
+            continue
+        child = str(event.get("child_agent_id") or "")
+        payload = str(event.get("summary") or "")
+        returns.append(
+            SubagentReturnInfo(
+                child_agent_id=child,
+                agent_type=str(event.get("agent_type") or "explorer"),
+                question=questions.get(child, ""),
+                started_at=str(event.get("started_at") or ""),
+                ended_at=str(event.get("ended_at") or ""),
+                status=str(event.get("status") or "ok"),
+                payload_snippet=payload[:120],
+                duration_sec=_duration_seconds(event.get("started_at"), event.get("ended_at")),
+            )
+        )
+    if len(returns) < 2:
+        return None
+    intervals: list[tuple[datetime, datetime]] = []
+    for item in returns:
+        start = _parse_iso_timestamp(item.started_at)
+        end = _parse_iso_timestamp(item.ended_at)
+        if start is not None and end is not None:
+            intervals.append((start, end))
+    overlap = False
+    for index, (a_start, a_end) in enumerate(intervals):
+        for b_start, b_end in intervals[index + 1 :]:
+            if _intervals_overlap(a_start, a_end, b_start, b_end):
+                overlap = True
+                break
+        if overlap:
+            break
+    return ParallelSubagentSummary(returns=tuple(returns), overlap=overlap)
+
+
+def format_parallel_progress_lines(
+    summary: ParallelSubagentSummary,
+    *,
+    spawn_payload: list[dict[str, object]] | None = None,
+) -> list[str]:
+    """stderr lines after spawn_subagents tool_result."""
+    durations = [item.duration_sec for item in summary.returns if item.duration_sec is not None]
+    dur_text = ""
+    if durations:
+        parts = [f"{value:.1f}s" for value in durations[:4]]
+        dur_text = f" · {' / '.join(parts)}"
+    overlap_label = "yes" if summary.overlap else "no"
+    types = {item.agent_type for item in summary.returns}
+    type_label = next(iter(types)) if len(types) == 1 else "mixed"
+    header = (
+        f"[parallel] {len(summary.returns)} {type_label} finished "
+        f"({'concurrently' if summary.overlap else 'sequentially'}) "
+        f"(overlap {overlap_label}{dur_text})"
+    )
+    lines = [header]
+    payload_by_child: dict[str, str] = {}
+    if spawn_payload:
+        for entry in spawn_payload:
+            if isinstance(entry, dict):
+                child = str(entry.get("agent_id") or "")
+                payload_by_child[child] = str(entry.get("payload") or "")[:60]
+    for item in summary.returns:
+        snippet = payload_by_child.get(item.child_agent_id) or item.question or item.payload_snippet
+        child_short = item.child_agent_id.split(".")[-1] if "." in item.child_agent_id else item.child_agent_id
+        lines.append(f"  · {child_short}: {snippet}")
+    return lines
+
+
+def parallel_finops_batch_lines(events: list[dict[str, object]]) -> list[str]:
+    """Short parallel-batch summary for /finops."""
+    prompt_positions = [
+        index for index, event in enumerate(events) if event.get("kind") == "user_prompt"
+    ]
+    if not prompt_positions:
+        return []
+    batches: list[str] = []
+    batch_num = 0
+    for turn_num, start in enumerate(prompt_positions, start=1):
+        end = prompt_positions[turn_num] if turn_num < len(prompt_positions) else len(events)
+        turn_events = events[start:end]
+        has_spawn = any(
+            event.get("kind") == "tool_result"
+            and event.get("tool") == "spawn_subagents"
+            and event.get("status") == "ok"
+            and event.get("agent_id") == "parent"
+            for event in turn_events
+        )
+        if not has_spawn:
+            continue
+        summary = parallel_subagent_summary(events, since_event_idx=start, before_event_idx=end)
+        if summary is None:
+            continue
+        batch_num += 1
+        overlap_label = "overlapping wall-clock" if summary.overlap else "no overlap detected"
+        batches.append(
+            f"  turn {turn_num}: spawn_subagents · {len(summary.returns)} sub-agents · {overlap_label}"
+        )
+    if not batches:
+        return []
+    return [f"Parallel batches this session: {batch_num}", *batches]
+
+
+def _turn_event_bounds(events: list[dict[str, object]], turn_index: int) -> tuple[int, int] | None:
+    """Return (start_list_index, end_list_index) for 1-based user_prompt turn_index."""
+    prompt_positions = [
+        index for index, event in enumerate(events) if event.get("kind") == "user_prompt"
+    ]
+    if turn_index < 1 or turn_index > len(prompt_positions):
+        return None
+    start = prompt_positions[turn_index - 1]
+    end = prompt_positions[turn_index] if turn_index < len(prompt_positions) else len(events)
+    return start, end
+
+
+def format_turn_review(
+    events: list[dict[str, object]],
+    *,
+    turn_index: int | None = None,
+    trace_path: Path | str | None = None,
+    tool_summary_fn: Any | None = None,
+) -> str:
+    """Human-readable recap of one chat turn for /review."""
+    prompt_positions = [
+        index for index, event in enumerate(events) if event.get("kind") == "user_prompt"
+    ]
+    if not prompt_positions:
+        return "No turns recorded yet.\\n"
+    chosen = turn_index if turn_index is not None else len(prompt_positions)
+    bounds = _turn_event_bounds(events, chosen)
+    if bounds is None:
+        return f"Turn {chosen} not found ({len(prompt_positions)} turn(s) in session).\\n"
+    start, end = bounds
+    turn_events = events[start:end]
+    lines: list[str] = [f"=== Turn {chosen} review ===", ""]
+    user_prompt = next((event for event in turn_events if event.get("kind") == "user_prompt"), None)
+    if user_prompt:
+        lines.extend(["Prompt:", str(user_prompt.get("prompt") or ""), ""])
+    lines.append("Parent plan:")
+    plan_found = False
+    for event in turn_events:
+        if event.get("kind") != "assistant_step" or event.get("agent_id") != "parent":
+            continue
+        tool_calls = event.get("tool_calls") or []
+        if not isinstance(tool_calls, list):
+            continue
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            name = str(call.get("name") or call.get("tool") or "tool")
+            args = call.get("args") or {}
+            if tool_summary_fn is not None:
+                summary = tool_summary_fn(name, args if isinstance(args, dict) else {})
+            else:
+                summary = name
+            lines.append(f"  - {summary}")
+            plan_found = True
+    if not plan_found:
+        lines.append("  (no tool calls)")
+    lines.append("")
+    summary = parallel_subagent_summary(events, since_event_idx=start, before_event_idx=end)
+    lines.append("Parallel:")
+    if summary is None:
+        lines.append("  (no parallel sub-agent batch)")
+    else:
+        lines.append(
+            f"  {len(summary.returns)} sub-agents · overlap {'yes' if summary.overlap else 'no'}"
+        )
+        for item in summary.returns:
+            dur = f"{item.duration_sec:.1f}s" if item.duration_sec is not None else "?"
+            lines.append(
+                f"  · {item.child_agent_id} ({item.agent_type}, {dur}): "
+                f"{item.payload_snippet or item.question}"
+            )
+    lines.append("")
+    compactions = [event for event in turn_events if event.get("kind") == "compaction"]
+    lines.append("Context engineering:")
+    if not compactions:
+        lines.append("  (no compaction events)")
+    else:
+        for event in compactions:
+            lines.append(
+                f"  - compacted {event.get('before_tokens')} -> {event.get('after_tokens')} tokens "
+                f"(trace event {event.get('original_event_idx')})"
+            )
+    lines.append("")
+    answer = ""
+    for event in reversed(turn_events):
+        if event.get("kind") != "assistant_step" or event.get("agent_id") != "parent":
+            continue
+        tool_calls = event.get("tool_calls") or []
+        text = str(event.get("assistant_text") or "").strip()
+        if not tool_calls and text:
+            answer = text
+            break
+    lines.append("Answer:")
+    if not answer:
+        lines.append("  (no final parent text)")
+    elif len(answer) > 2048:
+        lines.append(answer[:2048])
+        lines.append(f"  … truncated ({len(answer)} chars; full text in trace)")
+    else:
+        lines.append(answer)
+    lines.append("")
+    if trace_path:
+        lines.append(f"trace: {trace_path}")
+    parent_steps = [
+        int(event.get("step_idx") or 0)
+        for event in turn_events
+        if event.get("kind") == "assistant_step" and event.get("agent_id") == "parent"
+    ]
+    if parent_steps:
+        lines.append(f"Tip: /show-context {max(parent_steps)} for parent-visible context at final step.")
+    lines.append("")
+    return "\\n".join(lines)
 ''',
     "demo_fixture.py": '''"""Generated deterministic fixture repository."""
 
@@ -2276,6 +2654,7 @@ from .chat_ui import (
     capture_write_prior,
     emit_session_statusline,
     format_compaction_banner,
+    format_literal_tool_body,
     format_statusline_compact,
     mark_turn_completed,
     print_chat_dashboard_cleared,
@@ -2294,7 +2673,16 @@ from .agent import BUDGET_CAP_TOOL, ApprovalOutcome, ApprovalPolicy, ApprovalReq
 from .live_model_client import LiveModelClient, MissingOpenRouterKey
 from .budget import BudgetGuard
 from .demo_fixture import write_fixture
-from .trace import TraceRecorder, render_tree, show_context
+from .trace import (
+    TraceRecorder,
+    format_parallel_progress_lines,
+    format_show_context_overview,
+    format_turn_review,
+    parallel_finops_batch_lines,
+    parallel_subagent_summary,
+    render_tree,
+    show_context,
+)
 
 
 def _stdin_prompt(stream: object | None = None, *, workspace_root: Path | None = None) -> "callable":
@@ -2360,6 +2748,27 @@ def _print_budget(guard: BudgetGuard) -> None:
     )
 
 
+def _print_chat_status_report(
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    args: argparse.Namespace,
+    *,
+    since_event_idx: int = 0,
+) -> None:
+    line = _format_chat_statusline(
+        recorder,
+        guard,
+        live_model=bool(args.live_model),
+        since_event_idx=since_event_idx,
+    )
+    sys.stdout.write(line + "\\n")
+    _print_budget(guard)
+    sys.stdout.write(f"trace: {recorder.path}\\n")
+    final_status = _latest_run_end_status(recorder.events)
+    if final_status:
+        sys.stdout.write(f"last_run: {final_status}\\n")
+
+
 SLASH_COMMANDS = (
     "/exit",
     "/quit",
@@ -2370,21 +2779,24 @@ SLASH_COMMANDS = (
     "/reset",
     "/new",
     "/show-context",
+    "/review",
     "/help",
 )
 SLASH_COMMAND_USAGE = {
     "/show-context": "/show-context N",
+    "/review": "/review [N]",
 }
 SLASH_COMMAND_META = {
     "/exit": "End chat cleanly",
     "/quit": "Alias for /exit",
     "/budget": "Show steps, tokens, USD, and daily remaining",
-    "/status": "Reprint session dashboard (TTY) or compact status + budget",
-    "/finops": "Show per-agent token, tool, and cost table",
+    "/status": "Refresh dashboard (TTY) and print session summary on stdout",
+    "/finops": "Show per-agent token, tool, and cost table (+ parallel batches)",
+    "/review": "Readable recap of a completed turn (default: last)",
     "/approvals": "Show approval history and cached scopes",
     "/reset": "Clear approvals, budget, and chat history",
     "/new": "Start a fresh chat session and trace",
-    "/show-context": "N: parent step index; default 0",
+    "/show-context": "Overview, or N for parent context JSON at step N",
     "/help": "Show slash command help",
 }
 
@@ -2515,6 +2927,9 @@ def _print_finops(guard: BudgetGuard, recorder: TraceRecorder | None = None) -> 
     if recorder is not None:
         user_prompts = sum(1 for event in recorder.events if event.get("kind") == "user_prompt")
         sys.stdout.write(f"user_prompts {user_prompts}\\n")
+        parallel_lines = parallel_finops_batch_lines(recorder.events)
+        if parallel_lines:
+            sys.stdout.write("\\n".join(parallel_lines) + "\\n")
 
 
 def _print_approvals(policy: ApprovalPolicy, recorder: TraceRecorder) -> None:
@@ -2794,6 +3209,7 @@ def _make_progress_sink(
     on_parent_status: Any = None,
     turn_state: dict[str, Any] | None = None,
     workspace_root: Path | None = None,
+    recorder: TraceRecorder | None = None,
 ) -> "callable":
     fh = stream if stream is not None else sys.stderr
     use_color = bool(getattr(fh, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
@@ -2808,6 +3224,8 @@ def _make_progress_sink(
             return
         if kind == "user_prompt":
             state["turn"] = int(state.get("turn", 0)) + 1
+            if recorder is not None:
+                state["turn_list_start"] = len(recorder.events) - 1
             pending_calls.clear()
             if use_color:
                 fh.write(f"\\n\\x1b[90m── turn {state['turn']} ──\\x1b[0m\\n")
@@ -2834,6 +3252,26 @@ def _make_progress_sink(
         if kind == "tool_result":
             tool = str(event.get("tool") or "")
             tool_use_id = str(event.get("tool_use_id") or "")
+            if (
+                tool == "spawn_subagents"
+                and event.get("status") == "ok"
+                and event.get("agent_id") == "parent"
+                and recorder is not None
+            ):
+                since = int(state.get("turn_list_start", 0))
+                summary = parallel_subagent_summary(recorder.events, since_event_idx=since)
+                if summary is not None:
+                    spawn_payload: list[dict[str, object]] | None = None
+                    try:
+                        parsed = json.loads(str(event.get("result_full") or ""))
+                    except json.JSONDecodeError:
+                        parsed = None
+                    if isinstance(parsed, list):
+                        spawn_payload = [item for item in parsed if isinstance(item, dict)]
+                    parallel_color = "\\x1b[35m" if use_color else ""
+                    for parallel_line in format_parallel_progress_lines(summary, spawn_payload=spawn_payload):
+                        fh.write(f"{parallel_color}{parallel_line}{reset}\\n")
+                    fh.flush()
             if tool in WRITE_EDIT_TOOLS and event.get("status") == "ok":
                 call = pending_calls.pop(tool_use_id, None)
                 if call is not None:
@@ -2905,10 +3343,21 @@ def _parent_tool_calls(events: list[dict[str, object]], start_idx: int) -> dict[
     return calls
 
 
-def _literal_tool_outputs(events: list[dict[str, object]], start_idx: int, prompt: str, answer: str) -> list[str]:
+def _literal_tool_outputs(
+    events: list[dict[str, object]],
+    start_idx: int,
+    prompt: str,
+    answer: str,
+    *,
+    trace_path: Path | None = None,
+) -> list[str]:
     if not _wants_literal_tool_output(prompt):
         return []
     calls = _parent_tool_calls(events, start_idx)
+    compaction_by_tool: dict[str, dict[str, object]] = {}
+    for event in events[start_idx:]:
+        if event.get("kind") == "compaction":
+            compaction_by_tool[str(event.get("tool_use_id") or "")] = event
     outputs: list[str] = []
     answer_text = answer.strip()
     for event in events[start_idx:]:
@@ -2919,11 +3368,27 @@ def _literal_tool_outputs(events: list[dict[str, object]], start_idx: int, promp
         content = clarify_tool_error(str(event.get("tool") or ""), str(event.get("result_full") or "")).strip()
         if not content or (answer_text and content in answer_text):
             continue
-        call = calls.get(str(event.get("tool_use_id") or ""), {})
-        command = str(call.get("command") or "").strip()
+        tool_use_id = str(event.get("tool_use_id") or "")
+        call = calls.get(tool_use_id, {})
+        args = call.get("args") or {}
+        path = str(args.get("path") or "") if isinstance(args, dict) else ""
+        command = str(call.get("command") or "").strip() if isinstance(call, dict) else ""
+        body = format_literal_tool_body(
+            content,
+            tool=str(event.get("tool") or ""),
+            path=path,
+            compaction_event=compaction_by_tool.get(tool_use_id),
+            event_idx=int(event.get("event_idx") or 0),
+            trace_path=trace_path,
+        )
         label = "Tool output" if event.get("status") == "ok" else "Blocked"
-        title = f"{label} ({command}):" if command else f"{label} ({event.get('tool')}):"
-        outputs.append(f"{title}\\n{content}")
+        if command:
+            title = f"{label} ({command}):"
+        elif path:
+            title = f"{label} ({path}):"
+        else:
+            title = f"{label} ({event.get('tool')}):"
+        outputs.append(f"{title}\\n{body}")
     return outputs
 
 
@@ -3036,12 +3501,12 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             force_state=turn_state.get("force_state"),
         )
 
-    recorder = TraceRecorder(
-        root,
-        redact=not args.no_redact,
-        event_sink=_make_progress_sink(
-            on_parent_status=on_parent_status, turn_state=turn_state, workspace_root=root
-        ),
+    recorder = TraceRecorder(root, redact=not args.no_redact, event_sink=None)
+    recorder.event_sink = _make_progress_sink(
+        on_parent_status=on_parent_status,
+        turn_state=turn_state,
+        workspace_root=root,
+        recorder=recorder,
     )
     policy = _make_policy(args, workspace_root=root)
     history_path = root / ".vg_chat_history"
@@ -3057,7 +3522,6 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             try:
                 render_input_top_rule()
                 prompt = read_prompt().strip()
-                render_input_bottom_and_footer(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
             except KeyboardInterrupt:
                 recorder.emit("budget_event", budget_reason="user_abort", details={})
                 sys.stderr.write("\\n")
@@ -3074,11 +3538,9 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 continue
             if prompt == "/status":
                 if use_rich_ui():
+                    reset_dashboard_mode()
                     print_chat_dashboard_cleared(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since), compact=False)
-                else:
-                    line = _format_chat_statusline(recorder, guard, live_model=bool(args.live_model))
-                    sys.stdout.write(line + "\\n")
-                    _print_budget(guard)
+                _print_chat_status_report(recorder, guard, args, since_event_idx=ui_since)
                 continue
             if prompt == "/approvals":
                 _print_approvals(policy, recorder)
@@ -3102,14 +3564,12 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 ui_since = 0
                 reset_dashboard_mode()
                 turn_state["turn"] = 0
-                recorder = TraceRecorder(
-                    root,
-                    redact=not args.no_redact,
-                    event_sink=_make_progress_sink(
-                        on_parent_status=on_parent_status,
-                        turn_state=turn_state,
-                        workspace_root=root,
-                    ),
+                recorder = TraceRecorder(root, redact=not args.no_redact, event_sink=None)
+                recorder.event_sink = _make_progress_sink(
+                    on_parent_status=on_parent_status,
+                    turn_state=turn_state,
+                    workspace_root=root,
+                    recorder=recorder,
                 )
                 recorder.emit("session_new")
                 if use_rich_ui():
@@ -3121,14 +3581,41 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             if prompt == "/finops":
                 _print_finops(guard, recorder)
                 continue
+            if prompt.startswith("/review"):
+                parts = prompt.split()
+                turn_index: int | None = None
+                if len(parts) > 1:
+                    try:
+                        turn_index = int(parts[1])
+                    except ValueError:
+                        sys.stdout.write(f"Invalid turn index: {parts[1]!r}\\n")
+                        continue
+                review_text = format_turn_review(
+                    recorder.events,
+                    turn_index=turn_index,
+                    trace_path=recorder.path,
+                    tool_summary_fn=lambda name, args: _tool_summary({"name": name, "args": args}),
+                )
+                sys.stdout.write(review_text)
+                continue
             if prompt.startswith("/show-context"):
                 parts = prompt.split()
-                step = int(parts[1]) if len(parts) > 1 else 0
-                sys.stdout.write(json.dumps(show_context(recorder.events, step), indent=2, ensure_ascii=False) + "\\n")
+                if len(parts) == 1 or (len(parts) == 2 and parts[1].lower() == "overview"):
+                    sys.stdout.write(format_show_context_overview(recorder.events))
+                else:
+                    try:
+                        step = int(parts[1])
+                    except ValueError:
+                        sys.stdout.write(f"Invalid step index: {parts[1]!r}\\n")
+                        continue
+                    sys.stdout.write(
+                        json.dumps(show_context(recorder.events, step), indent=2, ensure_ascii=False) + "\\n"
+                    )
                 continue
             if prompt == "/help":
                 sys.stdout.write(SLASH_COMMAND_HELP + "\\n")
                 continue
+            render_input_bottom_and_footer(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
             start_idx = len(recorder.events)
             turn_state["since_event_idx"] = start_idx
             turn_state["write_priors"] = {}
@@ -3145,7 +3632,13 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             run_live_task(root, prompt, recorder, client=client, guard=guard, policy=policy, history=conversation)
             turn_state["force_state"] = None
             answer = _latest_parent_answer(recorder.events, start_idx)
-            literal_outputs = _literal_tool_outputs(recorder.events, start_idx, literal_prompt, answer)
+            literal_outputs = _literal_tool_outputs(
+                recorder.events,
+                start_idx,
+                literal_prompt,
+                answer,
+                trace_path=recorder.path,
+            )
             print_turn_output(
                 answer=answer,
                 literal_outputs=literal_outputs,
@@ -3218,7 +3711,9 @@ def main(argv: list[str] | None = None) -> int:
     answer = _latest_parent_answer(recorder.events)
     if answer:
         print(answer)
-    for output in _literal_tool_outputs(recorder.events, 0, args.task, answer):
+    for output in _literal_tool_outputs(
+        recorder.events, 0, args.task, answer, trace_path=recorder.path
+    ):
         print(output)
     if args.trace:
         print(render_tree(recorder.events))

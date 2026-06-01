@@ -32,12 +32,15 @@ model step.
 | `/exit` | End the chat process cleanly. |
 | `/quit` | Alias for `/exit`. |
 | `/budget` | Print the current session budget counters: steps, tokens, USD spend, and daily remaining USD. |
-| `/status` | In TTY chat, clear the terminal and reprint the full session dashboard (welcome panel + status bar). In non-TTY chat, print the compact statusline plus budget counters. See `specs/16_chat_ui.md`. |
-| `/finops` | Print a per-agent-type FinOps table for the session, including input/output/total tokens, model-call count, tool-call count, and USD spend. |
+| `/status` | Clear and reprint the full session dashboard when Rich TTY UI is active (welcome panel + status bar). Always print on stdout: compact statusline, budget counters, trace path, and last `run_end` status when present. See `specs/16_chat_ui.md`. |
+| `/finops` | Print a per-agent-type FinOps table for the session, including input/output/total tokens, model-call count, tool-call count, and USD spend. After the table, print a short **parallel batches** summary when `spawn_subagents` produced overlapping sub-agents (see `specs/60_observability.md`). |
+| `/review` | Print a human-readable recap of a completed user turn: prompt, parent tool plan, parallel sub-agent summary, compaction rows, final answer, and trace pointers. `/review` = last turn; `/review N` = turn `N` (1-based `user_prompt` index). |
 | `/approvals` | Print the session approval history and any cached reusable approval scopes. |
 | `/reset` | Clear cached approval scopes, reset the session budget guard, clear conversation history, and emit a `session_reset` trace event. In TTY Rich chat, also clear the terminal before reprinting the dashboard. |
 | `/new` | Start a fresh chat session and trace inside the current REPL process; clear cached approval scopes, reset the budget guard, clear conversation history, and emit a `session_new` trace event in the new trace. In TTY Rich chat, clear the terminal before the welcome dashboard. |
-| `/show-context N` | Print the parent-visible context at parent step `N` as formatted JSON. If `N` is omitted, step `0` is used. |
+| `/show-context` | Print a **step overview**: per parent step, context message count, tools invoked that step, visible tool-result count, compaction count, and parallel sub-agent notes when `spawn_subagents` ran. |
+| `/show-context N` | Print the parent-visible context at parent step `N` as formatted JSON (same as `--show-context N`). |
+| `/show-context overview` | Alias for `/show-context` (overview only). |
 | `/help` | Print the available slash commands in their compact help form. |
 
 Interactive TTY chat provides arrow-key autocomplete only while the current
@@ -70,6 +73,11 @@ chat prints the parent tool output after the assistant answer when the answer
 does not already include it. Failed parent read/inspection tools are printed as
 `Tool error (...)` with the tool's refusal/error text, so a refused read does
 not collapse into only a final `tool_error` run state.
+
+Literal read output follows `specs/16_chat_ui.md` **File preview** rules: when
+the parent `tool_result` was compacted, show the compaction banner instead of
+raw file bytes; when the file exceeds `VG_CHAT_FILE_PREVIEW_LINES` (default 30),
+show the **last N lines** plus a trace pointer and `read_file_range` hint.
 
 ## Flags
 

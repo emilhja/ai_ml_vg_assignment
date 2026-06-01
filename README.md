@@ -159,8 +159,82 @@ SQLite observability:
 - The SQLite database keeps the lossless event payloads plus rollup tables for
   sessions, runs, turns, model calls, tool calls, sub-agents, approvals,
   redactions, and compactions. This records prompt durations, response
-  latency, token and cost totals, tool latency/errors, and model usage without
-  requiring a frontend yet.
+  latency, token and cost totals, tool latency/errors, and model usage.
+
+### Trace analysis dashboard
+
+Local FastAPI + React UI for live session tail (SSE), history browse, and
+statistics. See [`specs/70_dashboard.md`](specs/70_dashboard.md).
+
+**Important:** start the **API from the repository root**, not from
+`dashboard/web`. The API resolves trace paths from the process working
+directory. If you run uvicorn inside `dashboard/web`, startup will log
+`trace_dirs=[]` and History will show zero sessions even though
+`traces/*.jsonl` exists one level up.
+
+```powershell
+# Install dashboard deps (once)
+uv sync --extra dashboard --extra dev
+```
+
+**Recommended (Git Bash / WSL)** — one command from repo root starts API + Vite:
+
+```bash
+./start-web.sh
+# Optional: ./start-web.sh --no-install --api-port 8787
+```
+
+**Manual two-terminal setup** (fallback):
+
+```powershell
+# From repo root: C:\Users\emil_\vscode\vg_assignment
+cd C:\Users\emil_\vscode\vg_assignment
+
+# Terminal 1 — API (must be repo root)
+$env:VG_WORKSPACE_ROOT = "workspace"
+uv run uvicorn dashboard.api.main:app --host 127.0.0.1 --port 8787 --reload
+```
+
+On startup you should see something like:
+
+```text
+dashboard: sqlite=...\vg_assignment\traces\vg_agent.sqlite3 schema_ready=True
+dashboard: trace_dirs=['...\workspace\traces', '...\traces']
+```
+
+If you see `trace_dirs=[]` or a sqlite path under `dashboard\web\`, stop
+uvicorn, `cd` to the repo root, and start again.
+
+```powershell
+# Terminal 2 — frontend (dashboard/web is fine here)
+cd dashboard\web
+npm install
+npm run dev
+# Open http://127.0.0.1:5173  (Vite proxies /api → :8787)
+```
+
+**PowerShell launcher** (starts API from repo root in a new window):
+
+```powershell
+.\scripts\run_dashboard.ps1
+```
+
+Do **not** run `uvicorn` from `dashboard/web` unless you set `VG_TRACES_DIR` /
+`VG_SQLITE_PATH` (see alternative below).
+
+**Alternative:** keep uvicorn in `dashboard/web` but point at real traces:
+
+```powershell
+cd dashboard\web
+$env:VG_TRACES_DIR = "C:\Users\emil_\vscode\vg_assignment\traces"
+$env:VG_SQLITE_PATH = "C:\Users\emil_\vscode\vg_assignment\traces\vg_agent.sqlite3"
+uv run uvicorn dashboard.api.main:app --host 127.0.0.1 --port 8787 --reload
+```
+
+Quick checks:
+
+- http://127.0.0.1:8787/api/v1/health — `schema_ready: true`, non-empty `traces_dirs`
+- http://127.0.0.1:8787/api/v1/sessions?limit=5 — `total` should be &gt; 0 if you have JSONL traces
 
 See [`dev_docs/dangerous_cli.md`](dev_docs/dangerous_cli.md) for the *why*
 behind every command, argument token, and path on the deny-list.
