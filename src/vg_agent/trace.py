@@ -206,6 +206,17 @@ def show_context(events: list[dict[str, object]], step_idx: int) -> list[dict[st
             if pos is not None:
                 context[pos]["content"] = compacted_marker(event)
                 context[pos]["compacted"] = True
+        elif kind == "context_compaction":
+            context.append({
+                "role": "meta",
+                "kind": "context_compaction",
+                "content": (
+                    f"Conversation compacted {event.get('before_tokens')} -> {event.get('after_tokens')} "
+                    f"tokens ({event.get('percent_reduced')}% reduced, reason={event.get('reason')}). "
+                    f"{event.get('summary')}"
+                ),
+                "trace_pointer": event.get("trace_pointer"),
+            })
         elif kind == "approval":
             context.append({
                 "role": "meta",
@@ -574,15 +585,32 @@ def format_turn_review(
             )
     lines.append("")
     compactions = [event for event in turn_events if event.get("kind") == "compaction"]
+    context_compactions = [event for event in turn_events if event.get("kind") == "context_compaction"]
     lines.append("Context engineering:")
-    if not compactions:
+    if not compactions and not context_compactions:
         lines.append("  (no compaction events)")
     else:
         for event in compactions:
+            summary = str(event.get("summary") or "").strip()
+            if len(summary) > 80:
+                summary = summary[:80] + "…"
             lines.append(
-                f"  - compacted {event.get('before_tokens')} -> {event.get('after_tokens')} tokens "
-                f"(trace event {event.get('original_event_idx')})"
+                f"  - tool_result compacted {event.get('before_tokens')} -> {event.get('after_tokens')} tokens "
+                f"(trace event {event.get('original_event_idx')}, model={event.get('compactor_model')}, "
+                f"fallback={event.get('compactor_fallback')})"
             )
+            if summary:
+                lines.append(f"    summary: {summary}")
+        for event in context_compactions:
+            summary = str(event.get("summary") or "").strip()
+            if len(summary) > 80:
+                summary = summary[:80] + "…"
+            lines.append(
+                f"  - conversation compacted {event.get('before_tokens')} -> {event.get('after_tokens')} tokens "
+                f"(reason={event.get('reason')}, {event.get('percent_reduced')}% reduced)"
+            )
+            if summary:
+                lines.append(f"    summary: {summary}")
     lines.append("")
     answer = ""
     for event in reversed(turn_events):

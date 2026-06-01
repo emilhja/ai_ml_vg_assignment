@@ -60,6 +60,11 @@ a single `budget_event` with `reason ∈ {warn_usd, warn_tokens, warn_steps}`
 and `crossed_at_step`. The event is **not** an abort. The hard caps remain
 the only termination triggers.
 
+When `step_count == max_steps - 1` and interactive approval is enabled, the
+parent loop may emit a single proactive `approval{tool:budget_cap,
+budget_reason:step_extend}` before the next model call (`specs/30_runtime_governance.md`).
+`warn_steps` does not trigger that prompt.
+
 ## Per-event attribution
 
 Every event the trace recorder writes must carry these fields (or

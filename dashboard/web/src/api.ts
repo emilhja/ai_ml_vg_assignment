@@ -14,6 +14,9 @@ export type SessionSummary = {
   has_subagents?: boolean;
   has_parallel_subagents?: boolean;
   has_sequential_subagents?: boolean;
+  has_tool_compaction?: boolean;
+  has_context_compaction_auto?: boolean;
+  has_context_compaction_manual?: boolean;
 };
 
 export type EventItem = {
@@ -99,7 +102,10 @@ export type ContextResponse = {
     role: string;
     content?: string | null;
     compacted?: boolean | null;
+    compaction_before_tokens?: number | null;
+    compaction_after_tokens?: number | null;
     tool?: string | null;
+    tool_use_id?: string | null;
     step_idx?: number | null;
   }[];
 };
@@ -246,7 +252,8 @@ export const api = {
   timeline: (runId: string) => get<Timeline>(`/runs/${runId}/timeline`),
   context: (runId: string, stepIdx: number) =>
     get<ContextResponse>(`/runs/${runId}/context?step_idx=${stepIdx}`),
-  maxStep: (runId: string) => get<{ max_step_idx: number }>(`/runs/${runId}/context/max-step`),
+  maxStep: (runId: string) =>
+    get<{ max_step_idx: number; compaction_steps: number[] }>(`/runs/${runId}/context/max-step`),
   parallel: (runId: string) => get<ParallelResponse>(`/runs/${runId}/parallel`),
   safety: (runId: string) => get<SafetyResponse>(`/runs/${runId}/safety`),
   stats: (range: string) => get<StatsResponse>(`/stats?range=${range}`),

@@ -23,8 +23,9 @@ COMPACTOR_MODEL_ID: openrouter/google/gemini-2.0-flash-001
 ```
 
 Optional examples for manual demos include
-`openrouter/anthropic/claude-haiku-4.5`, `openrouter/openai/gpt-5.2`,
-and `openrouter/deepseek/deepseek-r1`. They are not test requirements.
+`openrouter/google/gemini-2.5-flash`, `openrouter/anthropic/claude-haiku-4.5`,
+`openrouter/openai/gpt-5.2`, and `openrouter/deepseek/deepseek-r1`. They are not
+test requirements. Select via `--parent-model` when supported by the CLI.
 
 ## Egress Pin
 
@@ -45,6 +46,8 @@ Preflight budget checks use a conservative estimate for unknown models.
 ```yaml
 GEMINI_2_0_FLASH_INPUT_PER_MTOK: 0.10
 GEMINI_2_0_FLASH_OUTPUT_PER_MTOK: 0.40
+GEMINI_2_5_FLASH_INPUT_PER_MTOK: 0.10
+GEMINI_2_5_FLASH_OUTPUT_PER_MTOK: 0.40
 CLAUDE_SONNET_4_6_INPUT_PER_MTOK: 3.00
 CLAUDE_SONNET_4_6_OUTPUT_PER_MTOK: 15.00
 CLAUDE_HAIKU_4_5_INPUT_PER_MTOK: 1.00

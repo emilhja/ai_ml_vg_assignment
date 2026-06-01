@@ -36,6 +36,10 @@ has the mirror schema, otherwise `traces/vg_agent.sqlite3` at the repo root
 
 JSONL for session `S`: `<resolved_traces_dir>/S.jsonl`.
 
+`all_traces_dirs()` also scans nested `traces/` directories under
+`VG_WORKSPACE_ROOT` (depth-limited glob, deduped), so JSONL written to paths
+such as `workspace/workspace/traces/` is discoverable without manual copy.
+
 ## Active session detection
 
 1. `VG_ACTIVE_SESSION_ID` if set.
@@ -47,7 +51,7 @@ JSONL for session `S`: `<resolved_traces_dir>/S.jsonl`.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | DB reachable, workspace path |
-| GET | `/sessions` | Paginated session list; each item includes `has_subagents`, `has_parallel_subagents`, `has_sequential_subagents` for History filters |
+| GET | `/sessions` | Paginated session list; each item includes sub-agent and compaction flags for History filters (see **History sub-agent badges** and **History compaction filters** below) |
 | GET | `/sessions/active` | Active session snapshot |
 | GET | `/sessions/{session_id}` | Session + runs + turns summary |
 | PATCH | `/sessions/{session_id}` | Set/clear user `display_name` (body: `{ "display_name": string \| null }`; max 120 chars); `session_id` unchanged |
@@ -55,6 +59,7 @@ JSONL for session `S`: `<resolved_traces_dir>/S.jsonl`.
 | GET | `/sessions/{session_id}/stream` | SSE live tail |
 | GET | `/runs/{run_id}/timeline` | Turns, model_calls, tool_calls, subagents |
 | GET | `/runs/{run_id}/context` | `?step_idx=N` — parent `show_context` |
+| GET | `/runs/{run_id}/context/max-step` | `max_step_idx` and `compaction_steps` (parent steps where context includes a compacted tool result) |
 | GET | `/runs/{run_id}/parallel` | Per-turn parallel sub-agent summaries |
 | GET | `/runs/{run_id}/safety` | Approvals, redactions, budget_events |
 | GET | `/stats` | `?range=today\|7d\|30d` — rollups (see below) |
@@ -100,7 +105,7 @@ Client tracks `last_event_idx` for idempotent resume.
 |-------|-----|
 | `/` | Current session (SSE) |
 | `/history` | Session list |
-| `/history/:sessionId` | Detail: Timeline, Context, Tools, Safety, Events (`?tab`, `?runId`, `?highlight`, `?eventIdx`) |
+| `/history/:sessionId` | Detail: Timeline, **Parent context**, Tools, Safety, Events (`?tab`, `?runId`, `?highlight`, `?eventIdx`) |
 | `/stats` | Statistics: tool usage, prompts, expensive turns, drillable tool errors |
 
 ### Event stream (`EventFeed`)
@@ -118,6 +123,50 @@ sub-agent lanes side-by-side instead of stacked. Shown when any turn has overlap
 from `GET /runs/{run_id}/parallel`, overlapping sub-agent timestamp ranges, or a
 `spawn_subagents` tool call with 2+ sub-agent lanes / `subagent_spawn` events
 (even before `subagent_return`).
+
+### History sub-agent badges
+
+`has_parallel_subagents` / `has_sequential_subagents` on the session list use **JSONL**
+when `<traces_dir>/<session_id>.jsonl` exists (same audit rules as the Events tab).
+SQLite is used only when no JSONL file is present.
+
+Per user-prompt turn:
+
+| Badge | When |
+|-------|------|
+| **parallel** (turn) | `parallel_subagent_summary` reports overlapping `subagent_return` intervals, **or** `spawn_subagents` with 2+ overlapping sub-agent lanes (timestamp overlap on lane events, including before returns land). |
+| **sequential** (turn) | `parallel_subagent_summary` with 2+ returns but no overlap, single `spawn_subagent`, or other sub-agent activity without parallel overlap. |
+
+Session flags OR across turns. A session may show **both** badges (e.g. one turn with
+`spawn_subagent`, another with parallel `spawn_subagents`).
+
+### History compaction filters
+
+`has_tool_compaction`, `has_context_compaction_auto`, and
+`has_context_compaction_manual` on the session list use **JSONL** when
+`<traces_dir>/<session_id>.jsonl` exists (same audit rules as sub-agent badges).
+SQLite `compactions` / `events` tables are used only when no JSONL file is present.
+
+| Session field | Filter chip | When |
+|---------------|-------------|------|
+| `has_tool_compaction` | **Tool compaction** | Any parent `kind: compaction` (automatic tool-result compaction over `K_COMPACT`) |
+| `has_context_compaction_auto` | **Auto context compaction** | Any `kind: context_compaction` with `reason: auto` (parent loop before `llm_start` when context exceeds window × fraction) |
+| `has_context_compaction_manual` | **Manual context compaction** | Any `kind: context_compaction` with `reason: manual` (chat `/compact`) |
+
+Matching any selected filter shows the session (same OR semantics as sub-agent filters).
+Select none to show all sessions.
+
+### Verifying compaction on a session
+
+Use any of these on `/history/:sessionId`:
+
+| Tab | What to look for |
+|-----|------------------|
+| **Safety / FinOps** | **Compactions** list: `before_tokens→after_tokens` per tool-result compaction |
+| **Events** | Rows with `kind: compaction` (expand for `original_event_idx`, `original_sha256`) |
+| **Parent context** | Step slider: tool-result **compacted** markers (`[COMPACTED tool_result…]`) and **context_compaction** meta rows (fold summary + before→after). Use **Jump to compaction step** when present. Full payloads remain in JSONL only. |
+
+Canonical live demo: task reads `data/sample.log` then parallel explorers (`demo_review.md` scene 2).
 
 ### Session display names
 
@@ -159,11 +208,18 @@ Turn section headers show **in / out / USD** from SQLite `turns` rollups when av
 | `child_agent_id` | Sub-agent id on `subagent_spawn` / `subagent_return` |
 | `timestamp_iso` | Wall-clock + relative time tags in UI |
 
+## JSONL backfill
+
+On session list or detail, if `<session_id>.jsonl` exists but the session row is
+missing from the resolved SQLite file, the API replays the JSONL into that DB
+(same `SQLiteTraceStore.record_event` path as live runs). Files larger than 50 MiB
+are skipped. `VG_SQLITE_PATH` selects the backfill target.
+
 ## Data authority
 
 | View | Primary source |
 |------|----------------|
-| Lists, rollups, stats | SQLite |
+| Lists, rollups, stats | SQLite (session sub-agent and compaction badges: JSONL when file exists) |
 | Session event list (`GET …/events`), run loaders (timeline, context, parallel) | **Merge** SQLite + JSONL by `event_idx`; JSONL wins on conflict (audit source). JSONL events beyond the SQLite mirror are included when the mirror lags. |
 | Live tail (low latency) | JSONL file tail + SQLite events |
 | Parent context at step N | `vg_agent.trace.show_context` on merged events |

@@ -193,6 +193,10 @@ cd C:\Users\emil_\vscode\vg_assignment
 # Terminal 1 — API (must be repo root)
 $env:VG_WORKSPACE_ROOT = "workspace"
 uv run uvicorn dashboard.api.main:app --host 127.0.0.1 --port 8787 --reload
+
+# Agent traces use the same root (default workspace/ when run from repo root):
+# uv run vg-agent --task "..."   # writes workspace/traces/*.jsonl + vg_agent.sqlite3
+# If your cwd is already the workspace folder: $env:VG_WORKSPACE_ROOT = "."
 ```
 
 On startup you should see something like:

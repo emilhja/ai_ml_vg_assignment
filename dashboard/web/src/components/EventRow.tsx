@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type { EventItem } from "../api";
 import { kindColor } from "../lib/eventKindColor";
 import { formatTimeTags, type TimeAnchors } from "../lib/groupEvents";
+import CompactionStatsBadge from "./CompactionStatsBadge";
 import {
   assistantStepTokens,
   expandableEventDetail,
@@ -72,9 +73,37 @@ export default function EventRow({
         <span className="text-muted">#{event.event_idx}</span>
         <span className={kindColor(event.kind)}>{event.kind}</span>
         {event.kind === "compaction" && (
-          <span className="text-[10px] uppercase tracking-wide px-1 py-0.5 rounded bg-amber-500/20 text-amber-300">
-            compacted
-          </span>
+          <>
+            <span className="text-[10px] uppercase tracking-wide px-1 py-0.5 rounded bg-amber-500/20 text-amber-300">
+              compacted
+            </span>
+            <CompactionStatsBadge
+              before={
+                typeof event.payload.before_tokens === "number"
+                  ? event.payload.before_tokens
+                  : Number(event.payload.before_tokens) || null
+              }
+              after={
+                typeof event.payload.after_tokens === "number"
+                  ? event.payload.after_tokens
+                  : Number(event.payload.after_tokens) || null
+              }
+            />
+          </>
+        )}
+        {event.kind === "context_compaction" && (
+          <CompactionStatsBadge
+            before={
+              typeof event.payload.before_tokens === "number"
+                ? event.payload.before_tokens
+                : Number(event.payload.before_tokens) || null
+            }
+            after={
+              typeof event.payload.after_tokens === "number"
+                ? event.payload.after_tokens
+                : Number(event.payload.after_tokens) || null
+            }
+          />
         )}
         {event.agent_id && <span className="text-muted">{event.agent_id}</span>}
         {event.tool && <span>{event.tool}</span>}

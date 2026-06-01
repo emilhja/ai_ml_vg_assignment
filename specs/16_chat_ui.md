@@ -30,8 +30,12 @@ unaffected.
    - `{mode}` — always `live` (the agent has a single live runtime path).
    - `ctx {tokens}` or `ctx {tokens}/{window} ({pct}%)` — parent-visible context
      token estimate from `show_context`, not raw `llm_start.tokens_in`.
-   - `🪙 ${running_usd:.4f}/${max_usd:.2f}` — session spend vs cap.
-   - `📊 {steps}/{max_steps} steps`.
+   - `⚠️ 🪙 ${running}/${cap}` (or `! usd:` without emoji) — session spend vs cap; **bold red**
+     when the next model step is projected to exceed `--max-usd`, **yellow** with the same
+     warning icon at the 80% warn threshold (`WARN_USD_FRACTION`). May append
+     `(next ~$projected)` when over cap.
+   - `📊 {steps}/{max_steps} steps` — prefix `!` when `steps == max_steps - 1`
+     (one step remaining before hard `step_cap`).
    - `{status_icon} {status}` — `✓ ready` | `… running` | `⚠ warn` | `✗ error`.
 5. **Hint line** — dim: `/help for commands · /status to refresh session` (once
    per screen; not duplicated in the welcome panel).
@@ -176,7 +180,10 @@ Plain stdout (optional dim Rich sections when TTY). Sections:
 1. **Prompt** — user text for the turn.
 2. **Parent plan** — parent `assistant_step` tool-call summaries.
 3. **Parallel** — overlap, durations, truncated explorer payloads when present.
-4. **Context engineering** — `compaction` rows with token counts and trace pointers.
+4. **Context engineering** — for each `compaction` in the turn: `before_tokens ->
+   after_tokens`, trace `original_event_idx`, `compactor_model`, `compactor_fallback`,
+   and the first ~80 characters of `summary` (ellipsis if longer). For each
+   `context_compaction`: `reason`, before/after tokens, and summary snippet.
 5. **Answer** — final parent `assistant_text` (truncate above ~2 KB with trace pointer).
 6. **Pointers** — JSONL path; suggest `/show-context <step>`.
 
@@ -205,7 +212,8 @@ Use `/show-context N` for the full JSON parent context at step `N`.
 | Rules | dim |
 | Status segments | default white; status token green/yellow/red |
 | Hint line | dim |
-| Approval panel border | cyan |
+| Approval panel border | cyan (tool writes); **red** for `budget_cap` |
+| Budget-cap approval body | Reason-dispatch via `format_budget_cap_approval_text(reason, details)`: `step_extend` / `step_cap` show steps used/max; `usd_cap` shows cap / spent / step estimate / projected; other caps have short reason-specific copy |
 | Diff panel background | black (matches `Syntax` tool output) |
 | Diff removals (`-` lines) | red |
 | Diff additions (`+` lines) | green |

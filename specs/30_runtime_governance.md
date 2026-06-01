@@ -15,10 +15,18 @@ Constants:
 - `WALL_CLOCK_TIMEOUT = 120`
 - `TOOL_TIMEOUT = 30`
 - `K_COMPACT = 4000`
+- `COMPACTOR_MAX_OUTPUT_TOKENS = 400`
+- `COMPACTOR_MAX_INPUT_CHARS = 120_000` (payload cap sent to compactor; remainder noted with trace pointer)
+- `COMPACTOR_MAX_SUMMARY_TOKENS = 300`
+- `COMPACT_KEEP_RECENT_TURNS = 4` (conversation compaction tail)
+- `DEFAULT_CONTEXT_WINDOW = 128_000`
+- `DEFAULT_COMPACT_FRACTION = 0.80`
+- Per-model `CONTEXT_WINDOW_TOKENS` and `AUTO_COMPACT_FRACTION` from `CONTEXT_WINDOWS.md`
 - `MAX_TOOL_RESULT_BYTES = 1_048_576`
 - `DAILY_SPEND_FILE = ".vg_daily_spend.json"`
 - `SQLITE_TRACE_DB = "traces/vg_agent.sqlite3"`
 - `REQUIRE_APPROVAL_DEFAULT = "off"`
+- `STEP_EXTEND_PROMPT_ON_LAST_STEP = true` (proactive step-budget offer; disable via `--no-step-extend-prompt`)
 - `OPENROUTER_ENDPOINT_HOST = "openrouter.ai"`
 
 Model and pricing constants are imported from `MODEL_CONFIG.md`.
@@ -27,7 +35,8 @@ Event kinds:
 
 - Top-level `kind` is always the event discriminator. Defined kinds:
   `user_prompt`, `assistant_step`, `tool_call`, `tool_result`, `compaction`,
-  `subagent_spawn`, `subagent_return`, `budget_event`, `approval`,
+  `context_compaction`, `subagent_spawn`, `subagent_return`, `budget_event`,
+  `approval`,
   `egress_blocked`, `redaction`, `session_reset`, `statusline`, `run_end`.
 
 Per-event attribution (see `specs/60_observability.md`):
@@ -46,10 +55,16 @@ Per-event attribution (see `specs/60_observability.md`):
 Budget events:
 
 - `budget_reason` enum: `step_cap`, `token_cap`, `usd_cap`, `daily_cap`,
-  `repetition_abort`, `timeout`, `user_abort`, `parallel_aborted`,
+  `repetition_abort`, `timeout`, `user_abort`, `user_config`, `parallel_aborted`,
   `warn_usd`, `warn_tokens`, `warn_steps`.
 - `warn_*` reasons are emitted **once** when their respective fraction is
   first crossed; they do not abort the run.
+- **Proactive step extend** (`step_extend`): when interactive approval is
+  configured and `STEP_EXTEND_PROMPT_ON_LAST_STEP` is enabled, the parent loop
+  may offer **once per run** to raise `max_steps` immediately before the next
+  parent model call when `step_count == max_steps - 1` (e.g. 14/15). Deny
+  continues until the hard `step_cap`; abort ends the run. This is separate
+  from `warn_steps` (80% log-only).
 - `parallel_aborted` is emitted when any per-slice budget is exceeded inside
   a parallel `spawn_subagents` call; remaining in-flight sub-agents are
   cancelled.
@@ -60,14 +75,25 @@ Budget events:
   models. Unknown live model pricing fails closed unless explicit cost is
   returned.
 
-Compaction events:
+Tool-result compaction events (`kind: compaction`):
 
 - `original_event_idx` points to the full parent `tool_result`.
 - `original_sha256` is SHA-256 of `tool_result.result_full`.
+- `summary` is produced by `COMPACTOR_MODEL_ID` (or stub when `compactor_fallback=true`).
+- `compactor_model` records the model id used (or omitted on stub fallback).
+
+Conversation compaction events (`kind: context_compaction`):
+
+- `before_tokens`, `after_tokens`, `percent_reduced` on the in-memory parent message list.
+- `reason` ∈ {`auto`, `manual`}.
+- `model`, `window`, `threshold` for the parent model that triggered auto compaction.
+- `summary` from the conversation compaction prompt.
+- `trace_pointer` is the run id; full history remains in JSONL.
 
 Approval events:
 
-- `approval` events are emitted *before* a gated tool runs, and also when a
+- `approval` events are emitted *before* a gated tool runs, when a
+  proactive step extend is offered (`budget_reason=step_extend`), and when a
   hard budget cap would abort an interactive run (`tool="budget_cap"`,
   optional `budget_reason`). Fields: `tool_use_id`, `tool`, `args_summary`,
   `decision` ∈ {`approved`, `approved_scoped`, `approved_always`, `denied`,
@@ -118,6 +144,9 @@ SQLite observability persistence:
   redactions, and compactions.
 - SQLite failures are fail-open for execution: a warning is written to stderr
   and JSONL tracing continues.
+- The SQLite connection must be usable from any thread that calls
+  `TraceRecorder.emit` (parallel `spawn_subagents`). Use
+  `check_same_thread=False` and a store-level write lock around `record_event`.
 
 Approval cache persistence (opt-in):
 

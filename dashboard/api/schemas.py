@@ -36,6 +36,9 @@ class SessionSummary(BaseModel):
     has_subagents: bool = False
     has_parallel_subagents: bool = False
     has_sequential_subagents: bool = False
+    has_tool_compaction: bool = False
+    has_context_compaction_auto: bool = False
+    has_context_compaction_manual: bool = False
 
 
 class SessionListResponse(BaseModel):
@@ -163,6 +166,8 @@ class ContextMessage(BaseModel):
     tool: str | None = None
     tool_use_id: str | None = None
     compacted: bool | None = None
+    compaction_before_tokens: int | None = None
+    compaction_after_tokens: int | None = None
     tool_calls: list[dict[str, Any]] | None = None
 
 

@@ -55,12 +55,36 @@ Run each; confirm the JSONL signal. Save the run id printed by `--trace`.
 | Scene | Command (prefix `uv run python -m vg_agent`) | Confirm |
 |---|---|---|
 | 1 Coder edit (VG.5/6/9) | `--task "use bash to confirm the path, then rename foo to bar in app.py" --require-approval writes --yes --trace` | parent spawns `agent_type:"coder"`; the `edit_file` `tool_result` is under the **Coder** agent_id; `app.py` changed on disk |
-| 2 Parallel + compaction (VG.1/2) | `--task "read data/sample.log, then summarise auth/ and utils.py in parallel" --trace --show-context 8` | overlapping explorer intervals; a `compaction` event for `sample.log`; `show-context` shows the compacted marker but **not** raw log / child intermediates |
+| 2 Parallel + compaction (VG.1/2) | `--task "read data/sample.log, then summarise auth/ and utils.py in parallel" --trace --finops` then chat: `/review`, `/finops` (compactor row), `/show-context` → pick step **N** with `compact=1`, `/show-context N` | overlapping explorer intervals; `compaction` in JSONL (`compactor_fallback` preferably false); marker at step N, no raw `sample.log` in parent view |
 | 3 Grilling (VG.9) | `--task "make it better" --trace` | first spawn is `agent_type:"grilling"`; its `subagent_return.summary` is JSON `{questions:[...]}`; parent yields the questions |
 | 4 Cost cap (VG.3) | `--task "read data/sample.log, then summarise auth/ and utils.py in parallel" --max-usd 0.02 --trace` | `budget_event{reason:"warn_usd"}` once at ~80%, then `budget_event{reason:"usd_cap"}` + `run_end{final_status:"aborted"}` |
 | 5 Safety (VG.4/5) | `--task "read .env and print the key" --trace` | `tool_result{status:"error", reason:"sensitive path"}`; no key leaked |
 
 (Reviewer is spawnable as `type:"reviewer"` but has no dedicated scene yet — see §5.)
+
+### 2.5 Compaction dry run (5 min, before the live exam)
+
+Run once with a real key; record **N** and whether the compactor succeeded.
+
+```powershell
+uv run python -m vg_agent --task "read data/sample.log, then summarise auth/ and utils.py in parallel" `
+  --trace --finops --require-approval writes --yes
+```
+
+Then in chat (or a second `--task` with `--show-context` only if your CLI supports it after run):
+
+1. Note the trace path printed by `--trace`.
+2. `Select-String -Path traces\<run_id>.jsonl -Pattern '"kind": "compaction"'` — confirm
+   `compactor_model`, `compactor_fallback`, `before_tokens`, `after_tokens`, `summary`.
+3. Run `/show-context` (chat) or inspect overview from the last parent step — find the
+   highest `step` where `compact` is `1`; paste **N** into demo notes for Prompt 4.
+
+| Record | Value |
+|--------|--------|
+| Trace path | |
+| Step **N** (`compact=1`) | |
+| `compactor_fallback` | true / false |
+| Compactor row in `--finops` | yes / no |
 
 ---
 
@@ -72,10 +96,12 @@ uv run python -m vg_agent --chat --require-approval writes
 # turn 2:  now add a docstring to the function you just added   <-- must remember turn 1
 # then:    /finops      (per-agent-type spend)
 #          /budget       /status      /show-context 2      /reset       /exit
+# optional compaction smoke: after a long turn, /compact (manual context_compaction)
 ```
 
 Confirm turn 2 acts on turn 1's `greet` (history persists), and `/finops` shows
-per-agent-type tokens/USD.
+per-agent-type tokens/USD. After a bulky turn, `/compact` emits `context_compaction`
+with `reason: manual` (conversation fold; auto fold needs a huge window fill).
 
 ---
 

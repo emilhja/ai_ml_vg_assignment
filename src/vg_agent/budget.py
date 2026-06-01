@@ -26,6 +26,27 @@ def _today_utc_key() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
+def format_usd_display(value: float) -> str:
+    """USD with $ prefix; no scientific notation; sub-cent caps stay readable."""
+    value = float(value)
+    if abs(value) < 1e-12:
+        return "$0.00"
+    if abs(value) >= 0.01:
+        return f"${value:.2f}"
+    for decimals in range(4, 10):
+        formatted = f"{value:.{decimals}f}"
+        if abs(float(formatted)) >= 1e-12:
+            body = formatted.rstrip("0").rstrip(".") if "." in formatted else formatted
+            return f"${body}"
+    return f"${value:.8f}".rstrip("0").rstrip(".")
+
+
+def format_usd_number(value: float) -> str:
+    """Plain USD amount (no $) for slash-command / budget lines."""
+    text = format_usd_display(value)
+    return text[1:] if text.startswith("$") else text
+
+
 class DailySpendLedger:
     """UTC date-keyed persistent ledger under workspace root."""
 
@@ -91,6 +112,7 @@ class BudgetGuard:
     per_agent_type_model_calls: dict[str, int] = field(default_factory=dict)
     per_agent_type_usd: dict[str, float] = field(default_factory=dict)
     warned: set[str] = field(default_factory=set)
+    step_extend_prompted: bool = False
     wall_clock_extra_s: float = 0.0
     lock: object = field(default_factory=threading.RLock, compare=False, repr=False)
 
@@ -113,7 +135,7 @@ class BudgetGuard:
                 return BudgetDecision(False, "token_cap", {"tokens": self.running_tokens, "max_tokens": self.max_tokens})
             worst_cost = self.estimate_cost(model, worst_input_tokens, worst_output_tokens)
             if self.running_usd + worst_cost > self.max_usd:
-                return BudgetDecision(False, "usd_cap", {"running_usd": self.running_usd, "worst_next_usd": worst_cost})
+                return BudgetDecision(False, "usd_cap", {"running_usd": self.running_usd, "worst_next_usd": worst_cost, "max_usd": self.max_usd})
             if self.running_usd + worst_cost > self.daily_remaining_usd:
                 return BudgetDecision(False, "daily_cap", {"running_usd": self.running_usd, "daily_remaining_usd": self.daily_remaining_usd})
             return BudgetDecision(True)
@@ -160,6 +182,18 @@ class BudgetGuard:
                 out.append(BudgetDecision(True, "warn_steps", {"step_count": self.step_count, "max_steps": self.max_steps, "crossed_at_step": self.step_count}))
             return out
 
+    def should_offer_step_extend(self) -> bool:
+        with self.lock:
+            if not config.STEP_EXTEND_PROMPT_ON_LAST_STEP:
+                return False
+            if self.step_extend_prompted or self.max_steps <= 1:
+                return False
+            return self.step_count > 0 and self.step_count == self.max_steps - 1
+
+    def mark_step_extend_prompted(self) -> None:
+        with self.lock:
+            self.step_extend_prompted = True
+
     def record_tool_signature(self, tool: str, args_key: str) -> BudgetDecision:
         with self.lock:
             signature = (tool, args_key)
@@ -171,6 +205,40 @@ class BudgetGuard:
             if self.repeat_count >= 3:
                 return BudgetDecision(False, "repetition_abort", {"tool": tool, "args_key": args_key, "repeat_count": self.repeat_count})
             return BudgetDecision(True)
+
+    def configure_caps(
+        self,
+        *,
+        max_steps: int | None = None,
+        max_tokens: int | None = None,
+        max_usd: float | None = None,
+        daily_remaining_usd: float | None = None,
+    ) -> str | None:
+        """Update session caps from ``/budget``; returns an error message or None."""
+        with self.lock:
+            if max_steps is not None:
+                if max_steps < 1:
+                    return "max_steps must be >= 1"
+                if max_steps < self.step_count:
+                    return f"max_steps must be >= step_count ({self.step_count})"
+                self.max_steps = max_steps
+            if max_tokens is not None:
+                if max_tokens < 1:
+                    return "max_tokens must be >= 1"
+                if max_tokens < self.running_tokens:
+                    return f"max_tokens must be >= running tokens ({self.running_tokens})"
+                self.max_tokens = max_tokens
+            if max_usd is not None:
+                if max_usd <= 0:
+                    return "max_usd must be > 0"
+                if max_usd < self.running_usd:
+                    return f"max_usd must be >= running usd ({format_usd_number(self.running_usd)})"
+                self.max_usd = float(max_usd)
+            if daily_remaining_usd is not None:
+                if daily_remaining_usd <= 0:
+                    return "daily_remaining_usd must be > 0"
+                self.daily_remaining_usd = float(daily_remaining_usd)
+        return None
 
     def extend_cap(self, reason: str, *, once: bool) -> None:
         """Raise a hard cap after interactive approval."""

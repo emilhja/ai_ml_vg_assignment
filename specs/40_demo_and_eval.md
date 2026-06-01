@@ -18,6 +18,8 @@ VG slide assertions (context engineering — VG.2):
 - The demo reads `data/sample.log` through the parent so at
   least one parent `tool_result` exceeds `K_COMPACT`.
 - A parent-scoped `compaction` event exists for that `tool_use_id`.
+- `compaction.summary` is model-produced (tests use a deterministic compactor stub,
+  not the legacy template-only string).
 - `compaction.original_event_idx` points to the original event.
 - `compaction.original_sha256` equals SHA-256 of the original
   `tool_result.result_full`.
@@ -26,6 +28,20 @@ VG slide assertions (context engineering — VG.2):
 - A separate parallel-Explorer step proves sub-agent offloading: parent
   context contains only sub-agent return summaries, not sub-agent
   intermediate tool calls or tool results.
+
+Live demo verification (VG.2 — grader-visible, see `final_demo_live_chat_script.md`):
+
+1. After the canonical parallel+log task: `/review` shows **Context engineering**
+   with `compacted before -> after` for the `sample.log` read; lines include
+   `compactor_model`, `compactor_fallback`, and a summary snippet.
+2. `/finops` includes a `compactor` row with at least one model call when the live
+   compactor succeeded (`compactor_fallback` false in JSONL).
+3. `/show-context` overview → choose step **N** with `compact=1` → `/show-context N`
+   shows the compacted marker and excludes raw `sample.log` content.
+4. JSONL grep: `"kind": "compaction"` with `original_event_idx`, `original_sha256`,
+   `summary`, `compactor_model`.
+5. Optional: chat `/compact` emits `context_compaction` with `reason: manual` (conversation
+   fold; auto fold at window × fraction is not expected in a short demo).
 
 Parallel-sub-agent assertions (VG.1):
 

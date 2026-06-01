@@ -69,6 +69,10 @@ class FailingRateLimitClient:
 
 
 def _classify_agent(system_prompt: str) -> str:
+    if "Summarise the supplied tool result" in system_prompt:
+        return "compactor"
+    if "Summarise the supplied prior conversation" in system_prompt:
+        return "compactor"
     if "parent coding agent" in system_prompt:
         return "parent"
     if "You are Grilling" in system_prompt:
@@ -121,6 +125,19 @@ class PipelineClient:
             return ModelTurn(assistant_text=f"{agent} summary: {question}", input_tokens=20, output_tokens=10)
 
 
+def test_format_usd_display_sub_cent() -> None:
+    from vg_agent.budget import format_usd_display, format_usd_number
+
+    assert format_usd_display(0.0) == "$0.00"
+    assert format_usd_display(0.5) == "$0.50"
+    assert format_usd_display(5.0) == "$5.00"
+    assert format_usd_display(0.0001) == "$0.0001"
+    assert format_usd_display(0.00001) == "$0.00001"
+    assert format_usd_display(0.0017) == "$0.0017"
+    assert format_usd_number(1e-05) == "0.00001"
+    assert "e" not in format_usd_number(0.00001).lower()
+
+
 def test_budget_guard_reasons_and_costs() -> None:
     guard = BudgetGuard(max_steps=1)
     assert guard.before_model_call(config.PARENT_MODEL_ID, 100, 100).allowed
@@ -167,6 +184,16 @@ def _log_then_explorer_client() -> PipelineClient:
             ),
             ModelTurn("Auth summary integrated: SENTINEL_AUTH.", input_tokens=100, output_tokens=20),
         ],
+        by_type={
+            "compactor": [
+                ModelTurn(
+                    "SAMPLE_LOG_SUMMARY_SENTINEL: large log summarised for parent context.",
+                    input_tokens=100,
+                    output_tokens=50,
+                )
+            ],
+            "explorer": [ModelTurn("SENTINEL_AUTH: session middleware and routes.", input_tokens=20, output_tokens=10)],
+        },
     )
 
 
@@ -198,6 +225,192 @@ def _rename_via_coder_client() -> PipelineClient:
     )
 
 
+def test_compactor_fallback_on_model_error(tmp_path: Path) -> None:
+    from vg_agent.agent import _compact_if_needed
+
+    write_fixture(tmp_path)
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("tool_result", tool="read_file", tool_use_id="t1", result_full="x" * 50000, bytes=50000, tokens=9000, status="ok")
+    event = recorder.events[-1]
+
+    class FailingCompactorClient:
+        def complete(self, **_kwargs: object) -> ModelTurn:
+            raise LiveModelRateLimitError("compactor rate limited")
+
+    compaction = _compact_if_needed(
+        recorder,
+        event,
+        client=FailingCompactorClient(),
+        guard=BudgetGuard(),
+        tool="read_file",
+        deterministic=False,
+    )
+    assert compaction is not None
+    assert compaction.get("compactor_fallback") is True
+    assert "Large read_file" in str(compaction.get("summary") or "")
+
+
+def test_compact_conversation_deterministic(tmp_path: Path) -> None:
+    from vg_agent.agent import compact_conversation
+
+    recorder = TraceRecorder(tmp_path)
+    messages: list[dict[str, object]] = []
+    for index in range(6):
+        messages.append({"role": "user", "content": f"question {index} " + ("word " * 500)})
+        messages.append({"role": "assistant", "content": f"answer {index} " + ("detail " * 500)})
+    before = len(messages)
+    event = compact_conversation(
+        recorder,
+        messages,  # type: ignore[arg-type]
+        config.PARENT_MODEL_ID,
+        BudgetGuard(),
+        client=PipelineClient([]),
+        reason="manual",
+        deterministic=True,
+    )
+    assert event is not None
+    assert event["kind"] == "context_compaction"
+    assert int(event["after_tokens"]) < int(event["before_tokens"])
+    assert len(messages) < before
+    assert messages[0]["role"] == "user"
+    assert "CONVERSATION COMPACTED" in str(messages[0]["content"])
+
+
+def test_auto_context_compaction_before_parent_llm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(config.CONTEXT_WINDOW_TOKENS, config.PARENT_MODEL_ID, 200)
+    monkeypatch.setitem(config.AUTO_COMPACT_FRACTION, config.PARENT_MODEL_ID, 0.5)
+    write_fixture(tmp_path)
+    recorder = TraceRecorder(tmp_path)
+    history: list[dict[str, object]] = [
+        {"role": "user", "content": "old " + ("context " * 800)},
+        {"role": "assistant", "content": [{"type": "text", "text": "old reply " + ("x " * 800)}]},
+        {"role": "user", "content": "recent 1"},
+        {"role": "assistant", "content": [{"type": "text", "text": "recent reply 1"}]},
+        {"role": "user", "content": "recent 2"},
+        {"role": "assistant", "content": [{"type": "text", "text": "recent reply 2"}]},
+        {"role": "user", "content": "recent 3"},
+        {"role": "assistant", "content": [{"type": "text", "text": "recent reply 3"}]},
+        {"role": "user", "content": "recent 4"},
+        {"role": "assistant", "content": [{"type": "text", "text": "recent reply 4"}]},
+    ]
+    client = PipelineClient(
+        parent_turns=[ModelTurn("Done.", input_tokens=10, output_tokens=5)],
+        by_type={"compactor": [ModelTurn("folded head summary", input_tokens=10, output_tokens=5)]},
+    )
+    run_live_task(tmp_path, "finish", recorder, client=client, history=history)  # type: ignore[arg-type]
+    assert any(e["kind"] == "context_compaction" and e.get("reason") == "auto" for e in read_events(recorder.path))
+
+
+def test_compactor_budget_recorded(tmp_path: Path) -> None:
+    from vg_agent.agent import _compact_if_needed
+
+    write_fixture(tmp_path)
+    recorder = TraceRecorder(tmp_path)
+    guard = BudgetGuard()
+    recorder.emit(
+        "tool_result",
+        tool="read_file",
+        tool_use_id="budget-read",
+        result_full="x" * 50000,
+        bytes=50000,
+        tokens=9000,
+        status="ok",
+    )
+    event = recorder.events[-1]
+    client = PipelineClient(
+        [],
+        by_type={
+            "compactor": [
+                ModelTurn(
+                    "SAMPLE_LOG_SUMMARY_SENTINEL: budgeted compactor call.",
+                    input_tokens=120,
+                    output_tokens=60,
+                )
+            ],
+        },
+    )
+    _compact_if_needed(
+        recorder,
+        event,
+        client=client,
+        guard=guard,
+        tool="read_file",
+        deterministic=False,
+    )
+    assert guard.per_agent_type_model_calls.get("compactor") == 1
+    assert guard.per_agent_type_tokens.get("compactor", 0) > 0
+    assert any(
+        e["kind"] == "llm_start" and e.get("agent_type") == "compactor"
+        for e in recorder.events
+    )
+
+
+def test_chat_slash_compact_emits_manual_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from vg_agent import __main__ as cli
+
+    write_fixture(tmp_path)
+    prompts = iter(["seed turn", "/compact", "/exit"])
+    compactor_client = PipelineClient(
+        [],
+        by_type={
+            "compactor": [
+                ModelTurn(
+                    "CONVERSATION FOLD: prior turns summarised for parent.",
+                    input_tokens=80,
+                    output_tokens=40,
+                )
+            ],
+        },
+    )
+
+    def fake_run_live_task(
+        root: Path,
+        prompt: str,
+        recorder: TraceRecorder,
+        *,
+        client: object,
+        guard: BudgetGuard,
+        policy: ApprovalPolicy,
+        history: list[dict[str, object]],
+    ) -> TraceRecorder:
+        for index in range(6):
+            history.append({"role": "user", "content": f"{prompt} question {index} " + ("word " * 400)})
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": f"answer {index} " + ("detail " * 400)}],
+                }
+            )
+        recorder.emit("user_prompt", prompt=prompt)
+        recorder.emit(
+            "assistant_step",
+            agent_id="parent",
+            step_idx=1,
+            assistant_text=f"ack {prompt}",
+            tool_calls=[],
+            stop_reason="end_turn",
+        )
+        recorder.emit("run_end", final_status="ok", total_tokens=0, total_cost_usd=0.0, duration_s=0.1)
+        return recorder
+
+    monkeypatch.setattr(cli, "use_rich_ui", lambda: False)
+    monkeypatch.setattr(cli, "_make_chat_prompt", lambda _history_path: (lambda: next(prompts), lambda: None))
+    monkeypatch.setattr(cli, "LiveModelClient", SimpleNamespace(from_env=lambda recorder=None: compactor_client))
+    monkeypatch.setattr(cli, "run_live_task", fake_run_live_task)
+
+    args = SimpleNamespace(no_redact=False, require_approval="off", yes=False, live_model=True)
+    assert cli._chat_loop(tmp_path, args) == 0
+
+    events = read_events(next(iter((tmp_path / "traces").glob("*.jsonl"))))
+    manual = [e for e in events if e["kind"] == "context_compaction" and e.get("reason") == "manual"]
+    assert manual
+    assert "CONVERSATION FOLD" in str(manual[0].get("summary") or "")
+
+
 def test_parent_compaction_and_subagent_context(tmp_path: Path) -> None:
     write_fixture(tmp_path)
     recorder = TraceRecorder(tmp_path)
@@ -221,6 +434,8 @@ def test_parent_compaction_and_subagent_context(tmp_path: Path) -> None:
     ]
     assert compactions
     compaction = compactions[0]
+    assert "SAMPLE_LOG_SUMMARY_SENTINEL" in str(compaction.get("summary") or "")
+    assert compaction.get("compactor_model") == config.COMPACTOR_MODEL_ID
     assert compaction["original_event_idx"] == original["event_idx"]
     expected_hash = hashlib.sha256(str(original["result_full"]).encode("utf-8")).hexdigest()
     assert compaction["original_sha256"] == expected_hash
@@ -234,6 +449,44 @@ def test_parent_compaction_and_subagent_context(tmp_path: Path) -> None:
     assert "[COMPACTED tool_result for tool_use_id=parent-read-sample-log]" in context_text
     assert "req-00001" not in context_text
     assert "SENTINEL_AUTH" in context_text
+
+
+def test_resolve_workspace_root_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
+    monkeypatch.delenv("VG_WORKSPACE_ROOT", raising=False)
+    from vg_agent.workspace_paths import resolve_workspace_root
+
+    assert resolve_workspace_root() == (tmp_path / "workspace").resolve()
+
+
+def test_resolve_workspace_root_docker_compose_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Compose uses working_dir=/workspace and VG_WORKSPACE_ROOT=."""
+    ws = tmp_path / "workspace"
+    ws.mkdir(parents=True)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("VG_WORKSPACE_ROOT", ".")
+    from vg_agent.workspace_paths import resolve_workspace_root
+
+    assert resolve_workspace_root() == ws.resolve()
+
+
+def test_trace_recorder_uses_resolved_workspace_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("VG_WORKSPACE_ROOT", "workspace")
+    (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
+    from vg_agent.workspace_paths import resolve_workspace_root
+    from vg_agent.trace import TraceRecorder
+
+    root = resolve_workspace_root()
+    recorder = TraceRecorder(root)
+    recorder.emit("user_prompt", prompt="workspace trace path")
+    assert recorder.path.parent == root / "traces"
+    assert (root / config.SQLITE_TRACE_DB).is_file()
 
 
 def test_sqlite_trace_mirror_and_dashboard_rollups(tmp_path: Path) -> None:
@@ -381,6 +634,15 @@ def test_live_loop_budget_abort_before_client_call(tmp_path: Path) -> None:
     assert events[-1]["final_status"] == "aborted"
 
 
+def test_cli_exit_code_for_final_status() -> None:
+    from vg_agent.__main__ import _exit_code_for_final_status
+
+    assert _exit_code_for_final_status("aborted") == 3
+    assert _exit_code_for_final_status("model_error") == 75
+    assert _exit_code_for_final_status("ok") == 0
+    assert _exit_code_for_final_status(None) == 0
+
+
 def test_live_loop_budget_cap_approval_extends_steps(tmp_path: Path) -> None:
     client = FakeClient(
         [
@@ -403,6 +665,133 @@ def test_live_loop_budget_cap_approval_extends_steps(tmp_path: Path) -> None:
     assert len(approvals) == 1
     assert approvals[0]["decision"] == "approved"
     assert events[-1]["final_status"] == "ok"
+
+
+def test_proactive_step_extend_at_last_step(tmp_path: Path) -> None:
+    write_fixture(tmp_path)
+    client = FakeClient(
+        [
+            ModelTurn(
+                "",
+                [ToolCall("t1", "read_file", {"path": "README.md"})],
+                stop_reason="tool_use",
+                input_tokens=10,
+                output_tokens=5,
+            ),
+            ModelTurn(
+                "",
+                [ToolCall("t2", "read_file", {"path": "utils.py"})],
+                stop_reason="tool_use",
+                input_tokens=10,
+                output_tokens=5,
+            ),
+            ModelTurn("done", input_tokens=10, output_tokens=5),
+        ]
+    )
+    recorder = TraceRecorder(tmp_path)
+
+    def approve(request: ApprovalRequest) -> ApprovalOutcome:
+        if request.tool == "budget_cap" and request.path == "step_extend":
+            return ApprovalOutcome(decision="approved_scoped", scope_key="step_extend", reason="extend")
+        return ApprovalOutcome(decision="approved", reason="yes")
+
+    policy = ApprovalPolicy(mode="writes", prompt=approve)
+    guard = BudgetGuard(max_steps=2)
+    run_live_task(tmp_path, "work", recorder, client=client, guard=guard, policy=policy)
+    events = read_events(recorder.path)
+    assert len(client.calls) == 3
+    extend_approvals = [
+        e
+        for e in events
+        if e.get("kind") == "approval" and e.get("tool") == "budget_cap" and e.get("budget_reason") == "step_extend"
+    ]
+    assert len(extend_approvals) == 1
+    assert events[-1]["final_status"] == "ok"
+
+
+def test_proactive_step_extend_deny_then_hard_cap(tmp_path: Path) -> None:
+    write_fixture(tmp_path)
+    client = FakeClient(
+        [
+            ModelTurn(
+                "",
+                [ToolCall("t1", "read_file", {"path": "README.md"})],
+                stop_reason="tool_use",
+                input_tokens=10,
+                output_tokens=5,
+            ),
+            ModelTurn(
+                "",
+                [ToolCall("t2", "read_file", {"path": "utils.py"})],
+                stop_reason="tool_use",
+                input_tokens=10,
+                output_tokens=5,
+            ),
+            ModelTurn("three", input_tokens=10, output_tokens=5),
+        ]
+    )
+    recorder = TraceRecorder(tmp_path)
+
+    def approve(request: ApprovalRequest) -> ApprovalOutcome:
+        return ApprovalOutcome(decision="denied", reason="no")
+
+    policy = ApprovalPolicy(mode="writes", prompt=approve)
+    guard = BudgetGuard(max_steps=2)
+    run_live_task(tmp_path, "work", recorder, client=client, guard=guard, policy=policy)
+    events = read_events(recorder.path)
+    assert len(client.calls) == 2
+    assert events[-1]["final_status"] == "aborted"
+    reasons = [e.get("budget_reason") for e in events if e.get("kind") == "approval"]
+    assert "step_extend" in reasons
+    assert "step_cap" in reasons
+
+
+def test_budget_cap_approval_step_copy() -> None:
+    from vg_agent.chat_ui import format_budget_cap_approval_text
+
+    body = format_budget_cap_approval_text("step_cap", {"step_count": 14, "max_steps": 15})
+    assert "14/15" in body
+    assert "Cap (--max-usd)" not in body
+    assert "step cap" in body.lower() or "Step cap" in body
+
+
+def test_sqlite_mirror_survives_parallel_subagents(tmp_path: Path) -> None:
+    import sqlite3
+
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "parallel",
+                [
+                    ToolCall(
+                        "spawn-many",
+                        "spawn_subagents",
+                        {
+                            "requests": [
+                                {"type": "explorer", "question": "inspect app.py SENTINEL_APP"},
+                                {"type": "explorer", "question": "inspect utils.py SENTINEL_UTILS"},
+                            ]
+                        },
+                    )
+                ],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=40,
+            ),
+            ModelTurn("done", input_tokens=100, output_tokens=20),
+        ],
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "parallel explore", recorder, client=client)
+    assert recorder.sqlite_store is not None
+    db_path = tmp_path / "traces" / "vg_agent.sqlite3"
+    assert db_path.is_file()
+    with sqlite3.connect(db_path) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM subagents WHERE run_id = ?",
+            (recorder.run_id,),
+        ).fetchone()[0]
+    assert int(count) >= 2
 
 
 def test_parent_has_no_write_tools_and_coder_is_sole_mutation_path(tmp_path: Path) -> None:
@@ -499,7 +888,7 @@ def test_live_chat_statusline_shows_context_and_budget(tmp_path: Path) -> None:
     assert "ctx 1.2k" in line
     assert "run #---------" in line
     assert "1.3k/10.0k tok" in line
-    assert "steps 1/5" in line
+    assert "1/5 steps" in line
     assert "usd $" in line
     assert "tool errs 0" in line
     assert _chat_statusline_color(line, use_color=True).startswith("\x1b[32m[live]")
@@ -541,7 +930,8 @@ def test_chat_slash_command_completer_matches_prefixes() -> None:
     assert list(completer.get_completions(Document("/show-context "), CompleteEvent())) == []
     assert SLASH_COMMAND_HELP.startswith("Slash commands:\n")
     assert "/show-context N" in SLASH_COMMAND_HELP
-    assert "Show steps, tokens, USD, and daily remaining" in SLASH_COMMAND_HELP
+    assert "Show or set session caps" in SLASH_COMMAND_HELP
+    assert "/budget [steps N]" in SLASH_COMMAND_HELP
     assert "Normal text is sent to the agent as the next task." in SLASH_COMMAND_HELP
 
 
@@ -873,6 +1263,37 @@ def test_format_turn_review_includes_parallel_section(tmp_path: Path) -> None:
     assert "UTILS_SENTINEL" in text
 
 
+def test_format_turn_review_includes_compaction_details(tmp_path: Path) -> None:
+    from vg_agent.trace import format_turn_review
+
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="read the log")
+    recorder.emit(
+        "compaction",
+        agent_id="parent",
+        tool_use_id="read-log",
+        before_tokens=9000,
+        after_tokens=120,
+        summary="SAMPLE_LOG_SUMMARY_SENTINEL: compacted for parent context.",
+        compactor_model=config.COMPACTOR_MODEL_ID,
+        compactor_fallback=False,
+        original_event_idx=3,
+        original_sha256="abc",
+    )
+    recorder.emit(
+        "assistant_step",
+        agent_id="parent",
+        assistant_text="Done reading.",
+        tool_calls=[],
+        stop_reason="end_turn",
+    )
+    text = format_turn_review(recorder.events, trace_path=recorder.path)
+    assert "tool_result compacted 9000 -> 120 tokens" in text
+    assert f"model={config.COMPACTOR_MODEL_ID}" in text
+    assert "fallback=False" in text
+    assert "SAMPLE_LOG_SUMMARY_SENTINEL" in text
+
+
 def test_live_parent_large_tool_result_compacted_before_next_turn(tmp_path: Path) -> None:
     write_fixture(tmp_path)
     client = FakeClient([
@@ -883,15 +1304,25 @@ def test_live_parent_large_tool_result_compacted_before_next_turn(tmp_path: Path
             input_tokens=100,
             output_tokens=20,
         ),
+        ModelTurn(
+            "SAMPLE_LOG_SUMMARY_SENTINEL: compacted log summary.",
+            input_tokens=50,
+            output_tokens=30,
+        ),
         ModelTurn("Done.", input_tokens=100, output_tokens=20),
     ])
     recorder = TraceRecorder(tmp_path)
     run_live_task(tmp_path, "read sample log", recorder, client=client)
     events = read_events(recorder.path)
     assert any(e["kind"] == "compaction" and e["tool_use_id"] == "read-log" for e in events)
-    second_call_messages = json.dumps(client.calls[1]["messages"])
-    assert "[COMPACTED tool_result for tool_use_id=read-log]" in second_call_messages
-    assert "req-00001" not in second_call_messages
+    parent_calls = [
+        c for c in client.calls
+        if "parent coding agent" in str(c.get("system_prompt") or "")
+    ]
+    assert len(parent_calls) >= 2
+    second_parent_messages = json.dumps(parent_calls[1]["messages"])
+    assert "[COMPACTED tool_result for tool_use_id=read-log]" in second_parent_messages
+    assert "req-00001" not in second_parent_messages
 
 
 def test_generated_source_reproducible(tmp_path: Path) -> None:
@@ -1324,6 +1755,7 @@ def test_chat_persists_budget_and_approvals_across_turns(
 
     out = capsys.readouterr().out
     assert "steps" in out  # /budget
+    assert "Set caps:" in out
     assert "renamed foo to bar in app.py." in out  # parent final answer
     assert "Approvals - session history" in out  # /approvals
     assert "edit_file" in out
@@ -1339,10 +1771,53 @@ def test_chat_persists_budget_and_approvals_across_turns(
     assert any(a["decision"] == "auto" for a in approvals)
 
 
+def test_chat_budget_slash_sets_caps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from vg_agent import __main__ as cli
+
+    write_fixture(tmp_path)
+    prompts = iter(
+        [
+            "/budget steps 100 tokens 200000 usd 10 daily 8",
+            "/budget",
+            "/exit",
+        ]
+    )
+    monkeypatch.setattr(cli, "use_rich_ui", lambda: False)
+    monkeypatch.setattr(cli, "_make_chat_prompt", lambda _history_path: (lambda: next(prompts), lambda: None))
+    monkeypatch.setattr(
+        cli, "LiveModelClient", SimpleNamespace(from_env=lambda recorder=None: _rename_via_coder_client())
+    )
+
+    args = SimpleNamespace(no_redact=False, require_approval="writes", yes=True, live_model=True)
+    assert cli._chat_loop(tmp_path, args) == 0
+
+    out = capsys.readouterr().out
+    assert "steps 0/100" in out
+    assert "tokens 0/200000" in out
+    assert "usd 0.00/10.00" in out
+    assert "daily_remaining 8.00" in out
+
+    traces = list((tmp_path / "traces").glob("*.jsonl"))
+    events = read_events(traces[0])
+    config_events = [e for e in events if e.get("kind") == "budget_event" and e.get("budget_reason") == "user_config"]
+    assert len(config_events) == 1
+    assert config_events[0]["details"] == {
+        "max_steps": 100,
+        "max_tokens": 200000,
+        "max_usd": 10.0,
+        "daily_remaining_usd": 8.0,
+    }
+
+
 def test_chat_slash_reset_emits_event(tmp_path: Path) -> None:
     write_fixture(tmp_path)
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "src")
+    env["VG_WORKSPACE_ROOT"] = "."
     stdin_text = "/reset\n/exit\n"
     completed = subprocess.run(
         [sys.executable, "-m", "vg_agent", "--chat"],
@@ -1446,6 +1921,61 @@ def test_chat_ui_running_state(tmp_path: Path) -> None:
     )
     assert "running" in line
     assert "\u2026" in line
+
+
+def test_chat_ui_budget_warning_icon_when_next_step_exceeds_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vg_agent import chat_ui
+    from vg_agent.chat_ui import (
+        build_session_status,
+        build_status_bar_text,
+        format_budget_cap_approval_text,
+        format_statusline_compact,
+    )
+    from vg_agent.__main__ import _chat_statusline_color, _format_chat_statusline
+
+    monkeypatch.setattr(chat_ui, "use_emoji", lambda: True)
+
+    recorder = TraceRecorder(tmp_path)
+    guard = BudgetGuard(max_steps=15, max_tokens=80_000, max_usd=0.0001)
+    recorder.emit("llm_start", model=config.PARENT_MODEL_ID, step_idx=0, tokens_in=100)
+    status = build_session_status(
+        root=tmp_path, recorder=recorder, guard=guard, live_model=True
+    )
+    assert status.usd_would_exceed
+    assert status.usd_projected is not None
+    assert status.usd_projected > status.max_usd
+
+    bar = build_status_bar_text(
+        root=tmp_path, recorder=recorder, guard=guard, live_model=True
+    )
+    assert "\u26a0" in bar
+    assert "(next ~$" in bar
+
+    compact = format_statusline_compact(status, width=240)
+    assert compact.startswith("[live]")
+    assert "!usd" in compact
+    assert "(next ~$" in compact
+
+    line = _format_chat_statusline(recorder, guard, live_model=True, width=240)
+    colored = _chat_statusline_color(line, use_color=True)
+    assert colored.startswith("\x1b[31m[live]")
+
+    body = format_budget_cap_approval_text(
+        "usd_cap",
+        {
+            "max_usd": 0.0001,
+            "running_usd": 0.0,
+            "worst_next_usd": 0.0017,
+        },
+    )
+    assert "exceed your USD cap" in body
+    assert "Cap (--max-usd)" in body
+    assert "$0.0001" in body
+    assert "$0.0017" in body
+    assert "Cap (--max-usd):     $0.0001" in body
+    assert "Total after step" in body
 
 
 def test_clear_chat_screen_noop_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:

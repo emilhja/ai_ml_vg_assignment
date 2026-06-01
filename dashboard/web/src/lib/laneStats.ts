@@ -1,4 +1,5 @@
 import type { EventItem } from "../api";
+import { formatCompactionLine } from "./compactionStats";
 
 export type LaneTokenSummary = {
   tokensIn: number;
@@ -265,8 +266,15 @@ function toolResultDetail(event: EventItem): ExpandableEventDetail | null {
 }
 
 function compactionDetail(event: EventItem): ExpandableEventDetail | null {
-  if (event.kind !== "compaction") return null;
+  if (event.kind !== "compaction" && event.kind !== "context_compaction") return null;
   const sections: ExpandableSection[] = [];
+  const before = event.payload.before_tokens;
+  const after = event.payload.after_tokens;
+  const statsLine = formatCompactionLine(
+    typeof before === "number" ? before : Number(before) || null,
+    typeof after === "number" ? after : Number(after) || null,
+  );
+  if (statsLine) sections.push({ heading: "Before → after", body: statsLine });
   const idx = event.payload.original_event_idx;
   if (idx != null) sections.push({ heading: "original_event_idx", body: String(idx) });
   const sha = event.payload.original_sha256;
@@ -330,7 +338,7 @@ export function expandableEventDetail(event: EventItem): ExpandableEventDetail |
   if (event.kind === "assistant_step") return assistantStepDetail(event);
   if (event.kind === "llm_start") return llmStartDetail(event);
   if (event.kind === "tool_result") return toolResultDetail(event);
-  if (event.kind === "compaction") return compactionDetail(event);
+  if (event.kind === "compaction" || event.kind === "context_compaction") return compactionDetail(event);
   if (event.kind === "budget_event") return budgetEventDetail(event);
   if (event.kind === "approval") return approvalDetail(event);
   if (event.kind === "user_prompt") return userPromptDetail(event);

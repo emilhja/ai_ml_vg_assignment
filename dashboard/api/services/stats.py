@@ -136,7 +136,7 @@ def compute_stats(db: Session, range_key: str) -> StatsResponse:
     total_tokens = sum(int(r.total_tokens or 0) for r in filtered_runs)
     total_cost = sum(float(r.total_cost_usd or 0.0) for r in filtered_runs)
     turns = db.scalars(select(TurnRow)).all()
-    filtered_turns = [t for t in turns if _in_range(t.started_at, start)]
+    filtered_turns = [t for t in turns if t.started_at is not None and _in_range(t.started_at, start)]
     errors = sum(1 for t in filtered_turns if t.status not in {None, "ok", "running"})
     error_rate = (errors / len(filtered_turns)) if filtered_turns else 0.0
 

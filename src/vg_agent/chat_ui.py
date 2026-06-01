@@ -18,7 +18,7 @@ _WRITE_EDIT_TOOLS = frozenset({"edit_file", "write_file"})
 WRITE_EDIT_TOOLS = _WRITE_EDIT_TOOLS
 
 from . import config, tools
-from .budget import BudgetGuard
+from .budget import BudgetGuard, format_usd_display
 from .trace import TraceRecorder, parallel_subagent_summary, show_context
 
 CHAT_PLACEHOLDER = 'Try "read data/sample.log and summarise auth/"'
@@ -294,6 +294,9 @@ class SessionStatus:
     status_label: str
     status_style: str
     workspace_name: str
+    usd_projected: float | None = None
+    usd_would_exceed: bool = False
+    usd_warn: bool = False
 
     def ctx_display(self) -> str:
         compact = _format_compact_number(self.ctx_tokens)
@@ -325,6 +328,10 @@ def build_session_status(
     approval_events = sum(1 for event in recorder.events if event.get("kind") == "approval")
     session_tool_errors = _tool_error_count(recorder.events)
     turn_tool_errors = _tool_error_count(recorder.events[since_event_idx:])
+    usd_projected = _estimate_next_step_usd(guard, model_id=model_id, ctx_tokens=ctx_tokens)
+    usd_would_exceed, usd_warn = _usd_budget_flags(
+        guard.running_usd, guard.max_usd, projected_usd=usd_projected
+    )
     return SessionStatus(
         mode=mode,
         model=model,
@@ -346,7 +353,126 @@ def build_session_status(
         status_label=status_label,
         status_style=status_style,
         workspace_name=workspace_name,
+        usd_projected=usd_projected,
+        usd_would_exceed=usd_would_exceed,
+        usd_warn=usd_warn,
     )
+
+
+def _format_usd(value: float) -> str:
+    """Format a USD amount; delegates to :func:`format_usd_display` in ``budget``."""
+    return format_usd_display(value)
+
+
+def _budget_warn_prefix() -> str:
+    if use_emoji():
+        return "\u26a0\ufe0f "
+    return "! "
+
+
+def _estimate_next_step_usd(
+    guard: BudgetGuard,
+    *,
+    model_id: str,
+    ctx_tokens: int,
+    worst_output_tokens: int = 4096,
+) -> float:
+    worst_in = max(ctx_tokens, 512)
+    return guard.running_usd + guard.estimate_cost(model_id, worst_in, worst_output_tokens)
+
+
+def _usd_budget_flags(
+    running_usd: float,
+    max_usd: float,
+    *,
+    projected_usd: float | None,
+) -> tuple[bool, bool]:
+    """Return (would_exceed_on_next_step, in_warn_band)."""
+    if max_usd <= 0:
+        return False, False
+    would_exceed = projected_usd is not None and projected_usd > max_usd + 1e-12
+    at_cap = running_usd >= max_usd
+    warn_band = running_usd >= config.WARN_USD_FRACTION * max_usd
+    return would_exceed or at_cap, warn_band and not would_exceed and not at_cap
+
+
+def _budget_rich_style(running_usd: float, max_usd: float, *, projected_usd: float | None) -> str:
+    """Rich style for the USD segment: red when over/near cap, yellow at warn threshold."""
+    would_exceed, warn_only = _usd_budget_flags(running_usd, max_usd, projected_usd=projected_usd)
+    if would_exceed:
+        return "bold red"
+    if warn_only:
+        return "yellow"
+    return ""
+
+
+def format_budget_cap_approval_text(reason: str, details: dict[str, Any]) -> str:
+    """Plain-text body for budget-cap approval (Rich and non-TTY)."""
+    if reason in {"step_extend", "step_cap"}:
+        steps = int(details.get("step_count") or details.get("steps") or 0)
+        max_steps = int(details.get("max_steps") or 0)
+        bump_once = steps + 1
+        bump_scoped = max_steps + max(5, max_steps // 4) if max_steps else bump_once
+        if reason == "step_extend":
+            headline = f"Approaching step limit ({steps}/{max_steps}) — extend budget?"
+        else:
+            headline = f"Step cap reached ({steps}/{max_steps}) — extend to continue?"
+        return (
+            f"{headline}\n"
+            f"  Parent steps used:   {steps}/{max_steps}\n"
+            f"  1/y yes adds:        1 step (→ {bump_once} max)\n"
+            f"  2 scoped adds:       {bump_scoped - max_steps} steps (→ {bump_scoped} max)\n"
+            f"Approve to raise the step cap for this run, or n/abort to stop."
+        )
+    if reason == "token_cap":
+        tokens = int(details.get("tokens") or details.get("running_tokens") or 0)
+        max_tokens = int(details.get("max_tokens") or 0)
+        return (
+            f"Token cap reached ({tokens:,}/{max_tokens:,}).\n"
+            f"Approve to raise the token cap for this run, or n/abort to stop."
+        )
+    if reason == "usd_cap":
+        cap = float(details.get("max_usd") or 0.0)
+        spent = float(details.get("running_usd") or 0.0)
+        step_est = float(details.get("worst_next_usd") or 0.0)
+        projected = spent + step_est
+        prefix = _budget_warn_prefix().strip()
+        headline = f"{prefix} Next step would exceed your USD cap" if prefix else "Next step would exceed your USD cap"
+        return (
+            f"{headline}\n"
+            f"  Cap (--max-usd):     {_format_usd(cap)}\n"
+            f"  Spent so far:        {_format_usd(spent)}\n"
+            f"  This step (est.):    ~{_format_usd(step_est)}\n"
+            f"  Total after step:    ~{_format_usd(projected)}  (> cap)\n"
+            f"Approve to raise the cap for this run, or n/abort to stop."
+        )
+    if reason == "daily_cap":
+        remaining = details.get("daily_remaining_usd")
+        return (
+            f"Daily USD cap would be exceeded (remaining {_format_usd(float(remaining or 0))}).\n"
+            f"Approve to raise the daily allowance for this run, or n/abort to stop."
+        )
+    return f"Budget cap ({reason}). Approve to continue, or n/abort to stop."
+
+
+def _steps_status_segment(status: SessionStatus, *, chart: str = "") -> str:
+    prefix = "!" if status.max_steps > 0 and status.steps == status.max_steps - 1 else ""
+    label = f"{chart} {status.steps}/{status.max_steps} steps".strip()
+    return f"{prefix}{label}".strip() if prefix else label
+
+
+def _usd_status_segment(
+    status: SessionStatus,
+    *,
+    coin: str = "",
+) -> str:
+    prefix = _budget_warn_prefix() if (status.usd_would_exceed or status.usd_warn) else ""
+    run = _format_usd(status.running_usd)
+    cap = _format_usd(status.max_usd)
+    segment = f"{prefix}{coin} {run}/{cap}".strip() if coin else f"{prefix}{run}/{cap}".strip()
+    if status.usd_would_exceed and status.usd_projected is not None:
+        segment += f" (next ~{_format_usd(status.usd_projected)})"
+    return segment
 
 
 def format_statusline_compact(status: SessionStatus, *, width: int | None = None) -> str:
@@ -355,12 +481,16 @@ def format_statusline_compact(status: SessionStatus, *, width: int | None = None
         if status.tool_errors_turn != status.tool_errors_session
         else f"tool errs {status.tool_errors_session}"
     )
+    usd_prefix = "!" if status.usd_would_exceed or status.usd_warn else ""
+    usd_part = f"{usd_prefix}usd {_format_usd(status.running_usd)}/{_format_usd(status.max_usd)}"
+    if status.usd_would_exceed and status.usd_projected is not None:
+        usd_part += f" (next ~{_format_usd(status.usd_projected)})"
     line = (
         f"[{status.mode}] {status.model} | {status.ctx_display()} | "
         f"run {status.token_bar} {_format_compact_number(status.running_tokens)}/"
         f"{_format_compact_number(status.max_tokens)} tok | "
-        f"steps {status.steps}/{status.max_steps} | "
-        f"usd ${status.running_usd:.4f}/${status.max_usd:.2f} | "
+        f"{_steps_status_segment(status)} | "
+        f"{usd_part} | "
         f"approvals {status.approvals} | {err_segment} | {status.status_label}"
     )
     if width is None:
@@ -425,8 +555,8 @@ def build_status_bar_text(
     return (
         f"{folder} {status.workspace_name} | {robot} {status.model} | {status.mode} | "
         f"{status.ctx_display()} | "
-        f"{coin} ${status.running_usd:.4f}/${status.max_usd:.2f} | "
-        f"{chart} {status.steps}/{status.max_steps} steps | "
+        f"{_usd_status_segment(status, coin=coin)} | "
+        f"{_steps_status_segment(status, chart=chart)} | "
         f"{status.status_icon} {status.status_label}"
     )
 
@@ -460,11 +590,16 @@ def _write_status_bar(
         coin = "usd:"
         chart = "stp:"
     status_part = f"[{status.status_style}]{status.status_icon} {status.status_label}[/{status.status_style}]"
+    usd_plain = _usd_status_segment(status, coin=coin)
+    budget_style = _budget_rich_style(
+        status.running_usd, status.max_usd, projected_usd=status.usd_projected
+    )
+    usd_part = f"[{budget_style}]{usd_plain}[/{budget_style}]" if budget_style else usd_plain
     line = (
         f"{folder} {status.workspace_name} | {robot} {status.model} | {status.mode} | "
         f"{status.ctx_display()} | "
-        f"{coin} ${status.running_usd:.4f}/${status.max_usd:.2f} | "
-        f"{chart} {status.steps}/{status.max_steps} steps | {status_part}"
+        f"{usd_part} | "
+        f"{_steps_status_segment(status, chart=chart)} | {status_part}"
     )
     console.print(line)
 
@@ -1012,13 +1147,28 @@ def prompt_approval(
 
         console = _console()
         if request.tool == BUDGET_CAP_TOOL:
-            title = f"Approve budget cap: {request.path}"
+            warn = _budget_warn_prefix().strip()
+            title = (
+                f"{warn} Budget cap — {request.path} (approval required)"
+                if warn
+                else f"Budget cap — {request.path} (approval required)"
+            )
             options = "1/y yes  2 yes (this cap)  3/a always  4/n no  5 abort"
+            border_style = "red"
         else:
             title = f"Approve {request.tool}"
             options = "1/y yes  2 yes (scoped)  3/a always  4/n no  5 abort"
+            border_style = "cyan"
         panel_body: Any
-        if request.tool in WRITE_EDIT_TOOLS and isinstance(request.args, dict) and workspace_root is not None:
+        if request.tool == BUDGET_CAP_TOOL and isinstance(request.args, dict):
+            body_text = format_budget_cap_approval_text(str(request.path or "budget"), request.args)
+            headline, _, remainder = body_text.partition("\n")
+            panel_body = Group(
+                Text(headline + "\n", style="bold red"),
+                Text(remainder, style="white"),
+                Text(options, style="dim"),
+            )
+        elif request.tool in WRITE_EDIT_TOOLS and isinstance(request.args, dict) and workspace_root is not None:
             if request.tool == "edit_file":
                 old, new = old_new_for_edit_request(request.args)
             else:
@@ -1039,12 +1189,15 @@ def prompt_approval(
                 panel_body = f"{request.summary}\n[dim]{options}[/dim]"
         else:
             panel_body = f"{request.summary}\n[dim]{options}[/dim]"
-        console.print(Panel(panel_body, title=title, border_style="cyan"))
+        console.print(Panel(panel_body, title=title, border_style=border_style))
         if PromptSession is not None:
             session = PromptSession()
             line = session.prompt("> ")
             return _parse_approval_choice(line, request)
-    if request.tool == BUDGET_CAP_TOOL:
+    if request.tool == BUDGET_CAP_TOOL and isinstance(request.args, dict):
+        sys.stderr.write(format_budget_cap_approval_text(str(request.path or "budget"), request.args) + "\n")
+        sys.stderr.write("  1) yes  2) yes (this cap)  3) yes (always)  4) no  5) abort\n> ")
+    elif request.tool == BUDGET_CAP_TOOL:
         sys.stderr.write(f"[approval] budget {request.path}  {request.summary}\n")
         sys.stderr.write("  1) yes  2) yes (this cap)  3) yes (always)  4) no  5) abort\n> ")
     else:

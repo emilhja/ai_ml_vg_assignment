@@ -23,6 +23,9 @@ A single live service runs every demo:
 services:
   vg-agent:
     build: .
+    working_dir: /workspace
+    environment:
+      VG_WORKSPACE_ROOT: "."
     # bridged network for OpenRouter only; the agent's egress pin rejects
     # any non-openrouter.ai endpoint even if the network allows it.
     volumes:
@@ -38,6 +41,9 @@ services:
 
 - `vg-agent` runs the live agent against OpenRouter; every scene in
   `specs/70_demo_runbook.md` uses it.
+- `working_dir` is `/workspace` with `VG_WORKSPACE_ROOT=.` so traces and SQLite
+  land in `/workspace/traces` (host `./traces`), not a nested
+  `/workspace/workspace/traces` path.
 - The service mounts `./workspace` read-write so the agent can edit fixture
   files. The host repo itself is never mounted — copy the demo fixture into
   `./workspace` first (`--seed-fixture`).

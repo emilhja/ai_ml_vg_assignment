@@ -37,12 +37,17 @@ Approval policy:
   denylist. Granting `edit_file` for the workspace root does not let
   `.env` through.
 - When an interactive approval prompt is configured (`--require-approval`
-  `writes|all` without `--yes`), hitting a **hard** budget cap (`step_cap`,
-  `token_cap`, `usd_cap`, `daily_cap`, `timeout`, `repetition_abort`) pauses
-  the run with the same five-choice menu as tool approval (`budget_cap` in
-  the trace). Approving extends the relevant cap for one more step or for
-  the session (scoped to that cap type or always). Deny/abort ends the run
-  with `run_end{final_status:"aborted"}`.
+  `writes|all` without `--yes`):
+  - **Proactive step extend** (once per run, when `step_count == max_steps - 1`
+    and `STEP_EXTEND_PROMPT_ON_LAST_STEP` is enabled): optional
+    `budget_cap` prompt with `budget_reason=step_extend` before the next parent
+    model call. Deny continues; abort ends the run.
+  - **Hard budget cap** (`step_cap`, `token_cap`, `usd_cap`, `daily_cap`,
+    `timeout`, `repetition_abort`): pauses the run with the same five-choice
+    menu (`budget_cap` in the trace). Approving extends the relevant cap for
+    one more step or for the session (scoped to that cap type or always).
+    Deny/abort on a hard cap ends the run with `run_end{final_status:"aborted"}`.
+- `--no-step-extend-prompt` disables the proactive offer (hard caps unchanged).
 
 Injection defense:
 
@@ -65,9 +70,21 @@ Parent loop (the only runtime path):
 - Stops on final assistant text (no `tool_use` block), budget abort, step
   cap, token/cost cap, timeout, or tool error policy. **The model itself
   decides when to yield** — there is no scripted route (VG.9).
-- Parent tool results larger than `K_COMPACT` are compacted before the next
-  parent model turn. The full result remains in the JSONL trace and is
-  retrievable via `read_file_range`.
+- Parent tool results larger than `K_COMPACT` trigger **tool-result compaction**
+  before the next parent model turn: the runtime calls `COMPACTOR_MODEL_ID` with
+  the tool-result compaction prompt from `PROMPTS.md`, records a `compaction`
+  event (`summary`, `compactor_model`, `before_tokens`, `after_tokens`), and
+  sends only the compacted marker to the parent model. The full `tool_result`
+  remains in JSONL (`original_event_idx` / `read_file_range`). On compactor
+  failure or budget denial, a deterministic stub summary is used and
+  `compactor_fallback=true` is recorded on the event.
+- **Conversation compaction** runs when estimated parent context tokens exceed
+  `CONTEXT_WINDOW_TOKENS[parent_model] * AUTO_COMPACT_FRACTION[parent_model]`
+  before a parent model call, or when the user runs `/compact` in chat. The
+  compactor summarises folded head turns; the last `COMPACT_KEEP_RECENT_TURNS`
+  user turns stay verbatim. A `context_compaction` event records before/after
+  tokens, `reason` (`auto` | `manual`), and a trace pointer; JSONL retains all
+  original events.
 - The parent emits a `statusline` event and rewrites the stderr statusline
   at each step boundary (`specs/60_observability.md`).
 
@@ -84,7 +101,8 @@ Interactive chat mode:
 - Slash commands handled before dispatch: `/exit`, `/quit`, `/reset`
   (clears approvals, budget, and conversation history; emits `session_reset`),
   `/budget`, `/status`, `/finops` (per-agent-type token/USD breakdown),
-  `/show-context N`, `/approvals`, `/help`.
+  `/show-context N`, `/compact` (fold older in-memory turns via compactor),
+  `/approvals`, `/help`.
 - Interactive TTY chat uses arrow-key slash-command autocomplete: typing a
   command prefix such as `/fin` displays `/finops`, and the highlighted
   completion can be selected with the arrow keys and Enter. Piped stdin keeps

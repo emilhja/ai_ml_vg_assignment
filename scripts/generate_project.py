@@ -17,6 +17,7 @@ SOURCE_INPUTS = [
     ROOT / "specs" / "40_demo_and_eval.md",
     ROOT / "PROMPTS.md",
     ROOT / "MODEL_CONFIG.md",
+    ROOT / "CONTEXT_WINDOWS.md",
 ]
 
 
@@ -31,6 +32,8 @@ def read_config() -> dict[str, str]:
         "COMPACTOR_MODEL_ID",
         "GEMINI_2_0_FLASH_INPUT_PER_MTOK",
         "GEMINI_2_0_FLASH_OUTPUT_PER_MTOK",
+        "GEMINI_2_5_FLASH_INPUT_PER_MTOK",
+        "GEMINI_2_5_FLASH_OUTPUT_PER_MTOK",
         "CLAUDE_SONNET_4_6_INPUT_PER_MTOK",
         "CLAUDE_SONNET_4_6_OUTPUT_PER_MTOK",
         "CLAUDE_HAIKU_4_5_INPUT_PER_MTOK",
@@ -48,6 +51,27 @@ def read_config() -> dict[str, str]:
     return values
 
 
+def read_context_windows() -> dict[str, str]:
+    text = (ROOT / "CONTEXT_WINDOWS.md").read_text(encoding="utf-8")
+    keys = [
+        "GEMINI_2_0_FLASH_CONTEXT_WINDOW",
+        "GEMINI_2_0_FLASH_COMPACT_FRACTION",
+        "GEMINI_2_5_FLASH_CONTEXT_WINDOW",
+        "GEMINI_2_5_FLASH_COMPACT_FRACTION",
+        "CLAUDE_HAIKU_4_5_CONTEXT_WINDOW",
+        "CLAUDE_HAIKU_4_5_COMPACT_FRACTION",
+        "CLAUDE_SONNET_4_6_CONTEXT_WINDOW",
+        "CLAUDE_SONNET_4_6_COMPACT_FRACTION",
+    ]
+    values: dict[str, str] = {}
+    for key in keys:
+        match = re.search(rf"^{key}:\s*([^\n]+)$", text, flags=re.MULTILINE)
+        if not match:
+            raise SystemExit(f"missing {key} in CONTEXT_WINDOWS.md")
+        values[key] = match.group(1).strip()
+    return values
+
+
 def read_prompts() -> dict[str, str]:
     text = (ROOT / "PROMPTS.md").read_text(encoding="utf-8")
     sections: dict[str, str] = {}
@@ -57,7 +81,8 @@ def read_prompts() -> dict[str, str]:
         "EXPLORER_SYSTEM_PROMPT": "## Explorer system prompt",
         "CODER_SYSTEM_PROMPT": "## Coder system prompt",
         "REVIEWER_SYSTEM_PROMPT": "## Reviewer system prompt",
-        "COMPACTION_SYSTEM_PROMPT": "## Compaction system prompt",
+        "COMPACTION_SYSTEM_PROMPT": "## Tool-result compaction prompt",
+        "CONVERSATION_COMPACTION_SYSTEM_PROMPT": "## Conversation compaction prompt",
     }
     for key, header in section_titles.items():
         pattern = re.escape(header) + r"\s*\n(.*?)(?=\n## |\Z)"
@@ -119,10 +144,30 @@ SUBAGENT_MODEL_IDS = {
 
 PRICING_USD_PER_MTOK = {
     "openrouter/google/gemini-2.0-flash-001": {"input": __GEMINI_2_0_FLASH_INPUT_PER_MTOK__, "output": __GEMINI_2_0_FLASH_OUTPUT_PER_MTOK__},
+    "openrouter/google/gemini-2.5-flash": {"input": __GEMINI_2_5_FLASH_INPUT_PER_MTOK__, "output": __GEMINI_2_5_FLASH_OUTPUT_PER_MTOK__},
     "openrouter/anthropic/claude-haiku-4.5": {"input": __CLAUDE_HAIKU_4_5_INPUT_PER_MTOK__, "output": __CLAUDE_HAIKU_4_5_OUTPUT_PER_MTOK__},
     "openrouter/anthropic/claude-sonnet-4.6": {"input": __CLAUDE_SONNET_4_6_INPUT_PER_MTOK__, "output": __CLAUDE_SONNET_4_6_OUTPUT_PER_MTOK__},
 }
 UNKNOWN_MODEL_ESTIMATE_USD_PER_MTOK = {"input": __UNKNOWN_MODEL_INPUT_ESTIMATE_PER_MTOK__, "output": __UNKNOWN_MODEL_OUTPUT_ESTIMATE_PER_MTOK__}
+
+CONTEXT_WINDOW_TOKENS = {
+    "openrouter/google/gemini-2.0-flash-001": __GEMINI_2_0_FLASH_CONTEXT_WINDOW__,
+    "openrouter/google/gemini-2.5-flash": __GEMINI_2_5_FLASH_CONTEXT_WINDOW__,
+    "openrouter/anthropic/claude-haiku-4.5": __CLAUDE_HAIKU_4_5_CONTEXT_WINDOW__,
+    "openrouter/anthropic/claude-sonnet-4.6": __CLAUDE_SONNET_4_6_CONTEXT_WINDOW__,
+}
+AUTO_COMPACT_FRACTION = {
+    "openrouter/google/gemini-2.0-flash-001": __GEMINI_2_0_FLASH_COMPACT_FRACTION__,
+    "openrouter/google/gemini-2.5-flash": __GEMINI_2_5_FLASH_COMPACT_FRACTION__,
+    "openrouter/anthropic/claude-haiku-4.5": __CLAUDE_HAIKU_4_5_COMPACT_FRACTION__,
+    "openrouter/anthropic/claude-sonnet-4.6": __CLAUDE_SONNET_4_6_COMPACT_FRACTION__,
+}
+DEFAULT_CONTEXT_WINDOW = 128_000
+DEFAULT_COMPACT_FRACTION = 0.80
+COMPACT_KEEP_RECENT_TURNS = 4
+COMPACTOR_MAX_OUTPUT_TOKENS = 400
+COMPACTOR_MAX_INPUT_CHARS = 120_000
+COMPACTOR_MAX_SUMMARY_TOKENS = 300
 
 MAX_PARENT_STEPS = 15
 MAX_SUBAGENT_STEPS = 8
@@ -145,6 +190,7 @@ MAX_TOOL_RESULT_BYTES = 1_048_576
 DAILY_SPEND_FILE = ".vg_daily_spend.json"
 APPROVALS_FILE = ".vg_approvals.json"
 REQUIRE_APPROVAL_DEFAULT = "off"
+STEP_EXTEND_PROMPT_ON_LAST_STEP = True
 SQLITE_TRACE_DB = "traces/vg_agent.sqlite3"
 ''',
     "budget.py": '''"""Generated budget guard."""
@@ -173,6 +219,27 @@ class BudgetDecision:
 
 def _today_utc_key() -> str:
     return datetime.now(timezone.utc).date().isoformat()
+
+
+def format_usd_display(value: float) -> str:
+    """USD with $ prefix; no scientific notation; sub-cent caps stay readable."""
+    value = float(value)
+    if abs(value) < 1e-12:
+        return "$0.00"
+    if abs(value) >= 0.01:
+        return f"${value:.2f}"
+    for decimals in range(4, 10):
+        formatted = f"{value:.{decimals}f}"
+        if abs(float(formatted)) >= 1e-12:
+            body = formatted.rstrip("0").rstrip(".") if "." in formatted else formatted
+            return f"${body}"
+    return f"${value:.8f}".rstrip("0").rstrip(".")
+
+
+def format_usd_number(value: float) -> str:
+    """Plain USD amount (no $) for slash-command / budget lines."""
+    text = format_usd_display(value)
+    return text[1:] if text.startswith("$") else text
 
 
 class DailySpendLedger:
@@ -240,6 +307,7 @@ class BudgetGuard:
     per_agent_type_model_calls: dict[str, int] = field(default_factory=dict)
     per_agent_type_usd: dict[str, float] = field(default_factory=dict)
     warned: set[str] = field(default_factory=set)
+    step_extend_prompted: bool = False
     wall_clock_extra_s: float = 0.0
     lock: object = field(default_factory=threading.RLock, compare=False, repr=False)
 
@@ -262,7 +330,7 @@ class BudgetGuard:
                 return BudgetDecision(False, "token_cap", {"tokens": self.running_tokens, "max_tokens": self.max_tokens})
             worst_cost = self.estimate_cost(model, worst_input_tokens, worst_output_tokens)
             if self.running_usd + worst_cost > self.max_usd:
-                return BudgetDecision(False, "usd_cap", {"running_usd": self.running_usd, "worst_next_usd": worst_cost})
+                return BudgetDecision(False, "usd_cap", {"running_usd": self.running_usd, "worst_next_usd": worst_cost, "max_usd": self.max_usd})
             if self.running_usd + worst_cost > self.daily_remaining_usd:
                 return BudgetDecision(False, "daily_cap", {"running_usd": self.running_usd, "daily_remaining_usd": self.daily_remaining_usd})
             return BudgetDecision(True)
@@ -309,6 +377,18 @@ class BudgetGuard:
                 out.append(BudgetDecision(True, "warn_steps", {"step_count": self.step_count, "max_steps": self.max_steps, "crossed_at_step": self.step_count}))
             return out
 
+    def should_offer_step_extend(self) -> bool:
+        with self.lock:
+            if not config.STEP_EXTEND_PROMPT_ON_LAST_STEP:
+                return False
+            if self.step_extend_prompted or self.max_steps <= 1:
+                return False
+            return self.step_count > 0 and self.step_count == self.max_steps - 1
+
+    def mark_step_extend_prompted(self) -> None:
+        with self.lock:
+            self.step_extend_prompted = True
+
     def record_tool_signature(self, tool: str, args_key: str) -> BudgetDecision:
         with self.lock:
             signature = (tool, args_key)
@@ -320,6 +400,40 @@ class BudgetGuard:
             if self.repeat_count >= 3:
                 return BudgetDecision(False, "repetition_abort", {"tool": tool, "args_key": args_key, "repeat_count": self.repeat_count})
             return BudgetDecision(True)
+
+    def configure_caps(
+        self,
+        *,
+        max_steps: int | None = None,
+        max_tokens: int | None = None,
+        max_usd: float | None = None,
+        daily_remaining_usd: float | None = None,
+    ) -> str | None:
+        """Update session caps from ``/budget``; returns an error message or None."""
+        with self.lock:
+            if max_steps is not None:
+                if max_steps < 1:
+                    return "max_steps must be >= 1"
+                if max_steps < self.step_count:
+                    return f"max_steps must be >= step_count ({self.step_count})"
+                self.max_steps = max_steps
+            if max_tokens is not None:
+                if max_tokens < 1:
+                    return "max_tokens must be >= 1"
+                if max_tokens < self.running_tokens:
+                    return f"max_tokens must be >= running tokens ({self.running_tokens})"
+                self.max_tokens = max_tokens
+            if max_usd is not None:
+                if max_usd <= 0:
+                    return "max_usd must be > 0"
+                if max_usd < self.running_usd:
+                    return f"max_usd must be >= running usd ({format_usd_number(self.running_usd)})"
+                self.max_usd = float(max_usd)
+            if daily_remaining_usd is not None:
+                if daily_remaining_usd <= 0:
+                    return "daily_remaining_usd must be > 0"
+                self.daily_remaining_usd = float(daily_remaining_usd)
+        return None
 
     def extend_cap(self, reason: str, *, once: bool) -> None:
         """Raise a hard cap after interactive approval."""
@@ -1130,6 +1244,17 @@ def show_context(events: list[dict[str, object]], step_idx: int) -> list[dict[st
             if pos is not None:
                 context[pos]["content"] = compacted_marker(event)
                 context[pos]["compacted"] = True
+        elif kind == "context_compaction":
+            context.append({
+                "role": "meta",
+                "kind": "context_compaction",
+                "content": (
+                    f"Conversation compacted {event.get('before_tokens')} -> {event.get('after_tokens')} "
+                    f"tokens ({event.get('percent_reduced')}% reduced, reason={event.get('reason')}). "
+                    f"{event.get('summary')}"
+                ),
+                "trace_pointer": event.get("trace_pointer"),
+            })
         elif kind == "approval":
             context.append({
                 "role": "meta",
@@ -1498,15 +1623,32 @@ def format_turn_review(
             )
     lines.append("")
     compactions = [event for event in turn_events if event.get("kind") == "compaction"]
+    context_compactions = [event for event in turn_events if event.get("kind") == "context_compaction"]
     lines.append("Context engineering:")
-    if not compactions:
+    if not compactions and not context_compactions:
         lines.append("  (no compaction events)")
     else:
         for event in compactions:
+            summary = str(event.get("summary") or "").strip()
+            if len(summary) > 80:
+                summary = summary[:80] + "…"
             lines.append(
-                f"  - compacted {event.get('before_tokens')} -> {event.get('after_tokens')} tokens "
-                f"(trace event {event.get('original_event_idx')})"
+                f"  - tool_result compacted {event.get('before_tokens')} -> {event.get('after_tokens')} tokens "
+                f"(trace event {event.get('original_event_idx')}, model={event.get('compactor_model')}, "
+                f"fallback={event.get('compactor_fallback')})"
             )
+            if summary:
+                lines.append(f"    summary: {summary}")
+        for event in context_compactions:
+            summary = str(event.get("summary") or "").strip()
+            if len(summary) > 80:
+                summary = summary[:80] + "…"
+            lines.append(
+                f"  - conversation compacted {event.get('before_tokens')} -> {event.get('after_tokens')} tokens "
+                f"(reason={event.get('reason')}, {event.get('percent_reduced')}% reduced)"
+            )
+            if summary:
+                lines.append(f"    summary: {summary}")
     lines.append("")
     answer = ""
     for event in reversed(turn_events):
@@ -1642,7 +1784,7 @@ from pathlib import Path
 
 from . import config, tools
 from .live_model_client import LiveModelClient, LiveModelError, ModelTurn, ToolCall
-from .budget import BudgetGuard
+from .budget import BudgetDecision, BudgetGuard, format_usd_display
 from .trace import TraceRecorder, compacted_marker, now_iso
 
 
@@ -1655,6 +1797,10 @@ EXPLORER_SYSTEM_PROMPT = __EXPLORER_SYSTEM_PROMPT_LITERAL__
 CODER_SYSTEM_PROMPT = __CODER_SYSTEM_PROMPT_LITERAL__
 
 REVIEWER_SYSTEM_PROMPT = __REVIEWER_SYSTEM_PROMPT_LITERAL__
+
+COMPACTION_SYSTEM_PROMPT = __COMPACTION_SYSTEM_PROMPT_LITERAL__
+
+CONVERSATION_COMPACTION_SYSTEM_PROMPT = __CONVERSATION_COMPACTION_SYSTEM_PROMPT_LITERAL__
 
 SUBAGENT_SYSTEM_PROMPTS = {
     "grilling": GRILLING_SYSTEM_PROMPT,
@@ -1758,6 +1904,7 @@ def _scope_candidates(request: ApprovalRequest) -> list[str]:
 class ApprovalPolicy:
     mode: str = "off"
     auto_yes: bool = False
+    step_extend_prompt: bool = True
     prompt: Callable[[ApprovalRequest], ApprovalOutcome] | None = None
     cache: ApprovalScopeCache = field(default_factory=ApprovalScopeCache)
 
@@ -1961,25 +2108,217 @@ def _subagent_tool_schemas(agent_type: str) -> list[dict[str, Any]]:
 EXPLORER_TOOL_SCHEMAS = _subagent_tool_schemas("explorer")
 
 
-def _compact_if_needed(recorder: TraceRecorder, event: dict[str, object]) -> dict[str, object] | None:
+def _compactor_stub_summary(tool: str, event: dict[str, object]) -> str:
+    lines = str(event.get("result_full") or "").splitlines()
+    return (
+        f"Large {tool} result with {len(lines)} lines and {event.get('bytes')} bytes. "
+        "The full content remains in the JSONL trace; use read_file_range or re-run "
+        "a targeted read to retrieve specific lines."
+    )
+
+
+def _clamp_summary_tokens(summary: str, max_tokens: int | None = None) -> str:
+    limit = max_tokens if max_tokens is not None else config.COMPACTOR_MAX_SUMMARY_TOKENS
+    while summary and tools.estimate_tokens(summary) > limit:
+        summary = summary[: max(1, len(summary) - 200)]
+    return summary.strip()
+
+
+def _prepare_compactor_input(body: str, *, trace_pointer: str) -> str:
+    if len(body) <= config.COMPACTOR_MAX_INPUT_CHARS:
+        return body
+    return (
+        body[: config.COMPACTOR_MAX_INPUT_CHARS]
+        + f"\\n[truncated for compaction input; full payload at {trace_pointer}]"
+    )
+
+
+def _summarize_for_compactor(
+    *,
+    system_prompt: str,
+    body: str,
+    tool: str,
+    client: Any,
+    guard: BudgetGuard,
+    recorder: TraceRecorder,
+    trace_pointer: str,
+    deterministic: bool = False,
+    stub_event: dict[str, object] | None = None,
+) -> tuple[str, bool]:
+    """Return (summary, compactor_fallback)."""
+    if deterministic:
+        if "SAMPLE_LOG" in body or (stub_event and int(stub_event.get("tokens") or 0) > config.K_COMPACT):
+            return "SAMPLE_LOG_SUMMARY_SENTINEL: large log summarised for parent context.", False
+        return _compactor_stub_summary(tool, stub_event or {"result_full": body, "bytes": len(body.encode())}), True
+
+    model = config.COMPACTOR_MODEL_ID
+    prepared = _prepare_compactor_input(body, trace_pointer=trace_pointer)
+    user_content = f"Tool: {tool}\\n\\n{prepared}"
+    expected_in = tools.estimate_tokens(system_prompt + "\\n" + user_content)
+    decision = guard.before_model_call(model, expected_in, config.COMPACTOR_MAX_OUTPUT_TOKENS)
+    if not decision.allowed:
+        return _compactor_stub_summary(tool, stub_event or {"result_full": body, "bytes": len(body.encode())}), True
+
+    recorder.emit(
+        "llm_start",
+        agent_id="compactor",
+        agent_type="compactor",
+        model=model,
+        model_id=model,
+        step_idx=guard.step_count,
+        tokens_in=expected_in,
+        max_tokens=config.COMPACTOR_MAX_OUTPUT_TOKENS,
+        endpoint_host=config.OPENROUTER_ENDPOINT_HOST,
+        system_prompt_sha256=hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
+        tool_schema_count=0,
+        tool_schema_names=[],
+    )
+    try:
+        turn = client.complete(
+            model=model,
+            system_prompt=system_prompt,
+            messages=[{"role": "user", "content": user_content}],
+            tools=[],
+            max_tokens=config.COMPACTOR_MAX_OUTPUT_TOKENS,
+        )
+    except LiveModelError:
+        return _compactor_stub_summary(tool, stub_event or {"result_full": body, "bytes": len(body.encode())}), True
+    if not isinstance(turn, ModelTurn):
+        turn = ModelTurn(**turn)
+    summary = _clamp_summary_tokens((turn.assistant_text or "").strip())
+    model_id = turn.model_id or model
+    input_tokens = turn.input_tokens or expected_in
+    output_tokens = turn.output_tokens or tools.estimate_tokens(summary)
+    cost = guard.record_model_call(model_id, input_tokens, output_tokens, cost_usd=turn.cost_usd, agent_type="compactor")
+    recorder.emit(
+        "assistant_step",
+        agent_id="compactor",
+        agent_type="compactor",
+        model=model_id,
+        model_id=model_id,
+        step_idx=guard.step_count,
+        tokens_in=input_tokens,
+        tokens_out=output_tokens,
+        cost_usd=cost,
+        assistant_text=summary,
+        tool_calls=[],
+        stop_reason=turn.stop_reason,
+    )
+    return summary, False
+
+
+def _compact_if_needed(
+    recorder: TraceRecorder,
+    event: dict[str, object],
+    *,
+    client: Any,
+    guard: BudgetGuard,
+    tool: str,
+    deterministic: bool = False,
+) -> dict[str, object] | None:
     tokens = int(event["tokens"])
     if tokens <= config.K_COMPACT:
         return None
     full = str(event["result_full"])
-    lines = full.splitlines()
-    summary = (
-        f"Large {event['tool']} result with {len(lines)} lines and {event['bytes']} bytes. "
-        "The full content remains in the JSONL trace; use read_file_range or re-run "
-        "a targeted read to retrieve specific lines."
+    trace_pointer = f"{recorder.run_id}:event:{event['event_idx']}"
+    summary, fallback = _summarize_for_compactor(
+        system_prompt=COMPACTION_SYSTEM_PROMPT,
+        body=full,
+        tool=tool or str(event.get("tool") or ""),
+        client=client,
+        guard=guard,
+        recorder=recorder,
+        trace_pointer=trace_pointer,
+        deterministic=deterministic,
+        stub_event=event,
     )
+    after_tokens = tools.estimate_tokens(summary)
     return recorder.emit(
         "compaction",
         tool_use_id=event["tool_use_id"],
         before_tokens=tokens,
-        after_tokens=tools.estimate_tokens(summary),
+        after_tokens=after_tokens,
         summary=summary,
+        compactor_model=config.COMPACTOR_MODEL_ID,
+        compactor_fallback=fallback,
         original_event_idx=event["event_idx"],
         original_sha256=hashlib.sha256(full.encode("utf-8")).hexdigest(),
+    )
+
+
+def _context_window_for_model(model_id: str) -> int:
+    return int(config.CONTEXT_WINDOW_TOKENS.get(model_id, config.DEFAULT_CONTEXT_WINDOW))
+
+
+def _compact_fraction_for_model(model_id: str) -> float:
+    return float(config.AUTO_COMPACT_FRACTION.get(model_id, config.DEFAULT_COMPACT_FRACTION))
+
+
+def _split_messages_for_conversation_compaction(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    user_indices = [index for index, message in enumerate(messages) if message.get("role") == "user"]
+    if len(user_indices) <= config.COMPACT_KEEP_RECENT_TURNS:
+        return None
+    split_at = user_indices[-config.COMPACT_KEEP_RECENT_TURNS]
+    if split_at <= 0:
+        return None
+    return messages[:split_at], messages[split_at:]
+
+
+def compact_conversation(
+    recorder: TraceRecorder,
+    messages: list[dict[str, Any]],
+    parent_model_id: str,
+    guard: BudgetGuard,
+    *,
+    client: Any,
+    reason: str,
+    deterministic: bool = False,
+) -> dict[str, object] | None:
+    split = _split_messages_for_conversation_compaction(messages)
+    if split is None:
+        return None
+    head, tail = split
+    before = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
+    head_text = json.dumps(head, sort_keys=True, ensure_ascii=False)
+    trace_pointer = str(recorder.run_id)
+    summary, fallback = _summarize_for_compactor(
+        system_prompt=CONVERSATION_COMPACTION_SYSTEM_PROMPT,
+        body=head_text,
+        tool="conversation",
+        client=client,
+        guard=guard,
+        recorder=recorder,
+        trace_pointer=trace_pointer,
+        deterministic=deterministic,
+    )
+    folded = {
+        "role": "user",
+        "content": (
+            f"[CONVERSATION COMPACTED reason={reason}]\\n"
+            f"{summary}\\n"
+            f"Trace pointer: {trace_pointer}. Full history remains in JSONL."
+        ),
+    }
+    messages[:] = [folded, *tail]
+    after = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
+    if before <= 0:
+        percent_reduced = 0.0
+    else:
+        percent_reduced = round(100.0 - (after / before) * 100.0, 1)
+    window = _context_window_for_model(parent_model_id)
+    threshold = int(window * _compact_fraction_for_model(parent_model_id))
+    return recorder.emit(
+        "context_compaction",
+        before_tokens=before,
+        after_tokens=after,
+        percent_reduced=percent_reduced,
+        model=parent_model_id,
+        window=window,
+        threshold=threshold,
+        reason=reason,
+        summary=summary,
+        trace_pointer=trace_pointer,
+        compactor_fallback=fallback,
     )
 
 
@@ -2039,12 +2378,20 @@ def _record_budget_abort(recorder: TraceRecorder, guard: BudgetGuard, decision: 
 def _budget_cap_summary(decision: Any) -> str:
     reason = str(getattr(decision, "budget_reason", None) or "budget")
     details = dict(getattr(decision, "details", None) or {})
-    if reason == "step_cap":
-        return f"{reason} steps {details.get('steps')}/{details.get('max_steps')}"
+    if reason in {"step_extend", "step_cap"}:
+        steps = details.get("step_count", details.get("steps"))
+        return f"{reason} steps {steps}/{details.get('max_steps')}"
     if reason == "token_cap":
         return f"{reason} tokens {details.get('tokens')}/{details.get('max_tokens')}"
     if reason == "usd_cap":
-        return f"{reason} usd {details.get('running_usd')}/{details.get('max_usd', config.MAX_USD_PER_RUN)}"
+        cap = float(details.get('max_usd', config.MAX_USD_PER_RUN))
+        spent = float(details.get('running_usd') or 0.0)
+        step_est = float(details.get('worst_next_usd') or 0.0)
+        projected = spent + step_est
+        return (
+            f"USD cap: next step ~{format_usd_display(projected)} exceeds cap {format_usd_display(cap)} "
+            f"(spent {format_usd_display(spent)}, step est. ~{format_usd_display(step_est)})"
+        )
     if reason == "daily_cap":
         return f"{reason} daily_remaining {details.get('daily_remaining_usd')}"
     if reason == "timeout":
@@ -2070,6 +2417,39 @@ def _emit_budget_approval(recorder: TraceRecorder, decision: Any, outcome: Appro
 
 def _wall_clock_exceeded(started: float, guard: BudgetGuard) -> bool:
     return time.perf_counter() - started > float(config.WALL_CLOCK_TIMEOUT) + guard.wall_clock_extra_s
+
+
+def _offer_step_extend_if_needed(
+    *,
+    policy: ApprovalPolicy,
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    started: float,
+) -> bool:
+    """Return False only when the user aborts the proactive step-extend prompt."""
+    if not policy.step_extend_prompt or policy.auto_yes or policy.prompt is None:
+        return True
+    if not guard.should_offer_step_extend():
+        return True
+    details: dict[str, object] = {"step_count": guard.step_count, "max_steps": guard.max_steps}
+    decision = BudgetDecision(False, "step_extend", details)
+    summary = _budget_cap_summary(decision)
+    outcome = policy.check_budget_cap("step_extend", details, summary)
+    _emit_budget_approval(recorder, decision, outcome)
+    guard.mark_step_extend_prompted()
+    if outcome.decision in {"approved", "approved_scoped", "approved_always", "auto"}:
+        once = outcome.decision in {"approved", "auto"}
+        guard.extend_cap("step_cap", once=once)
+        recorder.emit(
+            "budget_event",
+            budget_reason="step_extend",
+            details={**details, "extended": True},
+        )
+        return True
+    if outcome.decision == "aborted":
+        _record_budget_abort(recorder, guard, decision, started)
+        return False
+    return True
 
 
 def _handle_budget_cap(
@@ -2511,7 +2891,22 @@ def run_live_task(
             if not _handle_budget_cap(policy=policy, recorder=recorder, guard=guard, decision=timeout, started=started):
                 return recorder
             continue
+        if not _offer_step_extend_if_needed(policy=policy, recorder=recorder, guard=guard, started=started):
+            return recorder
         expected_in = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
+        window = _context_window_for_model(config.PARENT_MODEL_ID)
+        threshold = int(window * _compact_fraction_for_model(config.PARENT_MODEL_ID))
+        if expected_in > threshold:
+            compact_conversation(
+                recorder,
+                messages,
+                config.PARENT_MODEL_ID,
+                guard,
+                client=client,
+                reason="auto",
+                deterministic=False,
+            )
+            expected_in = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
         decision = guard.before_model_call(config.PARENT_MODEL_ID, expected_in, 4096)
         if not decision.allowed:
             if not _handle_budget_cap(policy=policy, recorder=recorder, guard=guard, decision=decision, started=started):
@@ -2595,7 +2990,14 @@ def run_live_task(
             )
             event = recorder.emit("tool_result", **result)
             content = str(result["result_full"])
-            compaction = _compact_if_needed(recorder, event)
+            compaction = _compact_if_needed(
+                recorder,
+                event,
+                client=client,
+                guard=guard,
+                tool=call.name,
+                deterministic=False,
+            )
             if compaction is not None:
                 content = compacted_marker(compaction)
             elif len(content.encode("utf-8")) > config.MAX_TOOL_RESULT_BYTES:
@@ -2653,6 +3055,7 @@ from .chat_ui import (
     build_session_status,
     capture_write_prior,
     emit_session_statusline,
+    format_budget_cap_approval_text,
     format_compaction_banner,
     format_literal_tool_body,
     format_statusline_compact,
@@ -2669,10 +3072,18 @@ from .chat_ui import (
     use_rich_ui,
     _console,
 )
-from .agent import BUDGET_CAP_TOOL, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, run_live_task
+from .agent import (
+    BUDGET_CAP_TOOL,
+    ApprovalOutcome,
+    ApprovalPolicy,
+    ApprovalRequest,
+    compact_conversation,
+    run_live_task,
+)
 from .live_model_client import LiveModelClient, MissingOpenRouterKey
-from .budget import BudgetGuard
+from .budget import BudgetGuard, format_usd_display
 from .demo_fixture import write_fixture
+from .workspace_paths import resolve_workspace_root
 from .trace import (
     TraceRecorder,
     format_parallel_progress_lines,
@@ -2691,7 +3102,9 @@ def _stdin_prompt(stream: object | None = None, *, workspace_root: Path | None =
     def ask(request: ApprovalRequest) -> ApprovalOutcome:
         if use_rich_ui():
             return prompt_approval(request, input_stream=fh, workspace_root=workspace_root)
-        if request.tool == BUDGET_CAP_TOOL:
+        if request.tool == BUDGET_CAP_TOOL and isinstance(request.args, dict):
+            sys.stderr.write(format_budget_cap_approval_text(request.path, request.args) + "\\n")
+        elif request.tool == BUDGET_CAP_TOOL:
             sys.stderr.write(f"[approval] budget {request.path}  {request.summary}\\n")
         else:
             sys.stderr.write(f"[approval] {request.tool}  {request.summary}\\n")
@@ -2735,17 +3148,87 @@ def _make_policy(args: argparse.Namespace, workspace_root: Path | None = None) -
     return ApprovalPolicy(
         mode=mode,
         auto_yes=bool(args.yes),
+        step_extend_prompt=not bool(getattr(args, "no_step_extend_prompt", False)),
         prompt=_stdin_prompt(workspace_root=workspace_root),
     )
 
 
 def _print_budget(guard: BudgetGuard) -> None:
+    from .budget import format_usd_number
+
     sys.stdout.write(
         f"steps {guard.step_count}/{guard.max_steps}  "
         f"tokens {guard.running_tokens}/{guard.max_tokens}  "
-        f"usd {guard.running_usd:.6f}/{guard.max_usd}  "
-        f"daily_remaining {guard.daily_remaining_usd:.6f}\\n"
+        f"usd {format_usd_number(guard.running_usd)}/{format_usd_number(guard.max_usd)}  "
+        f"daily_remaining {format_usd_number(guard.daily_remaining_usd)}\\n"
     )
+
+
+def _print_budget_set_hint() -> None:
+    sys.stdout.write(
+        "Set caps: /budget steps N   /budget tokens N   /budget usd N   /budget daily N\\n"
+        "  (combine: /budget steps 50 tokens 100000 usd 2 daily 4)\\n"
+    )
+
+
+_BUDGET_SLASH_KEYS = {
+    "steps": "max_steps",
+    "max_steps": "max_steps",
+    "tokens": "max_tokens",
+    "max_tokens": "max_tokens",
+    "usd": "max_usd",
+    "max_usd": "max_usd",
+    "daily": "daily_remaining_usd",
+    "daily_remaining": "daily_remaining_usd",
+    "daily_remaining_usd": "daily_remaining_usd",
+}
+
+
+def _parse_budget_slash(prompt: str) -> tuple[dict[str, float | int], str | None]:
+    parts = prompt.split()
+    if not parts or parts[0].lower() != "/budget":
+        return {}, "not a budget command"
+    if len(parts) == 1:
+        return {}, None
+    caps: dict[str, float | int] = {}
+    idx = 1
+    while idx < len(parts):
+        key = parts[idx].lower()
+        field = _BUDGET_SLASH_KEYS.get(key)
+        if field is None:
+            return {}, f"unknown budget field: {parts[idx]!r} (try steps, tokens, usd, daily)"
+        if idx + 1 >= len(parts):
+            return {}, f"missing value for {key}"
+        raw = parts[idx + 1]
+        idx += 2
+        try:
+            if field == "max_steps":
+                value: float | int = int(raw)
+            elif field == "max_tokens":
+                value = int(raw)
+            else:
+                value = float(raw)
+        except ValueError:
+            return {}, f"invalid value for {key}: {raw!r}"
+        caps[field] = value
+    return caps, None
+
+
+def _handle_budget_slash(prompt: str, guard: BudgetGuard, recorder: TraceRecorder) -> None:
+    caps, err = _parse_budget_slash(prompt)
+    if err:
+        sys.stdout.write(err + "\\n")
+        return
+    if not caps:
+        _print_budget(guard)
+        _print_budget_set_hint()
+        return
+    msg = guard.configure_caps(**caps)  # type: ignore[arg-type]
+    if msg:
+        sys.stdout.write(msg + "\\n")
+        return
+    recorder.emit("budget_event", budget_reason="user_config", details=caps)
+    _print_budget(guard)
 
 
 def _print_chat_status_report(
@@ -2779,17 +3262,20 @@ SLASH_COMMANDS = (
     "/reset",
     "/new",
     "/show-context",
+    "/compact",
     "/review",
     "/help",
 )
 SLASH_COMMAND_USAGE = {
+    "/budget": "/budget [steps N] [tokens N] [usd N] [daily N]",
     "/show-context": "/show-context N",
+    "/compact": "/compact",
     "/review": "/review [N]",
 }
 SLASH_COMMAND_META = {
     "/exit": "End chat cleanly",
     "/quit": "Alias for /exit",
-    "/budget": "Show steps, tokens, USD, and daily remaining",
+    "/budget": "Show or set session caps (steps, tokens, usd, daily)",
     "/status": "Refresh dashboard (TTY) and print session summary on stdout",
     "/finops": "Show per-agent token, tool, and cost table (+ parallel batches)",
     "/review": "Readable recap of a completed turn (default: last)",
@@ -2797,6 +3283,7 @@ SLASH_COMMAND_META = {
     "/reset": "Clear approvals, budget, and chat history",
     "/new": "Start a fresh chat session and trace",
     "/show-context": "Overview, or N for parent context JSON at step N",
+    "/compact": "Summarise folded conversation head; keep recent turns verbatim",
     "/help": "Show slash command help",
 }
 
@@ -2814,6 +3301,7 @@ def _format_slash_command_help() -> str:
             "  Normal text is sent to the agent as the next task.",
             "  Interactive terminals autocomplete slash commands after typing /.",
             "  TTY: /new, /reset, /status clear the screen and refresh the dashboard.",
+            "  /budget alone prints caps plus how to set steps, tokens, usd, or daily.",
         )
     )
     return "\\n".join(lines)
@@ -3059,6 +3547,8 @@ def _chat_statusline_color(line: str, *, use_color: bool) -> str:
     has_tool_errors = "tool errs " in lowered and "tool errs 0" not in lowered and "/ 0 session" not in lowered
     if any(marker in lowered for marker in ("tool_error", "model_error", "aborted")) or has_tool_errors:
         color = "\\x1b[31m"
+    elif "!usd" in lowered or "exceeds cap" in lowered or "(next ~$" in lowered:
+        color = "\\x1b[31m"
     elif any(marker in lowered for marker in ("warn_", "cap")):
         color = "\\x1b[33m"
     else:
@@ -3163,7 +3653,13 @@ def _format_progress_event(event: dict[str, object]) -> str | None:
             line += f" status={child_status}: {summary[:180]}"
         return line
     if kind == "compaction":
-        return f"[context] compacted {event.get('before_tokens')} -> {event.get('after_tokens')} tokens"
+        return f"[context] compacted tool result {event.get('before_tokens')} -> {event.get('after_tokens')} tokens"
+    if kind == "context_compaction":
+        reason = event.get("reason") or "auto"
+        return (
+            f"[context] {reason}-compact {event.get('before_tokens')} -> {event.get('after_tokens')} "
+            f"tokens ({event.get('percent_reduced')}% reduced); full history in trace"
+        )
     if kind == "budget_event":
         return f"[budget] {event.get('budget_reason')}"
     if kind == "model_error":
@@ -3413,6 +3909,14 @@ def _latest_run_end_status(events: list[dict[str, object]]) -> str | None:
     return None
 
 
+def _exit_code_for_final_status(status: str | None) -> int:
+    if status == "aborted":
+        return 3
+    if status == "model_error":
+        return 75
+    return 0
+
+
 def _apply_model_overrides(args: argparse.Namespace) -> None:
     if getattr(args, "parent_model", None):
         config.PARENT_MODEL_ID = args.parent_model
@@ -3533,8 +4037,8 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 continue
             if prompt in {"/exit", "/quit"}:
                 break
-            if prompt == "/budget":
-                _print_budget(guard)
+            if prompt.startswith("/budget"):
+                _handle_budget_slash(prompt, guard, recorder)
                 continue
             if prompt == "/status":
                 if use_rich_ui():
@@ -3612,6 +4116,31 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                         json.dumps(show_context(recorder.events, step), indent=2, ensure_ascii=False) + "\\n"
                     )
                 continue
+            if prompt == "/compact" or prompt.startswith("/compact "):
+                if not conversation:
+                    sys.stdout.write("No conversation history to compact yet.\\n")
+                    continue
+                try:
+                    compact_client = LiveModelClient.from_env(recorder=recorder)
+                except MissingOpenRouterKey as exc:
+                    sys.stderr.write(f"error: {exc}\\n")
+                    continue
+                compact_event = compact_conversation(
+                    recorder,
+                    conversation,
+                    config.PARENT_MODEL_ID,
+                    guard,
+                    client=compact_client,
+                    reason="manual",
+                    deterministic=False,
+                )
+                if compact_event is None:
+                    sys.stdout.write("Nothing to fold (history too short).\\n")
+                else:
+                    banner = format_compaction_banner(compact_event)
+                    if banner:
+                        sys.stdout.write(banner + "\\n")
+                continue
             if prompt == "/help":
                 sys.stdout.write(SLASH_COMMAND_HELP + "\\n")
                 continue
@@ -3672,6 +4201,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--chat", action="store_true")
     parser.add_argument("--require-approval", choices=["off", "writes", "all"], default=config.REQUIRE_APPROVAL_DEFAULT)
     parser.add_argument("--yes", action="store_true")
+    parser.add_argument("--no-step-extend-prompt", action="store_true")
     parser.add_argument("--no-redact", action="store_true")
     parser.add_argument("--budget", action="store_true")
     parser.add_argument("--finops", action="store_true")
@@ -3684,7 +4214,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_redact:
         sys.stderr.write("warning: --no-redact disables trace secret redaction.\\n")
 
-    root = Path.cwd()
+    root = resolve_workspace_root()
     if args.seed_fixture:
         write_fixture(root)
         print(f"seeded fixture at {root}")
@@ -3724,9 +4254,7 @@ def main(argv: list[str] | None = None) -> int:
         _print_budget(guard)
     if guard is not None and args.finops:
         _print_finops(guard, recorder)
-    if _latest_run_end_status(recorder.events) == "model_error":
-        return 75
-    return 0
+    return _exit_code_for_final_status(_latest_run_end_status(recorder.events))
 
 
 if __name__ == "__main__":
@@ -3735,7 +4263,7 @@ if __name__ == "__main__":
 }
 
 
-EXTRA_SOURCE_GENERATED_FILES = ["sqlite_store.py", "chat_ui.py"]
+EXTRA_SOURCE_GENERATED_FILES = ["sqlite_store.py", "chat_ui.py", "workspace_paths.py"]
 
 
 def write_generated(src_dir: Path, digest: str, cfg: dict[str, str], prompts: dict[str, str], clean: bool) -> None:
@@ -3776,6 +4304,7 @@ def main() -> int:
     args = parser.parse_args()
 
     cfg = read_config()
+    cfg.update(read_context_windows())
     prompts = read_prompts()
     digest = spec_digest()
     src_dir = Path(args.src_dir)

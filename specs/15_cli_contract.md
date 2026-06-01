@@ -31,7 +31,8 @@ model step.
 |---|---|
 | `/exit` | End the chat process cleanly. |
 | `/quit` | Alias for `/exit`. |
-| `/budget` | Print the current session budget counters: steps, tokens, USD spend, and daily remaining USD. |
+| `/budget` | Print the current session budget counters (steps, tokens, USD spend, daily remaining USD) and a one-line hint for setting each cap. |
+| `/budget …` | Set session caps without resetting counters: `/budget steps N`, `tokens N`, `usd N`, and/or `daily N` (aliases `max_steps`, `max_tokens`, `max_usd`, `daily_remaining`). Multiple pairs may appear on one line. New caps must be at least the current usage where applicable. Emits `budget_event{reason:"user_config"}`. |
 | `/status` | Clear and reprint the full session dashboard when Rich TTY UI is active (welcome panel + status bar). Always print on stdout: compact statusline, budget counters, trace path, and last `run_end` status when present. See `specs/16_chat_ui.md`. |
 | `/finops` | Print a per-agent-type FinOps table for the session, including input/output/total tokens, model-call count, tool-call count, and USD spend. After the table, print a short **parallel batches** summary when `spawn_subagents` produced overlapping sub-agents (see `specs/60_observability.md`). |
 | `/review` | Print a human-readable recap of a completed user turn: prompt, parent tool plan, parallel sub-agent summary, compaction rows, final answer, and trace pointers. `/review` = last turn; `/review N` = turn `N` (1-based `user_prompt` index). |
@@ -41,6 +42,7 @@ model step.
 | `/show-context` | Print a **step overview**: per parent step, context message count, tools invoked that step, visible tool-result count, compaction count, and parallel sub-agent notes when `spawn_subagents` ran. |
 | `/show-context N` | Print the parent-visible context at parent step `N` as formatted JSON (same as `--show-context N`). |
 | `/show-context overview` | Alias for `/show-context` (overview only). |
+| `/compact` | Manually fold older in-memory conversation turns via `COMPACTOR_MODEL_ID`; emits `context_compaction{reason:"manual"}`. Recent turns stay verbatim. |
 | `/help` | Print the available slash commands in their compact help form. |
 
 Interactive TTY chat provides arrow-key autocomplete only while the current
@@ -90,11 +92,20 @@ show the **last N lines** plus a trace pointer and `read_file_range` hint.
 | `--finops` | off | Print a per-agent-type token/USD FinOps breakdown at run end. |
 | `--require-approval off|writes|all` | config/default | Gate tools before execution. |
 | `--yes` | off | Auto-approve gated tools and record `approval{decision:"auto"}`. |
+| `--no-step-extend-prompt` | off | Disable the proactive “extend step budget?” offer at `max_steps - 1` (hard `step_cap` approval unchanged). |
 | `--no-redact` | off | Disable trace redaction and print a warning to stderr. |
 | `--max-usd FLOAT` | config/default | Override per-run USD cap. |
 | `--max-tokens INT` | config/default | Override per-run token cap. |
 | `--parent-model MODEL_ID` | config/default | Override parent model. |
 | `--subagent-model MODEL_ID` | config/default | Override all sub-agent models unless type-specific env/config is set. |
+
+## Workspace root
+
+- Default workspace: `./workspace` relative to the process current working directory.
+- Override with `VG_WORKSPACE_ROOT` (absolute path or relative to cwd). The dashboard
+  uses the same variable; agent and API must agree so JSONL and SQLite land in
+  `<workspace_root>/traces/`.
+- If the shell cwd is already the workspace directory, set `VG_WORKSPACE_ROOT=.`.
 
 ## Streams and exit codes
 

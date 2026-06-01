@@ -1,6 +1,6 @@
 """Generated runtime constants from MODEL_CONFIG.md."""
 
-SPEC_DIGEST = "b206d74f47b3882cbcb6f67a6635e27d1dda33c9ef1e5bbe8e3393d4dd03ce4c"
+SPEC_DIGEST = "5fd4adc3ffa54bd170edc9d614c27ec7d673635891a89d4502308aa9ec56b54c"
 
 PARENT_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
 GRILLING_MODEL_ID = "openrouter/google/gemini-2.0-flash-001"
@@ -18,10 +18,30 @@ SUBAGENT_MODEL_IDS = {
 
 PRICING_USD_PER_MTOK = {
     "openrouter/google/gemini-2.0-flash-001": {"input": 0.10, "output": 0.40},
+    "openrouter/google/gemini-2.5-flash": {"input": 0.10, "output": 0.40},
     "openrouter/anthropic/claude-haiku-4.5": {"input": 1.00, "output": 5.00},
     "openrouter/anthropic/claude-sonnet-4.6": {"input": 3.00, "output": 15.00},
 }
 UNKNOWN_MODEL_ESTIMATE_USD_PER_MTOK = {"input": 30.00, "output": 120.00}
+
+CONTEXT_WINDOW_TOKENS = {
+    "openrouter/google/gemini-2.0-flash-001": 1000000,
+    "openrouter/google/gemini-2.5-flash": 1048576,
+    "openrouter/anthropic/claude-haiku-4.5": 200000,
+    "openrouter/anthropic/claude-sonnet-4.6": 200000,
+}
+AUTO_COMPACT_FRACTION = {
+    "openrouter/google/gemini-2.0-flash-001": 0.80,
+    "openrouter/google/gemini-2.5-flash": 0.80,
+    "openrouter/anthropic/claude-haiku-4.5": 0.80,
+    "openrouter/anthropic/claude-sonnet-4.6": 0.80,
+}
+DEFAULT_CONTEXT_WINDOW = 128_000
+DEFAULT_COMPACT_FRACTION = 0.80
+COMPACT_KEEP_RECENT_TURNS = 4
+COMPACTOR_MAX_OUTPUT_TOKENS = 400
+COMPACTOR_MAX_INPUT_CHARS = 120_000
+COMPACTOR_MAX_SUMMARY_TOKENS = 300
 
 MAX_PARENT_STEPS = 15
 MAX_SUBAGENT_STEPS = 8
@@ -44,4 +64,5 @@ MAX_TOOL_RESULT_BYTES = 1_048_576
 DAILY_SPEND_FILE = ".vg_daily_spend.json"
 APPROVALS_FILE = ".vg_approvals.json"
 REQUIRE_APPROVAL_DEFAULT = "off"
+STEP_EXTEND_PROMPT_ON_LAST_STEP = True
 SQLITE_TRACE_DB = "traces/vg_agent.sqlite3"

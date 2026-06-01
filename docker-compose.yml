@@ -4,6 +4,9 @@ services:
     # Bridged network is for OpenRouter only; the in-process egress pin
     # refuses any non-openrouter.ai endpoint.
     working_dir: /workspace
+    environment:
+      # cwd is the mounted workspace; default "workspace" would nest to /workspace/workspace.
+      VG_WORKSPACE_ROOT: "."
     volumes:
       - ./workspace:/workspace
       - ./traces:/workspace/traces

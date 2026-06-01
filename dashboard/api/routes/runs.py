@@ -33,7 +33,12 @@ from ..schemas import (
     ToolCallItem,
     TurnSummary,
 )
-from ..services.context import build_context_response, build_parallel_response, max_parent_step
+from ..services.context import (
+    build_context_response,
+    build_parallel_response,
+    max_parent_step,
+    steps_with_compacted_context,
+)
 from ..services.sessions import load_events_for_run
 
 router = APIRouter(prefix="/runs", tags=["runs"])
@@ -179,11 +184,14 @@ def run_context(
 
 
 @router.get("/{run_id}/context/max-step")
-def run_context_max_step(run_id: str, db: Session | None = Depends(_db_dep)) -> dict[str, int]:
+def run_context_max_step(run_id: str, db: Session | None = Depends(_db_dep)) -> dict[str, object]:
     events = load_events_for_run(db, run_id)
     if not events:
         raise HTTPException(status_code=404, detail="no events for run")
-    return {"max_step_idx": max_parent_step(events)}
+    return {
+        "max_step_idx": max_parent_step(events),
+        "compaction_steps": steps_with_compacted_context(events),
+    }
 
 
 @router.get("/{run_id}/parallel", response_model=ParallelResponse)

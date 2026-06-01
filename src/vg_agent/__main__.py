@@ -35,6 +35,7 @@ from .chat_ui import (
     build_session_status,
     capture_write_prior,
     emit_session_statusline,
+    format_budget_cap_approval_text,
     format_compaction_banner,
     format_literal_tool_body,
     format_statusline_compact,
@@ -51,10 +52,18 @@ from .chat_ui import (
     use_rich_ui,
     _console,
 )
-from .agent import BUDGET_CAP_TOOL, ApprovalOutcome, ApprovalPolicy, ApprovalRequest, run_live_task
+from .agent import (
+    BUDGET_CAP_TOOL,
+    ApprovalOutcome,
+    ApprovalPolicy,
+    ApprovalRequest,
+    compact_conversation,
+    run_live_task,
+)
 from .live_model_client import LiveModelClient, MissingOpenRouterKey
-from .budget import BudgetGuard
+from .budget import BudgetGuard, format_usd_display
 from .demo_fixture import write_fixture
+from .workspace_paths import resolve_workspace_root
 from .trace import (
     TraceRecorder,
     format_parallel_progress_lines,
@@ -73,7 +82,9 @@ def _stdin_prompt(stream: object | None = None, *, workspace_root: Path | None =
     def ask(request: ApprovalRequest) -> ApprovalOutcome:
         if use_rich_ui():
             return prompt_approval(request, input_stream=fh, workspace_root=workspace_root)
-        if request.tool == BUDGET_CAP_TOOL:
+        if request.tool == BUDGET_CAP_TOOL and isinstance(request.args, dict):
+            sys.stderr.write(format_budget_cap_approval_text(request.path, request.args) + "\n")
+        elif request.tool == BUDGET_CAP_TOOL:
             sys.stderr.write(f"[approval] budget {request.path}  {request.summary}\n")
         else:
             sys.stderr.write(f"[approval] {request.tool}  {request.summary}\n")
@@ -117,17 +128,87 @@ def _make_policy(args: argparse.Namespace, workspace_root: Path | None = None) -
     return ApprovalPolicy(
         mode=mode,
         auto_yes=bool(args.yes),
+        step_extend_prompt=not bool(getattr(args, "no_step_extend_prompt", False)),
         prompt=_stdin_prompt(workspace_root=workspace_root),
     )
 
 
 def _print_budget(guard: BudgetGuard) -> None:
+    from .budget import format_usd_number
+
     sys.stdout.write(
         f"steps {guard.step_count}/{guard.max_steps}  "
         f"tokens {guard.running_tokens}/{guard.max_tokens}  "
-        f"usd {guard.running_usd:.6f}/{guard.max_usd}  "
-        f"daily_remaining {guard.daily_remaining_usd:.6f}\n"
+        f"usd {format_usd_number(guard.running_usd)}/{format_usd_number(guard.max_usd)}  "
+        f"daily_remaining {format_usd_number(guard.daily_remaining_usd)}\n"
     )
+
+
+def _print_budget_set_hint() -> None:
+    sys.stdout.write(
+        "Set caps: /budget steps N   /budget tokens N   /budget usd N   /budget daily N\n"
+        "  (combine: /budget steps 50 tokens 100000 usd 2 daily 4)\n"
+    )
+
+
+_BUDGET_SLASH_KEYS = {
+    "steps": "max_steps",
+    "max_steps": "max_steps",
+    "tokens": "max_tokens",
+    "max_tokens": "max_tokens",
+    "usd": "max_usd",
+    "max_usd": "max_usd",
+    "daily": "daily_remaining_usd",
+    "daily_remaining": "daily_remaining_usd",
+    "daily_remaining_usd": "daily_remaining_usd",
+}
+
+
+def _parse_budget_slash(prompt: str) -> tuple[dict[str, float | int], str | None]:
+    parts = prompt.split()
+    if not parts or parts[0].lower() != "/budget":
+        return {}, "not a budget command"
+    if len(parts) == 1:
+        return {}, None
+    caps: dict[str, float | int] = {}
+    idx = 1
+    while idx < len(parts):
+        key = parts[idx].lower()
+        field = _BUDGET_SLASH_KEYS.get(key)
+        if field is None:
+            return {}, f"unknown budget field: {parts[idx]!r} (try steps, tokens, usd, daily)"
+        if idx + 1 >= len(parts):
+            return {}, f"missing value for {key}"
+        raw = parts[idx + 1]
+        idx += 2
+        try:
+            if field == "max_steps":
+                value: float | int = int(raw)
+            elif field == "max_tokens":
+                value = int(raw)
+            else:
+                value = float(raw)
+        except ValueError:
+            return {}, f"invalid value for {key}: {raw!r}"
+        caps[field] = value
+    return caps, None
+
+
+def _handle_budget_slash(prompt: str, guard: BudgetGuard, recorder: TraceRecorder) -> None:
+    caps, err = _parse_budget_slash(prompt)
+    if err:
+        sys.stdout.write(err + "\n")
+        return
+    if not caps:
+        _print_budget(guard)
+        _print_budget_set_hint()
+        return
+    msg = guard.configure_caps(**caps)  # type: ignore[arg-type]
+    if msg:
+        sys.stdout.write(msg + "\n")
+        return
+    recorder.emit("budget_event", budget_reason="user_config", details=caps)
+    _print_budget(guard)
 
 
 def _print_chat_status_report(
@@ -161,17 +242,20 @@ SLASH_COMMANDS = (
     "/reset",
     "/new",
     "/show-context",
+    "/compact",
     "/review",
     "/help",
 )
 SLASH_COMMAND_USAGE = {
+    "/budget": "/budget [steps N] [tokens N] [usd N] [daily N]",
     "/show-context": "/show-context N",
+    "/compact": "/compact",
     "/review": "/review [N]",
 }
 SLASH_COMMAND_META = {
     "/exit": "End chat cleanly",
     "/quit": "Alias for /exit",
-    "/budget": "Show steps, tokens, USD, and daily remaining",
+    "/budget": "Show or set session caps (steps, tokens, usd, daily)",
     "/status": "Refresh dashboard (TTY) and print session summary on stdout",
     "/finops": "Show per-agent token, tool, and cost table (+ parallel batches)",
     "/review": "Readable recap of a completed turn (default: last)",
@@ -179,6 +263,7 @@ SLASH_COMMAND_META = {
     "/reset": "Clear approvals, budget, and chat history",
     "/new": "Start a fresh chat session and trace",
     "/show-context": "Overview, or N for parent context JSON at step N",
+    "/compact": "Summarise folded conversation head; keep recent turns verbatim",
     "/help": "Show slash command help",
 }
 
@@ -196,6 +281,7 @@ def _format_slash_command_help() -> str:
             "  Normal text is sent to the agent as the next task.",
             "  Interactive terminals autocomplete slash commands after typing /.",
             "  TTY: /new, /reset, /status clear the screen and refresh the dashboard.",
+            "  /budget alone prints caps plus how to set steps, tokens, usd, or daily.",
         )
     )
     return "\n".join(lines)
@@ -441,6 +527,8 @@ def _chat_statusline_color(line: str, *, use_color: bool) -> str:
     has_tool_errors = "tool errs " in lowered and "tool errs 0" not in lowered and "/ 0 session" not in lowered
     if any(marker in lowered for marker in ("tool_error", "model_error", "aborted")) or has_tool_errors:
         color = "\x1b[31m"
+    elif "!usd" in lowered or "exceeds cap" in lowered or "(next ~$" in lowered:
+        color = "\x1b[31m"
     elif any(marker in lowered for marker in ("warn_", "cap")):
         color = "\x1b[33m"
     else:
@@ -545,7 +633,13 @@ def _format_progress_event(event: dict[str, object]) -> str | None:
             line += f" status={child_status}: {summary[:180]}"
         return line
     if kind == "compaction":
-        return f"[context] compacted {event.get('before_tokens')} -> {event.get('after_tokens')} tokens"
+        return f"[context] compacted tool result {event.get('before_tokens')} -> {event.get('after_tokens')} tokens"
+    if kind == "context_compaction":
+        reason = event.get("reason") or "auto"
+        return (
+            f"[context] {reason}-compact {event.get('before_tokens')} -> {event.get('after_tokens')} "
+            f"tokens ({event.get('percent_reduced')}% reduced); full history in trace"
+        )
     if kind == "budget_event":
         return f"[budget] {event.get('budget_reason')}"
     if kind == "model_error":
@@ -795,6 +889,14 @@ def _latest_run_end_status(events: list[dict[str, object]]) -> str | None:
     return None
 
 
+def _exit_code_for_final_status(status: str | None) -> int:
+    if status == "aborted":
+        return 3
+    if status == "model_error":
+        return 75
+    return 0
+
+
 def _apply_model_overrides(args: argparse.Namespace) -> None:
     if getattr(args, "parent_model", None):
         config.PARENT_MODEL_ID = args.parent_model
@@ -915,8 +1017,8 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 continue
             if prompt in {"/exit", "/quit"}:
                 break
-            if prompt == "/budget":
-                _print_budget(guard)
+            if prompt.startswith("/budget"):
+                _handle_budget_slash(prompt, guard, recorder)
                 continue
             if prompt == "/status":
                 if use_rich_ui():
@@ -994,6 +1096,31 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                         json.dumps(show_context(recorder.events, step), indent=2, ensure_ascii=False) + "\n"
                     )
                 continue
+            if prompt == "/compact" or prompt.startswith("/compact "):
+                if not conversation:
+                    sys.stdout.write("No conversation history to compact yet.\n")
+                    continue
+                try:
+                    compact_client = LiveModelClient.from_env(recorder=recorder)
+                except MissingOpenRouterKey as exc:
+                    sys.stderr.write(f"error: {exc}\n")
+                    continue
+                compact_event = compact_conversation(
+                    recorder,
+                    conversation,
+                    config.PARENT_MODEL_ID,
+                    guard,
+                    client=compact_client,
+                    reason="manual",
+                    deterministic=False,
+                )
+                if compact_event is None:
+                    sys.stdout.write("Nothing to fold (history too short).\n")
+                else:
+                    banner = format_compaction_banner(compact_event)
+                    if banner:
+                        sys.stdout.write(banner + "\n")
+                continue
             if prompt == "/help":
                 sys.stdout.write(SLASH_COMMAND_HELP + "\n")
                 continue
@@ -1054,6 +1181,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--chat", action="store_true")
     parser.add_argument("--require-approval", choices=["off", "writes", "all"], default=config.REQUIRE_APPROVAL_DEFAULT)
     parser.add_argument("--yes", action="store_true")
+    parser.add_argument("--no-step-extend-prompt", action="store_true")
     parser.add_argument("--no-redact", action="store_true")
     parser.add_argument("--budget", action="store_true")
     parser.add_argument("--finops", action="store_true")
@@ -1066,7 +1194,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_redact:
         sys.stderr.write("warning: --no-redact disables trace secret redaction.\n")
 
-    root = Path.cwd()
+    root = resolve_workspace_root()
     if args.seed_fixture:
         write_fixture(root)
         print(f"seeded fixture at {root}")
@@ -1106,9 +1234,7 @@ def main(argv: list[str] | None = None) -> int:
         _print_budget(guard)
     if guard is not None and args.finops:
         _print_finops(guard, recorder)
-    if _latest_run_end_status(recorder.events) == "model_error":
-        return 75
-    return 0
+    return _exit_code_for_final_status(_latest_run_end_status(recorder.events))
 
 
 if __name__ == "__main__":

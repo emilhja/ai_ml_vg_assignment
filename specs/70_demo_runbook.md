@@ -51,8 +51,21 @@ docker compose run --rm vg-agent \
 ```bash
 docker compose run --rm vg-agent \
   --task "read data/sample.log, then summarise auth/ and utils.py in parallel" \
-  --trace --show-context 8
+  --trace --finops
 ```
+
+**Live chat verification** (see `final_demo_live_chat_script.md` Prompts 3–4):
+
+1. `/review` — **Context engineering** lists compaction for the log read
+   (`compactor_model`, `compactor_fallback`, summary snippet).
+2. `/finops` — row `compactor` with `prompts >= 1`; parallel-batch line with
+   **overlap yes**.
+3. `/show-context` (overview) — pick step **N** where `compact` column is `1`.
+4. `/show-context N` — `[COMPACTED tool_result…]` marker; no raw `sample.log`
+   lines; no Explorer intermediate tool traces in parent context.
+
+**Optional dashboard:** session → Safety / FinOps (Compactions list) → Parent
+context tab (amber compacted label, jump-to-step).
 
 - On-screen: statusline shows two Explorer entries simultaneously; final
   answer integrates both summaries in one paragraph.
@@ -64,9 +77,10 @@ docker compose run --rm vg-agent \
   - Both `subagent_return.summary` strings referenced verbatim/paraphrased
     in the next `assistant_step.content`.
   - A parent `read_file data/sample.log` result exceeds `K_COMPACT` and
-    emits a `compaction` event.
-  - `show_context` output contains the compacted markers but **not** raw
-    Explorer intermediate tool results.
+    emits a `compaction` event (`compactor_model`, `compactor_fallback`,
+    `original_sha256`).
+  - `show_context` at step **N** contains the compacted marker but **not** raw
+    Explorer intermediate tool results or `sample.log` body.
 - Talking point: parallel sub-agents satisfy VG.1; compaction + Explorer
   context offloading satisfy VG.2.
 

@@ -51,7 +51,7 @@ def get_active_session(db: Session | None = Depends(_db_dep)) -> ActiveSessionRe
     session_id = detect_active_session_id(db, active_session_id_override())
     if session_id is None:
         return ActiveSessionResponse(session_id=None)
-    detail = session_detail(db, session_id) if db is not None else None
+    detail = session_detail(db, session_id)
     events: list = []
     if db is not None:
         events, _ = list_events(db, session_id, from_event_idx=-1, limit=50)

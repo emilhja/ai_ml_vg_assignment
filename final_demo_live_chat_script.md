@@ -15,7 +15,7 @@ safety, edit a file, hard-stop on a budget cap, and decide when to yield.
 | Rubric item | Where it is proven | One-line expected outcome |
 |---|---|---|
 | VG.1 parallel sub-agents | Prompt 3 | One `spawn_subagents` launches 2 Explorers that overlap; parent merges both |
-| VG.2 context engineering | Prompt 3 + Prompt 4 | `sample.log` read is compacted; `/show-context` shows a marker, not raw bytes |
+| VG.2 context engineering | Prompt 3 + 3a + 4 (+ optional 4b) | `compaction` in `/review` or JSONL; `/finops` compactor row; `/show-context` overview → step N shows marker, not raw log |
 | VG.3 cost + warning + hard cap | Prompt 1 (live cost) + Prompt 8 (hard stop) | Cost ticks live; tiny cap → run aborts (exit 3), not extended |
 | VG.4 harmful-call protection | Prompt 5 + Prompt 6 | `.env` read refused, `rm -rf .` refused, denied approval blocks the edit |
 | VG.5 bash execution | Prompt 2 + Prompt 5 | `pwd` / `find` run for real; dangerous bash is blocked, safe bash works |
@@ -150,54 +150,134 @@ Type:
 read data/sample.log, then summarise auth/ and utils.py in parallel; combine both sub-agent findings into one final recommendation
 ```
 
-After the answer, type:
+Expected outcome — the grader sees:
+
+- **VG.1:** a single `spawn_subagents` call launches **two** Explorer sub-agents
+  in the same turn (not two serial `spawn_subagent` calls). The final parent answer
+  **combines both** Explorer findings (confirmed further in Prompt 3a `/finops`).
+
+Say:
+
+> The point is not just that sub-agents exist. The parent starts two Explorers in
+> one parallel call, waits for both, and integrates their summaries into the next
+> response.
+
+---
+
+## Prompt 3a - Verify Compaction Immediately (VG.2, VG.3)
+
+Right after Prompt 3 finishes (same chat session), run these **before** Prompt 4:
+
+Type:
+
+```text
+/review
+```
+
+Then:
 
 ```text
 /finops
 ```
 
+| Command | Grader must see |
+|---------|-----------------|
+| `/review` | **Context engineering** lists `compacted X -> Y tokens` for the large log read; lines include `compactor_model` and `compactor_fallback` (fallback should be `false` when the live compactor succeeded) |
+| `/finops` | Row `compactor` with `prompts >= 1` and non-zero tokens/USD; parallel-batch line for two Explorers with **overlap yes** |
+
 Expected outcome — the grader sees:
 
-- **VG.1:** a single `spawn_subagents` call launches **two** Explorer sub-agents
-  in the same turn (not two serial `spawn_subagent` calls). `/finops` ends with a
-  *parallel batches* line reporting the two sub-agents ran with overlapping
-  wall-clock. The final parent answer **combines both** Explorer findings.
-- **VG.2:** the large `data/sample.log` read exceeds the compaction threshold and
-  is summarised before the next parent turn (confirmed in Prompt 4).
-- **VG.3:** `/finops` shows a per-agent-type token/USD/tool breakdown, proving
-  the sub-agent work was tracked and used.
+- **VG.2:** compaction happened on the `sample.log` read (not deferred to Prompt 4).
+- **VG.1:** `/finops` parallel-batch line shows overlapping Explorer intervals.
+- **VG.3:** per-agent-type spend including compactor and explorer rows.
+
+**If `compactor_fallback` is true** (API/rate-limit): say the stub still bounds parent
+context; show the JSONL `compaction` event or re-run — do not claim a Flash summary
+without checking.
 
 Say:
 
-> The point is not just that sub-agents exist. The parent starts two Explorers in
-> one parallel call, waits for both, and integrates their summaries into its next
-> response. `/finops` shows the overlap and the per-agent cost.
+> Compaction is in the trace and in `/review` before we open parent context JSON.
+> `/finops` proves the compactor model was billed as its own agent type, separate
+> from parent and Explorer spend.
 
 ---
 
 ## Prompt 4 - Context Compaction Is Visible (VG.2)
 
+Do **not** guess a step number. Use the overview table first.
+
 Type:
 
 ```text
-/show-context 8
+/show-context
 ```
 
-(Use the parent step index from Prompt 3 if 8 is out of range; `/show-context`
-with no number prints the step overview first.)
+Pick **N** = the highest `step` where the `compact` column is `1` (or the first
+step after the parent `read_file` on `data/sample.log`). Record **N** in your demo
+notes (from a pre-demo dry run if helpful — see `demo_review.md` §2.5).
 
-Expected outcome — the grader sees:
+Then:
 
-- A **compacted marker** standing in for the large `data/sample.log` tool result.
-- The raw `sample.log` bytes are **not** dumped into the parent context.
-- Explorer intermediate tool output is absent from the parent context — only the
-  sub-agent summaries are present.
+```text
+/show-context N
+```
+
+(replace `N` with the step you picked)
+
+Expected checks in the JSON output:
+
+- `[COMPACTED tool_result for tool_use_id=…]` present.
+- Summary line in the marker (not empty; if stub fallback, say so explicitly).
+- No raw `sample.log` body (e.g. no `req-00001` log lines).
+- No Explorer intermediate `tool_call` / `tool_result` in parent context — only
+  sub-agent summaries.
+
+**Optional — dashboard** (if the trace dashboard is running during the demo):
+
+- Session → **Safety / FinOps** → Compactions list (`before_tokens→after_tokens`).
+- **Parent context** tab → step with amber **compacted** label → **Jump to compaction step**.
 
 Say:
 
-> This is the context-control mechanism. Large tool output is compacted to a
-> marker, and sub-agent intermediate traces stay out of the parent context, so
-> the window stays bounded while the full payload remains in the JSONL trace.
+> Over 4000 tokens we call the Gemini Flash compactor; the parent sees a
+> ≤300-token summary marker, not the raw log. Sub-agent intermediate traces stay
+> out of the parent context. The full read stays in the JSONL at its original
+> event index with SHA-256 for audit.
+
+---
+
+## Prompt 4b - Manual Conversation Compaction (VG.2, optional)
+
+**Only if time remains or the grader asks about conversation-level folding.** Auto
+conversation compaction at 80% of a 1M-token window will **not** fire in this short
+chat; `/compact` is the live proof for that layer.
+
+After Prompt 3 (or 4), add bulk to chat history, then fold manually.
+
+Type (example — one bulky follow-up):
+
+```text
+Write five separate 150-word paragraphs summarising what the auth/ explorer found; label each paragraph Part 1 through Part 5.
+```
+
+Wait for the answer, then:
+
+```text
+/compact
+```
+
+Expected outcome:
+
+- Dim compaction banner on stdout (before→after tokens).
+- Trace contains `kind: context_compaction` with `reason: manual`.
+- Later `/show-context` overview may show a `context_compaction` meta row.
+
+Say:
+
+> Short chats never hit the auto fold threshold. `/compact` folds older turns but
+> keeps the last four user turns verbatim — same compactor model as tool-result
+> compaction.
 
 ---
 
@@ -354,17 +434,32 @@ Say:
 
 ## Prompt 9 - Trace Evidence For The Grader (VG-HG-0, VG-HG-4, S1/S2)
 
-Every run writes a JSONL trace under `traces/`. Open the trace printed during the
-demo (the `--trace` runs print its path) and inspect it:
+Every run writes a JSONL trace under `traces/`. Open the trace for this chat session
+(statusline or `/status` prints the path) and inspect it:
 
 ```powershell
 Get-Content traces/<run_id>.jsonl | Select-Object -First 40
 ```
 
+Compaction-specific verification (Prompt 3 scene):
+
+```powershell
+Select-String -Path traces\<run_id>.jsonl -Pattern '"kind": "compaction"'
+```
+
+On the matching line(s), confirm these JSON fields are present:
+
+- `tool_use_id` — ties compaction to the large `read_file`
+- `before_tokens`, `after_tokens`
+- `summary`
+- `compactor_model`
+- `compactor_fallback` (prefer `false` in a successful live run)
+- `original_event_idx`, `original_sha256`
+
 Expected outcome:
 
 - The grader can inspect event order: `tool_call`, `tool_result`,
-  `subagent_spawn`/`subagent_return`, `approval` decisions, `compaction` events,
+  `compaction`, `subagent_spawn`/`subagent_return`, `approval` decisions,
   `budget_event` (warn + cap), and the final `run_end` status.
 - The same events are mirrored into `traces/vg_agent.sqlite3` for the dashboard.
 
@@ -372,7 +467,7 @@ Say:
 
 > This is the audit trail. If any claim is challenged, we point to the exact
 > JSONL event for that step. Demonstrated behaviour is backed by durable
-> evidence.
+> evidence — including the compaction row with SHA-256 of the full tool result.
 
 ---
 
@@ -390,11 +485,12 @@ If asked how sub-agents return results:
 
 If asked what triggers context control:
 
-> A parent tool result is compacted when its token estimate exceeds `K_COMPACT`
-> (4000). The full payload stays in the JSONL trace with its original index and
-> SHA-256; the next parent turn sees only a ≤300-token marker. Sub-agent
-> intermediate tool traces stay inside the child context, so the parent receives
-> compact markers and child summaries, not every raw intermediate result.
+> **Demo path:** parent `tool_result` over `K_COMPACT` (4000 tokens) triggers
+> `COMPACTOR_MODEL_ID` with the tool compaction prompt; we verify with `/review`,
+> `/finops` compactor row, and `/show-context`. On failure we fall back to a stub
+> (`compactor_fallback`). **Also:** Explorer intermediates never enter parent
+> context. **Latent in short demos:** auto conversation fold at window × fraction
+> (`CONTEXT_WINDOWS.md`); live proof for conversation layer is `/compact` (Prompt 4b).
 
 If asked where the hard cap is enforced:
 
@@ -430,7 +526,10 @@ Before ending the demo, make sure the grader has seen:
 - [ ] Approval denial prevents a mutation (VG.4).
 - [ ] Two Explorer sub-agents run in parallel in one `spawn_subagents` (VG.1).
 - [ ] Parent integrates both sub-agent results (VG.1).
-- [ ] Context compaction visible via `/show-context` (VG.2).
+- [ ] `compaction` event seen in `/review` or JSONL (VG.2).
+- [ ] `/finops` shows `compactor` spend (VG.2 / VG.3).
+- [ ] `/show-context` overview used to pick step N; marker visible at `/show-context N` (VG.2).
+- [ ] (Optional) `/compact` or `context_compaction` shown if conversation fold demonstrated (VG.2).
 - [ ] Hard cap **aborts** the run (exit 3), not just warns (VG.3).
 - [ ] Ambiguous prompt → agent yields clarifying questions (VG.9).
 - [ ] Trace evidence available and inspectable (VG-HG-0/4, S1/S2).

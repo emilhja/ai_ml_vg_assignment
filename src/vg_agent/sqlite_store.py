@@ -8,6 +8,7 @@ import platform
 import sqlite3
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -121,7 +122,8 @@ class SQLiteTraceStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.redaction_enabled = redaction_enabled
         self.git_commit = _git_commit(self.root)
-        self.conn = sqlite3.connect(str(self.path))
+        self._write_lock = threading.Lock()
+        self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self._init_schema()
@@ -357,37 +359,38 @@ class SQLiteTraceStore:
         self.conn.commit()
 
     def record_event(self, event: dict[str, object]) -> None:
-        payload = _json(event)
-        self._upsert_session(event)
-        self._upsert_run(event)
-        self._insert_event(event, payload)
-        kind = str(event.get("kind") or "")
-        if kind == "user_prompt":
-            self._record_user_prompt(event)
-        elif kind == "llm_start":
-            self._record_llm_start(event, payload)
-        elif kind == "assistant_step":
-            self._record_assistant_step(event, payload)
-        elif kind == "tool_call":
-            self._record_tool_call(event, payload)
-        elif kind == "tool_result":
-            self._record_tool_result(event, payload)
-        elif kind == "subagent_spawn":
-            self._record_subagent_spawn(event)
-        elif kind == "subagent_return":
-            self._record_subagent_return(event)
-        elif kind == "approval":
-            self._record_approval(event)
-        elif kind == "redaction":
-            self._record_redaction(event)
-        elif kind == "compaction":
-            self._record_compaction(event)
-        elif kind == "run_end":
-            self._record_run_end(event)
-        elif kind == "budget_event":
-            self._record_budget_event(event)
-        self._refresh_rollups(event)
-        self.conn.commit()
+        with self._write_lock:
+            payload = _json(event)
+            self._upsert_session(event)
+            self._upsert_run(event)
+            self._insert_event(event, payload)
+            kind = str(event.get("kind") or "")
+            if kind == "user_prompt":
+                self._record_user_prompt(event)
+            elif kind == "llm_start":
+                self._record_llm_start(event, payload)
+            elif kind == "assistant_step":
+                self._record_assistant_step(event, payload)
+            elif kind == "tool_call":
+                self._record_tool_call(event, payload)
+            elif kind == "tool_result":
+                self._record_tool_result(event, payload)
+            elif kind == "subagent_spawn":
+                self._record_subagent_spawn(event)
+            elif kind == "subagent_return":
+                self._record_subagent_return(event)
+            elif kind == "approval":
+                self._record_approval(event)
+            elif kind == "redaction":
+                self._record_redaction(event)
+            elif kind == "compaction":
+                self._record_compaction(event)
+            elif kind == "run_end":
+                self._record_run_end(event)
+            elif kind == "budget_event":
+                self._record_budget_event(event)
+            self._refresh_rollups(event)
+            self.conn.commit()
 
     def _upsert_session(self, event: dict[str, object]) -> None:
         session_id = _text(event.get("session_id"))
@@ -973,3 +976,24 @@ class SQLiteTraceStore:
                 session_id,
             ),
         )
+
+    def backfill_jsonl_file(self, path: Path) -> int:
+        """Replay JSONL events through record_event (idempotent via INSERT OR REPLACE)."""
+        events: list[dict[str, object]] = []
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return 0
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        for event in events:
+            self.record_event(event)
+        return len(events)

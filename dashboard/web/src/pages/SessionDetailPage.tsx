@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../api";
+import CompactionStatsBadge from "../components/CompactionStatsBadge";
 import EventFeed from "../components/EventFeed";
 import { SessionCard } from "../components/SessionCards";
 
@@ -25,6 +26,7 @@ export default function SessionDetailPage() {
   const highlightEventIdx =
     eventIdxParam && /^\d+$/.test(eventIdxParam) ? Number(eventIdxParam) : null;
   const [stepIdx, setStepIdx] = useState(0);
+  const [expandContext, setExpandContext] = useState(false);
   const [flashHighlight, setFlashHighlight] = useState<string | null>(null);
 
   const setTab = (next: Tab) => {
@@ -129,7 +131,7 @@ export default function SessionDetailPage() {
 
   const tabs: { id: Tab; label: string }[] = [
     { id: "timeline", label: "Timeline" },
-    { id: "context", label: "Context" },
+    { id: "context", label: "Parent context" },
     { id: "tools", label: "Tools & errors" },
     { id: "safety", label: "Safety / FinOps" },
     { id: "events", label: "Events" },
@@ -255,7 +257,15 @@ export default function SessionDetailPage() {
 
       {tab === "context" && runId && (
         <div className="space-y-4">
-          <div className="flex items-center gap-4">
+          <p className="text-xs text-muted max-w-3xl">
+            Parent model input at the selected step (same as CLI <code className="text-[11px]">--show-context</code>
+            ). Excludes sub-agent intermediates. Compacted tool results show markers only — open the{" "}
+            <button type="button" onClick={() => setTab("events")} className="text-accent hover:underline">
+              Events
+            </button>{" "}
+            tab or JSONL for full payloads.
+          </p>
+          <div className="flex flex-wrap items-center gap-4">
             <label className="text-sm text-muted">
               Parent step
               <input
@@ -267,6 +277,34 @@ export default function SessionDetailPage() {
                 className="ml-2 w-48"
               />
               <span className="ml-2 font-mono">{stepIdx}</span>
+            </label>
+            {(maxStep?.compaction_steps?.length ?? 0) > 0 && (
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="text-muted">Compaction at step:</span>
+                {maxStep!.compaction_steps.map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    onClick={() => setStepIdx(s)}
+                    className={`px-2 py-0.5 rounded font-mono ${
+                      stepIdx === s
+                        ? "bg-amber-500/30 text-amber-200"
+                        : "bg-panel border border-amber-500/30 text-amber-300/90 hover:text-amber-100"
+                    }`}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            )}
+            <label className="text-sm text-muted flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={expandContext}
+                onChange={(e) => setExpandContext(e.target.checked)}
+                className="rounded"
+              />
+              Expand all messages
             </label>
           </div>
           <ul className="space-y-2 text-sm">
@@ -280,11 +318,25 @@ export default function SessionDetailPage() {
                 <span className="text-muted text-xs">{m.role}</span>
                 {m.tool && <span className="ml-2 text-cyan-300 text-xs">{m.tool}</span>}
                 {m.compacted && <span className="ml-2 text-amber-300 text-xs">compacted</span>}
-                <pre className="mt-1 whitespace-pre-wrap text-xs max-h-48 overflow-y-auto">
+                {m.compacted && (
+                  <CompactionStatsBadge
+                    variant="block"
+                    before={m.compaction_before_tokens}
+                    after={m.compaction_after_tokens}
+                  />
+                )}
+                <pre
+                  className={`mt-1 whitespace-pre-wrap text-xs overflow-y-auto ${
+                    expandContext ? "max-h-[32rem]" : "max-h-48"
+                  }`}
+                >
                   {m.content ?? ""}
                 </pre>
               </li>
             ))}
+            {!context?.messages?.length && (
+              <li className="text-muted text-sm">No parent messages at this step yet.</li>
+            )}
           </ul>
         </div>
       )}
@@ -365,8 +417,13 @@ export default function SessionDetailPage() {
             <h3 className="text-muted text-xs mb-2">Compactions</h3>
             <ul className="space-y-1">
               {safety.compactions.map((c) => (
-                <li key={c.compaction_id} className="bg-amber-950/20 rounded px-2 py-1">
-                  #{c.original_event_idx}: {c.before_tokens}→{c.after_tokens} tokens
+                <li key={c.compaction_id} className="bg-amber-950/20 rounded px-2 py-1 space-y-0.5">
+                  <span className="text-muted">#{c.original_event_idx}</span>
+                  {c.before_tokens != null && c.after_tokens != null ? (
+                    <CompactionStatsBadge variant="block" before={c.before_tokens} after={c.after_tokens} />
+                  ) : (
+                    <span className="text-xs text-muted">(token counts unavailable)</span>
+                  )}
                 </li>
               ))}
               {!safety.compactions.length && <li className="text-muted">None</li>}

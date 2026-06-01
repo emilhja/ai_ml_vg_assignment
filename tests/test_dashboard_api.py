@@ -26,16 +26,58 @@ def dashboard_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestCli
     monkeypatch.setenv("VG_WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setenv("VG_TRACES_DIR", str(traces))
     monkeypatch.setenv("VG_SQLITE_PATH", str(traces / "vg_agent.sqlite3"))
+    monkeypatch.setattr("dashboard.api.paths._repo_root", lambda: tmp_path.resolve())
     import dashboard.api.db as db_module
     from dashboard.api.paths import clear_path_cache
+    from dashboard.api.services import trace_backfill
+
+    bootstrap = TraceRecorder(tmp_path)
+    bootstrap.emit("session_new")
+    clear_path_cache()
+    db_module._engine = None
+    db_module._SessionLocal = None
+    trace_backfill._BACKFILLED.clear()
+
+    from dashboard.api.main import app
+
+    client = TestClient(app)
+    yield client
+    clear_path_cache()
+    db_module._engine = None
+    db_module._SessionLocal = None
+    trace_backfill._BACKFILLED.clear()
+
+
+def test_list_sessions_backfills_orphan_jsonl(
+    dashboard_client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    from dashboard.api.paths import clear_path_cache
+    from dashboard.api.services import trace_backfill
+
+    trace_backfill._BACKFILLED.clear()
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="mirror me on list")
+    recorder.emit("run_end", final_status="ok")
+    session_id = str(recorder.session_id)
+    db_path = tmp_path / "traces" / "vg_agent.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        conn.commit()
+
+    import dashboard.api.db as db_module
 
     clear_path_cache()
     db_module._engine = None
     db_module._SessionLocal = None
+    trace_backfill._BACKFILLED.clear()
 
-    from dashboard.api.main import app
-
-    return TestClient(app)
+    response = dashboard_client.get("/api/v1/sessions")
+    assert response.status_code == 200
+    row = next(item for item in response.json()["items"] if item["session_id"] == session_id)
+    assert row["status"] != "jsonl_only"
+    assert row["total_turns"] >= 1
 
 
 def test_health(dashboard_client: TestClient, tmp_path: Path) -> None:
@@ -75,7 +117,23 @@ def test_sessions_and_timeline_after_run(dashboard_client: TestClient, tmp_path:
 
     context = dashboard_client.get(f"/api/v1/runs/{run_id}/context", params={"step_idx": 1})
     assert context.status_code == 200
-    assert isinstance(context.json()["messages"], list)
+    messages = context.json()["messages"]
+    assert isinstance(messages, list)
+    compacted_msgs = [m for m in messages if m.get("compacted")]
+    assert compacted_msgs
+    assert compacted_msgs[0].get("compaction_before_tokens", 0) > compacted_msgs[0].get(
+        "compaction_after_tokens", 0
+    )
+
+    row = next(item for item in items if item["session_id"] == session_id)
+    assert row.get("has_tool_compaction") is True
+
+    max_step = dashboard_client.get(f"/api/v1/runs/{run_id}/context/max-step")
+    assert max_step.status_code == 200
+    body = max_step.json()
+    assert body["max_step_idx"] >= 1
+    assert isinstance(body.get("compaction_steps"), list)
+    assert len(body["compaction_steps"]) >= 1
 
     parallel = dashboard_client.get(f"/api/v1/runs/{run_id}/parallel")
     assert parallel.status_code == 200
@@ -291,6 +349,158 @@ def test_session_rename_dual_storage(dashboard_client: TestClient, tmp_path: Pat
     assert cleared.json()["display_name"] is None
     meta_after = json.loads(sidecar.read_text(encoding="utf-8"))
     assert session_id not in meta_after
+
+
+def test_subagent_flags_overlapping_spawns_without_returns() -> None:
+    from dashboard.api.services.session_tags import _flags_from_turn_events
+
+    base = "2026-06-01T08:00:04"
+    events = [
+        {"kind": "user_prompt", "event_idx": 0},
+        {
+            "kind": "tool_call",
+            "tool": "spawn_subagents",
+            "event_idx": 1,
+        },
+        {
+            "kind": "subagent_spawn",
+            "child_agent_id": "explorer-2.0",
+            "agent_id": "explorer-2.0",
+            "timestamp_iso": f"{base}.492522+00:00",
+            "event_idx": 2,
+        },
+        {
+            "kind": "subagent_spawn",
+            "child_agent_id": "explorer-2.1",
+            "agent_id": "explorer-2.1",
+            "timestamp_iso": f"{base}.497101+00:00",
+            "event_idx": 3,
+        },
+        {
+            "kind": "tool_call",
+            "agent_id": "explorer-2.0",
+            "timestamp_iso": f"{base}.516181+00:00",
+            "event_idx": 4,
+        },
+        {
+            "kind": "tool_call",
+            "agent_id": "explorer-2.1",
+            "timestamp_iso": f"{base}.505445+00:00",
+            "event_idx": 5,
+        },
+    ]
+    flags = _flags_from_turn_events(events)
+    assert flags.has_subagents is True
+    assert flags.has_parallel_subagents is True
+    assert flags.has_sequential_subagents is False
+
+
+def test_subagent_flags_serial_spawn_subagents_returns() -> None:
+    from dashboard.api.services.session_tags import _flags_from_turn_events
+
+    events = [
+        {"kind": "user_prompt", "event_idx": 0},
+        {"kind": "tool_call", "tool": "spawn_subagents", "event_idx": 1},
+        {
+            "kind": "subagent_return",
+            "child_agent_id": "coder-1.0",
+            "agent_id": "coder-1.0",
+            "started_at": "2026-06-01T08:03:10.047489+00:00",
+            "ended_at": "2026-06-01T08:03:29.055551+00:00",
+            "event_idx": 2,
+        },
+        {
+            "kind": "subagent_return",
+            "child_agent_id": "coder-2",
+            "agent_id": "coder-2",
+            "started_at": "2026-06-01T08:03:30.178614+00:00",
+            "ended_at": "2026-06-01T08:03:34.060463+00:00",
+            "event_idx": 3,
+        },
+    ]
+    flags = _flags_from_turn_events(events)
+    assert flags.has_subagents is True
+    assert flags.has_parallel_subagents is False
+    assert flags.has_sequential_subagents is True
+
+
+def test_compaction_flags_from_jsonl_tool_event() -> None:
+    from dashboard.api.services.session_compaction_tags import (
+        CompactionFlags,
+        _flags_from_events,
+        compaction_flags_from_jsonl,
+    )
+
+    events = [
+        {"kind": "user_prompt", "agent_id": "parent", "prompt": "read log"},
+        {"kind": "compaction", "agent_id": "parent", "tool_use_id": "t1", "before_tokens": 5000},
+        {
+            "kind": "context_compaction",
+            "agent_id": "parent",
+            "reason": "manual",
+            "before_tokens": 80000,
+            "after_tokens": 20000,
+        },
+        {
+            "kind": "context_compaction",
+            "agent_id": "parent",
+            "reason": "auto",
+            "before_tokens": 90000,
+            "after_tokens": 25000,
+        },
+    ]
+    flags = _flags_from_events(events)
+    assert flags == CompactionFlags(
+        has_tool_compaction=True,
+        has_context_compaction_auto=True,
+        has_context_compaction_manual=True,
+    )
+
+    empty = compaction_flags_from_jsonl("nonexistent-session-id-xyz")
+    assert empty == CompactionFlags()
+
+
+def test_history_filter_tool_compaction(dashboard_client: TestClient, tmp_path: Path) -> None:
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(
+        tmp_path,
+        "read data/sample.log then summarise auth",
+        recorder,
+        client=_log_then_explorer_client(),
+    )
+    session_id = str(recorder.session_id)
+    listed = dashboard_client.get("/api/v1/sessions")
+    assert listed.status_code == 200
+    row = next(item for item in listed.json()["items"] if item["session_id"] == session_id)
+    assert row["has_tool_compaction"] is True
+    assert row["has_context_compaction_auto"] is False
+    assert row["has_context_compaction_manual"] is False
+
+
+@pytest.mark.parametrize(
+    ("session_id", "parallel", "sequential"),
+    [
+        ("907ec426c934", True, True),
+        ("cdf51f5010f5", False, True),
+    ],
+)
+def test_subagent_flags_regression_fixtures(
+    session_id: str,
+    parallel: bool,
+    sequential: bool,
+) -> None:
+    from pathlib import Path
+
+    from dashboard.api.paths import clear_path_cache
+    from dashboard.api.services.session_tags import subagent_flags_from_jsonl
+
+    clear_path_cache()
+    if not (Path("traces") / f"{session_id}.jsonl").exists():
+        pytest.skip("local trace fixture not present")
+    flags = subagent_flags_from_jsonl(session_id)
+    assert flags.has_subagents is True
+    assert flags.has_parallel_subagents is parallel
+    assert flags.has_sequential_subagents is sequential
 
 
 def test_events_merge_jsonl_when_sqlite_lags(dashboard_client: TestClient, tmp_path: Path) -> None:

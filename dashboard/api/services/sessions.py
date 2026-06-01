@@ -12,7 +12,9 @@ from ..config import jsonl_path_for_session
 from ..db import get_engine
 from ..metadata import load_all_display_names, set_display_name
 from ..paths import all_traces_dirs, find_jsonl_path, mtime_iso
+from .session_compaction_tags import bulk_compaction_flags
 from .session_tags import bulk_subagent_flags
+from .trace_backfill import ensure_session_mirrored
 from ..models import EventRow, RunRow, SessionRow, TurnRow
 from ..schemas import (
     EventItem,
@@ -222,6 +224,12 @@ def list_sessions(
     for session_id in _discover_jsonl_session_ids():
         if session_id in by_id:
             continue
+        if db is not None:
+            ensure_session_mirrored(db, session_id)
+            row = get_session(db, session_id)
+            if row is not None:
+                by_id[session_id] = session_to_summary(row, db, display_names=display_names)
+                continue
         path = find_jsonl_path(session_id)
         if path is not None:
             by_id[session_id] = _quick_jsonl_summary(
@@ -233,22 +241,31 @@ def list_sessions(
         key=lambda item: item.last_seen_at or item.first_seen_at or "",
         reverse=True,
     )
-    flags_by_id = bulk_subagent_flags(db, [item.session_id for item in merged])
+    session_ids = [item.session_id for item in merged]
+    flags_by_id = bulk_subagent_flags(db, session_ids)
+    compaction_by_id = bulk_compaction_flags(db, session_ids)
     enriched: list[SessionSummary] = []
     for item in merged:
         flags = flags_by_id.get(item.session_id)
-        if flags is None:
-            enriched.append(item)
-            continue
-        enriched.append(
-            item.model_copy(
-                update={
+        compaction = compaction_by_id.get(item.session_id)
+        updates: dict[str, bool] = {}
+        if flags is not None:
+            updates.update(
+                {
                     "has_subagents": flags.has_subagents,
                     "has_parallel_subagents": flags.has_parallel_subagents,
                     "has_sequential_subagents": flags.has_sequential_subagents,
                 }
             )
-        )
+        if compaction is not None:
+            updates.update(
+                {
+                    "has_tool_compaction": compaction.has_tool_compaction,
+                    "has_context_compaction_auto": compaction.has_context_compaction_auto,
+                    "has_context_compaction_manual": compaction.has_context_compaction_manual,
+                }
+            )
+        enriched.append(item.model_copy(update=updates) if updates else item)
     total = len(enriched)
     page = enriched[offset : offset + limit]
     return page, total
@@ -329,6 +346,8 @@ def session_detail_from_jsonl(session_id: str) -> SessionDetailResponse | None:
 
 def session_detail(db: Session | None, session_id: str) -> SessionDetailResponse | None:
     if db is not None:
+        if get_session(db, session_id) is None:
+            ensure_session_mirrored(db, session_id)
         row = get_session(db, session_id)
         if row is not None:
             return _session_detail_from_sqlite(db, session_id, row)

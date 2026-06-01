@@ -75,6 +75,24 @@ def all_traces_dirs() -> tuple[Path, ...]:
             continue
         seen.add(key)
         dirs.append(resolved)
+
+    ws_root = workspace_root()
+    try:
+        ws_parts = len(ws_root.parts)
+    except OSError:
+        ws_parts = 0
+    if ws_parts > 0:
+        for path in ws_root.glob("**/traces"):
+            if not path.is_dir():
+                continue
+            if len(path.parts) - ws_parts > 4:
+                continue
+            key = str(path.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            dirs.append(path.resolve())
+
     return tuple(dirs)
 
 
@@ -108,18 +126,20 @@ def resolve_sqlite_path() -> Path:
     add(_repo_root() / agent_config.SQLITE_TRACE_DB)
 
     workspace_db = workspace_root() / agent_config.SQLITE_TRACE_DB
-    if _sqlite_has_sessions(workspace_db):
-        return workspace_db.resolve()
 
     best: Path | None = None
     best_count = -1
     for path in candidates:
-        if path.resolve() == workspace_db.resolve():
-            continue
         count = _sqlite_session_count(path)
         if count > best_count:
             best = path
             best_count = count
+        elif (
+            count == best_count
+            and count > 0
+            and path.resolve() == workspace_db.resolve()
+        ):
+            best = path
 
     if best is not None and best_count > 0:
         return best

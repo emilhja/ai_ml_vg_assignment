@@ -6,8 +6,9 @@ import {
   filterSessions,
   loadSessionFilters,
   saveSessionFilters,
-  SESSION_FILTER_OPTIONS,
-  type SessionSubagentFilter,
+  SESSION_COMPACTION_FILTER_OPTIONS,
+  SESSION_SUBAGENT_FILTER_OPTIONS,
+  type SessionHistoryFilter,
 } from "../lib/sessionFilters";
 
 function SubagentBadges({ session }: { session: SessionSummary }) {
@@ -30,8 +31,37 @@ function SubagentBadges({ session }: { session: SessionSummary }) {
   );
 }
 
+function CompactionBadges({ session }: { session: SessionSummary }) {
+  const any =
+    session.has_tool_compaction ||
+    session.has_context_compaction_auto ||
+    session.has_context_compaction_manual;
+  if (!any) {
+    return <span className="text-[10px] text-muted">—</span>;
+  }
+  return (
+    <span className="flex flex-wrap gap-1">
+      {session.has_tool_compaction && (
+        <span className="text-[10px] uppercase tracking-wide px-1 py-0.5 rounded bg-amber-500/25 text-amber-300">
+          tool
+        </span>
+      )}
+      {session.has_context_compaction_auto && (
+        <span className="text-[10px] uppercase tracking-wide px-1 py-0.5 rounded bg-amber-600/20 text-amber-200">
+          ctx auto
+        </span>
+      )}
+      {session.has_context_compaction_manual && (
+        <span className="text-[10px] uppercase tracking-wide px-1 py-0.5 rounded bg-amber-700/25 text-amber-100">
+          ctx manual
+        </span>
+      )}
+    </span>
+  );
+}
+
 export default function HistoryPage() {
-  const [activeFilters, setActiveFilters] = useState<Set<SessionSubagentFilter>>(loadSessionFilters);
+  const [activeFilters, setActiveFilters] = useState<Set<SessionHistoryFilter>>(loadSessionFilters);
 
   const { data, isLoading, error, isError } = useQuery({
     queryKey: ["sessions"],
@@ -39,7 +69,7 @@ export default function HistoryPage() {
     retry: 2,
   });
 
-  const toggleFilter = (id: SessionSubagentFilter) => {
+  const toggleFilter = (id: SessionHistoryFilter) => {
     setActiveFilters((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -50,7 +80,7 @@ export default function HistoryPage() {
   };
 
   const clearFilters = () => {
-    const next = new Set<SessionSubagentFilter>();
+    const next = new Set<SessionHistoryFilter>();
     saveSessionFilters(next);
     setActiveFilters(next);
   };
@@ -93,27 +123,52 @@ export default function HistoryPage() {
         )}
       </div>
 
-      <div className="space-y-2">
-        <p className="text-xs text-muted">Show sessions with:</p>
-        <div className="flex flex-wrap gap-2">
-          {SESSION_FILTER_OPTIONS.map((opt) => {
-            const on = activeFilters.has(opt.id);
-            return (
-              <button
-                key={opt.id}
-                type="button"
-                title={opt.hint}
-                onClick={() => toggleFilter(opt.id)}
-                className={`px-3 py-1.5 rounded-full text-xs border transition-colors ${
-                  on
-                    ? "bg-accent/25 border-accent/50 text-accent"
-                    : "bg-panel/60 border-slate-700/50 text-muted hover:border-slate-500 hover:text-white"
-                }`}
-              >
-                {opt.label}
-              </button>
-            );
-          })}
+      <div className="space-y-3">
+        <div className="space-y-2">
+          <p className="text-xs text-muted">Sub-agents:</p>
+          <div className="flex flex-wrap gap-2">
+            {SESSION_SUBAGENT_FILTER_OPTIONS.map((opt) => {
+              const on = activeFilters.has(opt.id);
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  title={opt.hint}
+                  onClick={() => toggleFilter(opt.id)}
+                  className={`px-3 py-1.5 rounded-full text-xs border transition-colors ${
+                    on
+                      ? "bg-accent/25 border-accent/50 text-accent"
+                      : "bg-panel/60 border-slate-700/50 text-muted hover:border-slate-500 hover:text-white"
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <div className="space-y-2">
+          <p className="text-xs text-muted">Compaction:</p>
+          <div className="flex flex-wrap gap-2">
+            {SESSION_COMPACTION_FILTER_OPTIONS.map((opt) => {
+              const on = activeFilters.has(opt.id);
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  title={opt.hint}
+                  onClick={() => toggleFilter(opt.id)}
+                  className={`px-3 py-1.5 rounded-full text-xs border transition-colors ${
+                    on
+                      ? "bg-amber-500/20 border-amber-500/50 text-amber-200"
+                      : "bg-panel/60 border-slate-700/50 text-muted hover:border-slate-500 hover:text-white"
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
         </div>
         {activeFilters.size > 0 && (
           <p className="text-[11px] text-muted">
@@ -139,6 +194,7 @@ export default function HistoryPage() {
             <tr>
               <th className="px-4 py-2">Session</th>
               <th className="px-4 py-2">Sub-agents</th>
+              <th className="px-4 py-2">Compaction</th>
               <th className="px-4 py-2">Last seen</th>
               <th className="px-4 py-2">Status</th>
               <th className="px-4 py-2">Turns</th>
@@ -150,7 +206,10 @@ export default function HistoryPage() {
             {filteredItems.map((s) => (
               <tr key={s.session_id} className="border-t border-slate-700/40 hover:bg-panel/40">
                 <td className="px-4 py-2">
-                  <Link to={`/history/${s.session_id}`} className="text-accent hover:underline font-medium">
+                  <Link
+                    to={`/history/${s.session_id}${s.has_tool_compaction ? "?tab=context" : ""}`}
+                    className="text-accent hover:underline font-medium"
+                  >
                     {s.display_name?.trim() || `${s.session_id.slice(0, 12)}…`}
                   </Link>
                   <p className="text-xs text-muted font-mono truncate max-w-md">{s.session_id}</p>
@@ -160,6 +219,9 @@ export default function HistoryPage() {
                 </td>
                 <td className="px-4 py-2">
                   <SubagentBadges session={s} />
+                </td>
+                <td className="px-4 py-2">
+                  <CompactionBadges session={s} />
                 </td>
                 <td className="px-4 py-2 text-muted">{s.last_seen_at?.slice(0, 19) ?? "—"}</td>
                 <td className="px-4 py-2">
