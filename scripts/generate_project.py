@@ -193,6 +193,8 @@ COMPACTOR_MAX_INPUT_CHARS = 120_000
 COMPACTOR_MAX_SUMMARY_TOKENS = 300
 
 MAX_PARENT_STEPS = 15
+FINAL_STEP_RESERVE = 1
+MAX_PARALLEL_CODER_RETRIES_PER_CALL = 2
 MAX_SUBAGENT_STEPS = 8
 MAX_SUBAGENT_DEPTH = 1
 MAX_CONCURRENT_SUBAGENTS = 2
@@ -207,6 +209,7 @@ WARN_STEP_FRACTION = 0.8
 WALL_CLOCK_TIMEOUT = 120
 TOOL_TIMEOUT = 30
 K_COMPACT = 4000
+PARENT_MAX_OUTPUT_TOKENS = 4096
 
 OPENROUTER_ENDPOINT_HOST = "__OPENROUTER_ENDPOINT_HOST__"
 MAX_TOOL_RESULT_BYTES = 1_048_576
@@ -247,6 +250,7 @@ KNOWN_ENV_VARS: tuple[str, ...] = (
     "VG_MAX_TOKENS_PER_RUN",
     "VG_APPROVAL_MODE",
     "VG_K_COMPACT",
+    "VG_MAX_OUTPUT_TOKENS",
     "VG_STRICT_MODEL_PRICING",
 )
 
@@ -375,6 +379,11 @@ def _apply_env() -> None:
     raw = os.environ.get("VG_K_COMPACT", "").strip()
     if raw:
         config.K_COMPACT = int(raw)
+    raw = os.environ.get("VG_MAX_OUTPUT_TOKENS", "").strip()
+    if raw:
+        parsed = int(raw)
+        if parsed > 0:
+            config.PARENT_MAX_OUTPUT_TOKENS = parsed
 
     _refresh_subagent_model_ids()
 
@@ -533,6 +542,7 @@ class BudgetGuard:
     running_input_tokens: int = 0
     running_output_tokens: int = 0
     running_usd: float = 0.0
+    parent_step_count: int = 0
     step_count: int = 0
     last_tool_signature: tuple[str, str] | None = None
     repeat_count: int = 0
@@ -558,10 +568,17 @@ class BudgetGuard:
         price = config.PRICING_USD_PER_MTOK.get(model, config.UNKNOWN_MODEL_ESTIMATE_USD_PER_MTOK)
         return (input_tokens / 1_000_000) * price["input"] + (output_tokens / 1_000_000) * price["output"]
 
-    def before_model_call(self, model: str, worst_input_tokens: int, worst_output_tokens: int) -> BudgetDecision:
+    def before_model_call(
+        self,
+        model: str,
+        worst_input_tokens: int,
+        worst_output_tokens: int,
+        *,
+        enforce_parent_step_cap: bool = False,
+    ) -> BudgetDecision:
         with self.lock:
-            if self.step_count >= self.max_steps:
-                return BudgetDecision(False, "step_cap", {"steps": self.step_count, "max_steps": self.max_steps})
+            if enforce_parent_step_cap and self.parent_step_count >= self.max_steps:
+                return BudgetDecision(False, "step_cap", {"steps": self.parent_step_count, "max_steps": self.max_steps})
             if self.running_tokens + worst_input_tokens + worst_output_tokens > self.max_tokens:
                 return BudgetDecision(False, "token_cap", {"tokens": self.running_tokens, "max_tokens": self.max_tokens})
             worst_cost = self.estimate_cost(model, worst_input_tokens, worst_output_tokens)
@@ -574,6 +591,8 @@ class BudgetGuard:
     def record_model_call(self, model: str, input_tokens: int, output_tokens: int, cost_usd: float | None = None, agent_type: str = "parent") -> float:
         with self.lock:
             self.step_count += 1
+            if agent_type == "parent":
+                self.parent_step_count += 1
             self.running_tokens += input_tokens + output_tokens
             self.running_input_tokens += input_tokens
             self.running_output_tokens += output_tokens
@@ -608,9 +627,19 @@ class BudgetGuard:
             if "warn_tokens" not in self.warned and self.max_tokens > 0 and self.running_tokens >= config.WARN_TOKEN_FRACTION * self.max_tokens:
                 self.warned.add("warn_tokens")
                 out.append(BudgetDecision(True, "warn_tokens", {"running_tokens": self.running_tokens, "max_tokens": self.max_tokens, "crossed_at_step": self.step_count}))
-            if "warn_steps" not in self.warned and self.max_steps > 0 and self.step_count >= config.WARN_STEP_FRACTION * self.max_steps:
+            if "warn_steps" not in self.warned and self.max_steps > 0 and self.parent_step_count >= config.WARN_STEP_FRACTION * self.max_steps:
                 self.warned.add("warn_steps")
-                out.append(BudgetDecision(True, "warn_steps", {"step_count": self.step_count, "max_steps": self.max_steps, "crossed_at_step": self.step_count}))
+                out.append(
+                    BudgetDecision(
+                        True,
+                        "warn_steps",
+                        {
+                            "step_count": self.parent_step_count,
+                            "max_steps": self.max_steps,
+                            "crossed_at_step": self.parent_step_count,
+                        },
+                    )
+                )
             return out
 
     def should_offer_step_extend(self) -> bool:
@@ -619,7 +648,15 @@ class BudgetGuard:
                 return False
             if self.step_extend_prompted or self.max_steps <= 1:
                 return False
-            return self.step_count > 0 and self.step_count == self.max_steps - 1
+            return self.parent_step_count > 0 and self.parent_step_count == self.max_steps - 1
+
+    def at_final_step_reserve(self) -> bool:
+        """True when the parent should reserve the last step for synthesis (not spawns)."""
+        with self.lock:
+            # Only meaningful when the cap leaves room for work plus a finalize step.
+            if self.max_steps <= config.FINAL_STEP_RESERVE * 2:
+                return False
+            return self.parent_step_count >= self.max_steps - config.FINAL_STEP_RESERVE
 
     def mark_step_extend_prompted(self) -> None:
         with self.lock:
@@ -650,8 +687,8 @@ class BudgetGuard:
             if max_steps is not None:
                 if max_steps < 1:
                     return "max_steps must be >= 1"
-                if max_steps < self.step_count:
-                    return f"max_steps must be >= step_count ({self.step_count})"
+                if max_steps < self.parent_step_count:
+                    return f"max_steps must be >= step_count ({self.parent_step_count})"
                 self.max_steps = max_steps
             if max_tokens is not None:
                 if max_tokens < 1:
@@ -675,7 +712,7 @@ class BudgetGuard:
         """Raise a hard cap after interactive approval."""
         with self.lock:
             if reason == "step_cap":
-                self.max_steps = (self.step_count + 1) if once else (self.max_steps + max(5, self.max_steps // 4))
+                self.max_steps = (self.parent_step_count + 1) if once else (self.max_steps + max(5, self.max_steps // 4))
             elif reason == "token_cap":
                 bump = max(10_000, self.max_tokens // 4)
                 self.max_tokens = (self.running_tokens + bump) if once else (self.max_tokens + bump)
@@ -3098,7 +3135,7 @@ def _offer_step_extend_if_needed(
         return True
     if not guard.should_offer_step_extend():
         return True
-    details: dict[str, object] = {"step_count": guard.step_count, "max_steps": guard.max_steps}
+    details: dict[str, object] = {"step_count": guard.parent_step_count, "max_steps": guard.max_steps}
     decision = BudgetDecision(False, "step_extend", details)
     summary = _budget_cap_summary(decision)
     outcome = policy.check_budget_cap("step_extend", details, summary)
@@ -3270,6 +3307,43 @@ def _execute_live_tool(
         return tools.write_file(root, path, str(args.get("content") or ""), call.tool_use_id)
     if tool_name == "edit_file":
         return tools.edit_file(root, path, str(args.get("old") or ""), str(args.get("new") or ""), call.tool_use_id)
+    if tool_name in {"spawn_subagent", "spawn_subagents"} and agent_id == "parent":
+        if guard.at_final_step_reserve():
+            blocked = {
+                "status": "near_cap_blocked",
+                "message": (
+                    "Parent step budget reserves the final step for synthesis. "
+                    "Do not spawn sub-agents; summarize progress and answer the user now."
+                ),
+            }
+            return _result(
+                call.tool_use_id,
+                tool_name,
+                json.dumps(blocked, ensure_ascii=False),
+                "ok",
+                tool_started,
+            )
+        sig = _spawn_signature_key(tool_name, dict(args))
+        repeat = guard.record_tool_signature(tool_name, sig)
+        if not repeat.allowed:
+            if not _handle_budget_cap(
+                policy=policy,
+                recorder=recorder,
+                guard=guard,
+                decision=repeat,
+                started=started,
+                agent_id=agent_id,
+                parent_id=parent_id,
+                agent_type=agent_type,
+            ):
+                return _result(
+                    call.tool_use_id,
+                    tool_name,
+                    f"budget abort: {repeat.budget_reason}",
+                    "error",
+                    tool_started,
+                )
+            guard.record_tool_signature(tool_name, sig)
     if tool_name == "spawn_subagent":
         child_type = _normalise_agent_type(args.get("type"))
         question = str(args.get("question") or "")
@@ -3349,6 +3423,60 @@ def _is_impl_file_path(path: str) -> bool:
     return name.endswith(".py") and not name.startswith("test_")
 
 
+def _subagent_error_reason_from_tool_result(tool_name: str, result_text: str) -> str:
+    text = str(result_text or "").lower()
+    if tool_name in {"read_file", "read_file_range"} and ("is a directory" in text or "not a regular file" in text):
+        return "invalid_path_kind"
+    if tool_name == "run_bash" and "shell control or redirection marker" in text:
+        return "blocked_shell_control"
+    if tool_name == "run_bash" and "run_bash blocked:" in text:
+        return "blocked_run_bash"
+    if "old text not found" in text:
+        return "edit_not_found"
+    return "tool_error"
+
+
+def _spawn_signature_key(tool_name: str, args: dict[str, object]) -> str:
+    if tool_name == "spawn_subagent":
+        payload: object = {
+            "type": _normalise_agent_type(args.get("type")),
+            "question": str(args.get("question") or "")[:500],
+        }
+    else:
+        norm: list[dict[str, str]] = []
+        raw = args.get("requests") or []
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    norm.append(
+                        {
+                            "type": _normalise_agent_type(item.get("type")),
+                            "question": str(item.get("question") or "")[:200],
+                        }
+                    )
+        norm.sort(key=lambda entry: (entry["type"], entry["question"]))
+        payload = {"requests": norm}
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False)[:2000]
+
+
+@dataclass
+class _ParallelBatchControl:
+    slice_usd: float
+    slice_tokens: int
+    abort: threading.Event = field(default_factory=threading.Event, compare=False, repr=False)
+    lock: object = field(default_factory=threading.Lock, compare=False, repr=False)
+    offender_agent_id: str | None = None
+
+    def check_over_slice(self, child_id: str, spent_usd: float, spent_tokens: int) -> bool:
+        if spent_usd > self.slice_usd + 1e-9 or spent_tokens > self.slice_tokens:
+            with self.lock:
+                if self.offender_agent_id is None:
+                    self.offender_agent_id = child_id
+                self.abort.set()
+            return True
+        return self.abort.is_set()
+
+
 def _run_live_subagent(
     root: Path,
     agent_type: str,
@@ -3360,8 +3488,10 @@ def _run_live_subagent(
     started: float,
     policy: ApprovalPolicy,
     review_slice: str | None = None,
-) -> tuple[str, str, int, int]:
-    """Run one typed sub-agent loop. Returns (summary, status, writes_ok, reads_ok)."""
+    batch_ctrl: _ParallelBatchControl | None = None,
+    spawn_cost_before: tuple[float, int] | None = None,
+) -> tuple[str, str, int, int, str | None]:
+    """Run one typed sub-agent loop. Returns (summary, status, writes_ok, reads_ok, failure_reason)."""
     system_prompt = SUBAGENT_SYSTEM_PROMPTS[agent_type]
     model = config.SUBAGENT_MODEL_IDS[agent_type]
     tool_schemas = _subagent_tool_schemas(agent_type)
@@ -3382,8 +3512,16 @@ def _run_live_subagent(
     impl_read_ok = False
     empty_turn_retries = 0
     max_empty_turn_retries = 2
+    failure_reason: str | None = None
 
     for local_step in range(1, config.MAX_SUBAGENT_STEPS + 1):
+        if batch_ctrl is not None and batch_ctrl.abort.is_set():
+            status = "parallel_aborted"
+            failure_reason = "parallel_aborted"
+            final_summary = (
+                f"{agent_type} cancelled because a parallel peer exceeded its budget slice."
+            )
+            break
         if _wall_clock_exceeded(started, guard):
             timeout = type("Decision", (), {"budget_reason": "timeout", "details": {"timeout_s": config.WALL_CLOCK_TIMEOUT}})()
             if not _handle_budget_cap(
@@ -3413,6 +3551,7 @@ def _run_live_subagent(
                 agent_type=agent_type,
             ):
                 status = "tool_error"
+                failure_reason = "subagent_budget_cap"
                 break
             continue
         recorder.emit(
@@ -3442,6 +3581,7 @@ def _run_live_subagent(
             _record_model_error(recorder, guard, exc, started, model=model, step_idx=local_step, agent_id=child_id, parent_id="parent", agent_type=agent_type)
             final_summary = f"{agent_type} stopped because {exc}"
             status = "tool_error"
+            failure_reason = "model_error"
             break
         if not isinstance(turn, ModelTurn):
             turn = ModelTurn(**turn)
@@ -3450,6 +3590,17 @@ def _run_live_subagent(
         input_tokens = turn.input_tokens or expected_in
         output_tokens = turn.output_tokens or tools.estimate_tokens(turn.assistant_text + json.dumps([asdict(c) for c in turn.tool_calls], sort_keys=True))
         cost = guard.record_model_call(model_id, input_tokens, output_tokens, cost_usd=turn.cost_usd, agent_type=agent_type)
+        if batch_ctrl is not None and spawn_cost_before is not None:
+            spent_usd = guard.running_usd - spawn_cost_before[0]
+            spent_tokens = guard.running_tokens - spawn_cost_before[1]
+            if batch_ctrl.check_over_slice(child_id, spent_usd, spent_tokens):
+                status = "parallel_aborted"
+                failure_reason = "parallel_aborted"
+                final_summary = (
+                    f"{agent_type} stopped: parallel budget slice exceeded "
+                    f"(offender may be {batch_ctrl.offender_agent_id or child_id})."
+                )
+                break
         recorder.emit(
             "assistant_step",
             agent_id=child_id,
@@ -3514,6 +3665,7 @@ def _run_live_subagent(
                 final_summary = (
                     "Coder returned repeated empty responses without any tool calls."
                 )
+                failure_reason = "no_terminal_summary"
                 recorder.emit(
                     "budget_event",
                     agent_id=child_id,
@@ -3540,6 +3692,7 @@ def _run_live_subagent(
                         continue
                     status = "tool_error"
                     final_summary = "Reviewer returned without reading workspace."
+                    failure_reason = "reviewer_no_read"
                     completed = True
                     break
                 if not _is_reviewer_verdict(final_summary):
@@ -3554,6 +3707,7 @@ def _run_live_subagent(
                         continue
                     status = "tool_error"
                     final_summary = "Reviewer returned without PASS:/FAIL: verdict."
+                    failure_reason = "reviewer_no_verdict"
                     completed = True
                     break
             completed = True
@@ -3605,6 +3759,7 @@ def _run_live_subagent(
                         read_tools_ok += 1
             if result["status"] != "ok":
                 had_tool_error = True
+                failure_reason = _subagent_error_reason_from_tool_result(c.name, str(result["result_full"]))
                 break
         messages.append({"role": "user", "content": tool_blocks})
 
@@ -3620,21 +3775,30 @@ def _run_live_subagent(
             stop_reason = "stopped before returning a verdict"
         final_summary = f"FAIL: Reviewer did not return PASS:/FAIL: ({stop_reason})."
         status = "tool_error"
+        failure_reason = "reviewer_no_verdict"
         completed = True
     elif not final_summary:
-        final_summary = f"{agent_type} stopped before producing a final summary."
+        reason_label = failure_reason or ("step_limit" if not completed else "unknown")
+        final_summary = f"{agent_type} exited without summary (reason={reason_label})."
     if not completed and status == "ok" and had_tool_error:
         status = "tool_error"
+        if failure_reason is None:
+            failure_reason = "tool_error"
     if agent_type == "coder" and completed and status == "ok" and writes_ok == 0:
         status = "tool_error"
         if empty_turn_retries > 0:
-            final_summary = "Coder did not write any file after empty-turn retries."
+            failure_reason = failure_reason or "no_terminal_summary"
+            final_summary = f"Coder exited without summary (reason={failure_reason})."
         else:
-            final_summary = "Coder returned without writing or editing any file."
+            failure_reason = failure_reason or "no_write"
+            final_summary = f"Coder exited without summary (reason={failure_reason})."
     if agent_type == "coder" and completed and status == "ok" and require_impl_read and writes_ok > 0 and not impl_read_ok:
         status = "tool_error"
-        final_summary = "Coder wrote tests without reading the implementation file first."
-    return final_summary, status, writes_ok, reads_ok
+        failure_reason = "tests_without_impl_read"
+        final_summary = f"Coder exited without summary (reason={failure_reason})."
+    if status == "tool_error" and failure_reason is None:
+        failure_reason = "tool_error"
+    return final_summary, status, writes_ok, reads_ok, failure_reason
 
 
 def _spawn_one(
@@ -3649,6 +3813,7 @@ def _spawn_one(
     review_slice: str | None = None,
     child_id: str | None = None,
     barrier: "threading.Barrier | None" = None,
+    batch_ctrl: _ParallelBatchControl | None = None,
 ) -> dict[str, object]:
     child_id = child_id or _next_child_id(recorder, agent_type)
     model = config.SUBAGENT_MODEL_IDS[agent_type]
@@ -3671,7 +3836,21 @@ def _spawn_one(
         except threading.BrokenBarrierError:
             pass
     run_started_at = now_iso()
-    summary, status, writes_ok, reads_ok = _run_live_subagent(root, agent_type, question, recorder, client, guard, child_id, started, policy, review_slice)
+    spawn_cost_before = (guard.running_usd, guard.running_tokens)
+    summary, status, writes_ok, reads_ok, failure_reason = _run_live_subagent(
+        root,
+        agent_type,
+        question,
+        recorder,
+        client,
+        guard,
+        child_id,
+        started,
+        policy,
+        review_slice,
+        batch_ctrl=batch_ctrl,
+        spawn_cost_before=spawn_cost_before,
+    )
     ended_at = now_iso()
     recorder.emit(
         "subagent_return",
@@ -3681,6 +3860,7 @@ def _spawn_one(
         child_agent_id=child_id,
         status=status,
         summary=summary,
+        failure_reason=failure_reason,
         writes_ok=writes_ok,
         reads_ok=reads_ok,
         started_at=run_started_at,
@@ -3693,8 +3873,10 @@ def _spawn_one(
         "agent_type": agent_type,
         "status": status,
         "payload": summary,
+        "failure_reason": failure_reason,
         "writes_ok": writes_ok,
         "reads_ok": reads_ok,
+        "question": question,
     }
 
 
@@ -3743,6 +3925,16 @@ def _spawn_many(
 
     results_by_slot: dict[int, dict[str, object]] = {}
     barrier = threading.Barrier(len(runnable)) if len(runnable) > 1 else None
+    batch_ctrl: _ParallelBatchControl | None = None
+    if len(runnable) > 1:
+        with guard.lock:
+            remaining_usd = max(0.0, guard.max_usd - guard.running_usd)
+            remaining_tokens = max(0, guard.max_tokens - guard.running_tokens)
+        n = len(runnable)
+        batch_ctrl = _ParallelBatchControl(
+            slice_usd=max(0.01, remaining_usd / n),
+            slice_tokens=max(1000, remaining_tokens // n),
+        )
     if runnable:
         with ThreadPoolExecutor(max_workers=len(runnable)) as pool:
             futures = {}
@@ -3752,11 +3944,37 @@ def _spawn_many(
                     coder_id = _resolve_review_coder_id(recorder, review_agent_id)
                     if coder_id:
                         review_slice = _build_review_slice(recorder, coder_id)
-                futures[pool.submit(_spawn_one, root, atype, question, recorder, client, guard, started, policy, review_slice, child_id, barrier)] = slot
+                futures[
+                    pool.submit(
+                        _spawn_one,
+                        root,
+                        atype,
+                        question,
+                        recorder,
+                        client,
+                        guard,
+                        started,
+                        policy,
+                        review_slice,
+                        child_id,
+                        barrier,
+                        batch_ctrl,
+                    )
+                ] = slot
             for future, slot in futures.items():
                 out = future.result()
                 out["slot"] = slot
                 results_by_slot[slot] = out
+        if batch_ctrl is not None and batch_ctrl.offender_agent_id:
+            recorder.emit(
+                "budget_event",
+                budget_reason="parallel_aborted",
+                details={
+                    "offender_agent_id": batch_ctrl.offender_agent_id,
+                    "slice_usd": batch_ctrl.slice_usd,
+                    "slice_tokens": batch_ctrl.slice_tokens,
+                },
+            )
     for conflict in conflicts:
         results_by_slot[int(conflict["slot"])] = conflict
 
@@ -3766,6 +3984,113 @@ def _spawn_many(
     for entry in summaries:
         entry.pop("slot", None)
     return summaries
+
+
+def _parse_spawn_payload(result: dict[str, object]) -> dict[str, object] | None:
+    if str(result.get("tool") or "") != "spawn_subagent":
+        return None
+    if str(result.get("status") or "") != "ok":
+        return None
+    body = str(result.get("result_full") or "")
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _should_retry_coder_spawn(payload: dict[str, object], *, retry_used: bool) -> bool:
+    if retry_used:
+        return False
+    if str(payload.get("agent_type") or "") != "coder":
+        return False
+    if str(payload.get("status") or "") != "tool_error":
+        return False
+    reason = str(payload.get("failure_reason") or "")
+    return reason in {
+        "invalid_path_kind",
+        "blocked_shell_control",
+        "blocked_run_bash",
+        "no_terminal_summary",
+        "no_write",
+        "tool_error",
+    }
+
+
+def _constrained_retry_question(original_question: str, reason: str) -> str:
+    constraints = (
+        "Retry this coding task with strict constraints: use read_file on the exact file path "
+        "(not a directory), then use write_file/edit_file directly. Do not use run_bash unless "
+        "explicitly asked for `python3 -m py_compile <single .py file>`. "
+        "Return only after at least one successful write_file or edit_file."
+    )
+    return f"{original_question}\\n\\nFailure reason from previous attempt: {reason}\\n{constraints}"
+
+
+def _parallel_spawn_question(entry: dict[str, object]) -> str:
+    if "initial" in entry and isinstance(entry.get("initial"), dict):
+        initial = entry["initial"]
+        return str(initial.get("question") or initial.get("payload") or "")
+    return str(entry.get("payload") or "")
+
+
+def _retry_failed_parallel_coders(
+    root: Path,
+    summaries: list[dict[str, object]],
+    raw_requests: list[Any],
+    recorder: TraceRecorder,
+    client: Any,
+    guard: BudgetGuard,
+    started: float,
+    policy: ApprovalPolicy,
+) -> list[dict[str, object]]:
+    """Bounded same-turn constrained retries for failed Coder entries in a parallel batch."""
+    retries_done = 0
+    out: list[dict[str, object]] = []
+    for index, entry in enumerate(summaries):
+        merged = dict(entry)
+        if retries_done >= config.MAX_PARALLEL_CODER_RETRIES_PER_CALL:
+            out.append(merged)
+            continue
+        if str(merged.get("agent_type") or "") != "coder":
+            out.append(merged)
+            continue
+        if _should_retry_coder_spawn(merged, retry_used=False):
+            question = str(merged.get("question") or "")
+            if not question and index < len(raw_requests) and isinstance(raw_requests[index], dict):
+                question = str(raw_requests[index].get("question") or "")
+            if not question:
+                question = _parallel_spawn_question(merged)
+            retry_question = _constrained_retry_question(
+                question,
+                str(merged.get("failure_reason") or "tool_error"),
+            )
+            retry_payload = _spawn_one(
+                root,
+                "coder",
+                retry_question,
+                recorder,
+                client,
+                guard,
+                started,
+                policy,
+            )
+            retries_done += 1
+            recorder.emit(
+                "budget_event",
+                budget_reason="coder_constrained_retry",
+                details={
+                    "reason": str(merged.get("failure_reason") or "tool_error"),
+                    "original_agent_id": str(merged.get("agent_id") or ""),
+                    "retry_agent_id": str(retry_payload.get("agent_id") or ""),
+                    "parallel_index": index,
+                },
+            )
+            merged = {"initial": entry, "retry": retry_payload, **retry_payload}
+        out.append(merged)
+    return out
 
 
 def run_live_task(
@@ -3789,6 +4114,7 @@ def run_live_task(
     messages: list[dict[str, Any]] = history if history is not None else []
     messages.append({"role": "user", "content": task})
     recorder.emit("user_prompt", prompt=task, live_model=True)
+    constrained_coder_retry_used = False
 
     while True:
         if _wall_clock_exceeded(started, guard):
@@ -3812,7 +4138,12 @@ def run_live_task(
                 deterministic=False,
             )
             expected_in = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
-        decision = guard.before_model_call(config.PARENT_MODEL_ID, expected_in, 4096)
+        decision = guard.before_model_call(
+            config.PARENT_MODEL_ID,
+            expected_in,
+            config.PARENT_MAX_OUTPUT_TOKENS,
+            enforce_parent_step_cap=True,
+        )
         if not decision.allowed:
             if not _handle_budget_cap(policy=policy, recorder=recorder, guard=guard, decision=decision, started=started):
                 return recorder
@@ -3821,9 +4152,9 @@ def run_live_task(
             "llm_start",
             model=config.PARENT_MODEL_ID,
             model_id=config.PARENT_MODEL_ID,
-            step_idx=guard.step_count + 1,
+            step_idx=guard.parent_step_count + 1,
             tokens_in=expected_in,
-            max_tokens=4096,
+            max_tokens=config.PARENT_MAX_OUTPUT_TOKENS,
             endpoint_host=config.OPENROUTER_ENDPOINT_HOST,
             system_prompt_sha256=hashlib.sha256(PARENT_SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
             tool_schema_count=len(PARENT_TOOL_SCHEMAS),
@@ -3835,7 +4166,7 @@ def run_live_task(
                 system_prompt=PARENT_SYSTEM_PROMPT,
                 messages=messages,
                 tools=PARENT_TOOL_SCHEMAS,
-                max_tokens=4096,
+                max_tokens=config.PARENT_MAX_OUTPUT_TOKENS,
             )
         except LiveModelError as exc:
             _record_model_error(
@@ -3844,7 +4175,7 @@ def run_live_task(
                 exc,
                 started,
                 model=config.PARENT_MODEL_ID,
-                step_idx=guard.step_count + 1,
+                step_idx=guard.parent_step_count + 1,
             )
             return recorder
         if not isinstance(turn, ModelTurn):
@@ -3856,7 +4187,7 @@ def run_live_task(
         cost = guard.record_model_call(model_id, input_tokens, output_tokens, cost_usd=turn.cost_usd)
         for warning in guard.pending_warnings():
             recorder.emit("budget_event", budget_reason=warning.budget_reason, details=warning.details)
-        step_idx = guard.step_count
+        step_idx = guard.parent_step_count
         recorder.emit(
             "assistant_step",
             model=model_id,
@@ -3903,6 +4234,69 @@ def run_live_task(
                 policy=policy,
                 agent_type="parent",
             )
+            if call.name == "spawn_subagents" and result.get("status") == "ok":
+                try:
+                    batch = json.loads(str(result.get("result_full") or "[]"))
+                except json.JSONDecodeError:
+                    batch = None
+                if isinstance(batch, list):
+                    raw_requests = call.args.get("requests") if isinstance(call.args.get("requests"), list) else []
+                    retried = _retry_failed_parallel_coders(
+                        root,
+                        batch,
+                        raw_requests,
+                        recorder,
+                        client,
+                        guard,
+                        started,
+                        policy,
+                    )
+                    if any(
+                        "retry" in item
+                        for item in retried
+                        if isinstance(item, dict)
+                    ):
+                        result = {
+                            **result,
+                            "result_full": json.dumps(retried, ensure_ascii=False),
+                        }
+            if call.name == "spawn_subagent":
+                payload = _parse_spawn_payload(result)
+                if isinstance(payload, dict) and _should_retry_coder_spawn(payload, retry_used=constrained_coder_retry_used):
+                    retry_question = _constrained_retry_question(
+                        str(call.args.get("question") or ""),
+                        str(payload.get("failure_reason") or "tool_error"),
+                    )
+                    retry_payload = _spawn_one(
+                        root,
+                        "coder",
+                        retry_question,
+                        recorder,
+                        client,
+                        guard,
+                        started,
+                        policy,
+                    )
+                    constrained_coder_retry_used = True
+                    recorder.emit(
+                        "budget_event",
+                        budget_reason="coder_constrained_retry",
+                        details={
+                            "reason": str(payload.get("failure_reason") or "tool_error"),
+                            "original_agent_id": str(payload.get("agent_id") or ""),
+                            "retry_agent_id": str(retry_payload.get("agent_id") or ""),
+                        },
+                    )
+                    result = {
+                        **result,
+                        "result_full": json.dumps(
+                            {
+                                "initial": payload,
+                                "retry": retry_payload,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
             event = recorder.emit("tool_result", **result)
             content = str(result["result_full"])
             compaction = _compact_if_needed(
@@ -4083,7 +4477,7 @@ def _print_budget(guard: BudgetGuard) -> None:
     from .budget import format_usd_number
 
     sys.stdout.write(
-        f"steps {guard.step_count}/{guard.max_steps}  "
+        f"steps {guard.parent_step_count}/{guard.max_steps}  "
         f"session_tokens {guard.running_tokens}/{guard.max_tokens}  "
         f"usd {format_usd_number(guard.running_usd)}/{format_usd_number(guard.max_usd)}  "
         f"daily_remaining {format_usd_number(guard.daily_remaining_usd)}\\n"

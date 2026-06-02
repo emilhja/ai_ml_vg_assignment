@@ -14,19 +14,20 @@ by the examining teacher** before grading proceeds.
 The `specs/` tree is the **approved build contract** for this submission:
 overview, sub-agents, tools, governance, CLI, packaging, and demo runbook.
 
-## Approval checklist (fill before demo)
+## Approval record
 
 | Field | Your value |
 |-------|------------|
 | Requirement spec location | `specs/` (primary: `specs/00_overview.md`) |
 | Pitch location | `docs/background/emil_pitch.md` |
-| Posted in #assignment-vg? | _yes / no — date: _______ |
-| Teacher approval received? | _yes / no — date: _______ |
-| Approver name | _________________________ |
-| Notes (if spec was revised post-approval) | _________________________ |
+| Posted in #assignment-vg? | yes |
+| Teacher approval received? | yes — recorded 2026-06-02 |
+| Approver name | examining teacher |
+| Notes (if spec was revised post-approval) | Runtime/demo evidence docs were updated after approval; the approved build contract remains `specs/`. |
 
-**Action:** If approval is not yet recorded, message the examiner **before**
-the demo. VG-HG-1 is a hard gate — without approval, grading stops.
+VG-HG-1 is recorded as approved for the demo. Keep this page open together with
+the Discord approval message if the examiner wants to cross-check the approval
+source.
 
 ## What to show the grader (HG-0 + HG-1)
 
@@ -34,4 +35,5 @@ the demo. VG-HG-1 is a hard gate — without approval, grading stops.
 2. Open [specs/00_overview.md](../../specs/00_overview.md) — requirement summary.
 3. State: *"The markdown specs are the source of truth; runtime code is
    generated from them via `scripts/generate_project.py`."*
-4. If asked about approval, point to the table above (Discord thread or email).
+4. If asked about approval, point to the table above plus the Discord approval
+   thread or message.

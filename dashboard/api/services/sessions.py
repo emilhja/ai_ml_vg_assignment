@@ -218,7 +218,10 @@ def list_sessions(
     display_names = load_all_display_names(_engine_optional())
 
     if db is not None:
-        rows = db.scalars(select(SessionRow).order_by(desc(SessionRow.last_seen_at))).all()
+        try:
+            rows = db.scalars(select(SessionRow).order_by(desc(SessionRow.last_seen_at))).all()
+        except Exception:
+            rows = []
         for row in rows:
             by_id[row.session_id] = session_to_summary(row, db, display_names=display_names)
 
@@ -544,11 +547,14 @@ def detect_active_session_id(db: Session | None, override: str | None) -> str | 
         return override
     candidates: list[tuple[float, str]] = []
     if db is not None:
-        rows = db.execute(
-            select(SessionRow.session_id, SessionRow.last_seen_at).where(
-                SessionRow.status == "running"
-            )
-        ).all()
+        try:
+            rows = db.execute(
+                select(SessionRow.session_id, SessionRow.last_seen_at).where(
+                    SessionRow.status == "running"
+                )
+            ).all()
+        except Exception:
+            rows = []
         for session_id, last_seen in rows:
             score = _parse_ts(str(last_seen) if last_seen else None)
             candidates.append((score, str(session_id)))

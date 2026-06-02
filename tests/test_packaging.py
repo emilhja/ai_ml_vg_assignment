@@ -1,8 +1,10 @@
-"""Packaging contract: .env.example and config.example.toml coverage."""
+"""Packaging contract: .env.example, config.example.toml, and Compose layout."""
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
+from shutil import which
 
 import pytest
 
@@ -53,7 +55,6 @@ def test_env_gitignored() -> None:
     env_path = ROOT / ".env"
     if not env_path.exists():
         pytest.skip("no .env file in checkout")
-    import subprocess
 
     result = subprocess.run(
         ["git", "check-ignore", "-q", ".env"],
@@ -61,3 +62,27 @@ def test_env_gitignored() -> None:
         capture_output=True,
     )
     assert result.returncode == 0, ".env should be gitignored"
+
+
+def test_compose_defines_vg_dashboard_service() -> None:
+    text = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "vg-dashboard:" in text
+    assert "Dockerfile.dashboard" in text
+    assert "./workspace:/workspace" in text
+    assert "./traces:/workspace/traces" in text
+    assert '"8787:8787"' in text or "8787:8787" in text
+    assert "VG_WORKSPACE_ROOT" in text
+    assert "VG_DASHBOARD_SERVE_UI" in text
+    assert (ROOT / "Dockerfile.dashboard").is_file()
+
+
+def test_docker_compose_config_exits_zero() -> None:
+    if which("docker") is None:
+        pytest.skip("docker not on PATH")
+    result = subprocess.run(
+        ["docker", "compose", "config"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout

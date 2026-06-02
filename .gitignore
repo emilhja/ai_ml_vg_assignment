@@ -5,6 +5,8 @@ __pycache__/
 *.egg-info/
 traces/
 fixtures/demo_repo/traces/
+!docs/demo/evidence/traces/
+!docs/demo/evidence/traces/**
 
 # Secrets and credentials
 .env

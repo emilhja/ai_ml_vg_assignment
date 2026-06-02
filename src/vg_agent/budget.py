@@ -102,6 +102,7 @@ class BudgetGuard:
     running_input_tokens: int = 0
     running_output_tokens: int = 0
     running_usd: float = 0.0
+    parent_step_count: int = 0
     step_count: int = 0
     last_tool_signature: tuple[str, str] | None = None
     repeat_count: int = 0
@@ -127,10 +128,17 @@ class BudgetGuard:
         price = config.PRICING_USD_PER_MTOK.get(model, config.UNKNOWN_MODEL_ESTIMATE_USD_PER_MTOK)
         return (input_tokens / 1_000_000) * price["input"] + (output_tokens / 1_000_000) * price["output"]
 
-    def before_model_call(self, model: str, worst_input_tokens: int, worst_output_tokens: int) -> BudgetDecision:
+    def before_model_call(
+        self,
+        model: str,
+        worst_input_tokens: int,
+        worst_output_tokens: int,
+        *,
+        enforce_parent_step_cap: bool = False,
+    ) -> BudgetDecision:
         with self.lock:
-            if self.step_count >= self.max_steps:
-                return BudgetDecision(False, "step_cap", {"steps": self.step_count, "max_steps": self.max_steps})
+            if enforce_parent_step_cap and self.parent_step_count >= self.max_steps:
+                return BudgetDecision(False, "step_cap", {"steps": self.parent_step_count, "max_steps": self.max_steps})
             if self.running_tokens + worst_input_tokens + worst_output_tokens > self.max_tokens:
                 return BudgetDecision(False, "token_cap", {"tokens": self.running_tokens, "max_tokens": self.max_tokens})
             worst_cost = self.estimate_cost(model, worst_input_tokens, worst_output_tokens)
@@ -143,6 +151,8 @@ class BudgetGuard:
     def record_model_call(self, model: str, input_tokens: int, output_tokens: int, cost_usd: float | None = None, agent_type: str = "parent") -> float:
         with self.lock:
             self.step_count += 1
+            if agent_type == "parent":
+                self.parent_step_count += 1
             self.running_tokens += input_tokens + output_tokens
             self.running_input_tokens += input_tokens
             self.running_output_tokens += output_tokens
@@ -177,9 +187,19 @@ class BudgetGuard:
             if "warn_tokens" not in self.warned and self.max_tokens > 0 and self.running_tokens >= config.WARN_TOKEN_FRACTION * self.max_tokens:
                 self.warned.add("warn_tokens")
                 out.append(BudgetDecision(True, "warn_tokens", {"running_tokens": self.running_tokens, "max_tokens": self.max_tokens, "crossed_at_step": self.step_count}))
-            if "warn_steps" not in self.warned and self.max_steps > 0 and self.step_count >= config.WARN_STEP_FRACTION * self.max_steps:
+            if "warn_steps" not in self.warned and self.max_steps > 0 and self.parent_step_count >= config.WARN_STEP_FRACTION * self.max_steps:
                 self.warned.add("warn_steps")
-                out.append(BudgetDecision(True, "warn_steps", {"step_count": self.step_count, "max_steps": self.max_steps, "crossed_at_step": self.step_count}))
+                out.append(
+                    BudgetDecision(
+                        True,
+                        "warn_steps",
+                        {
+                            "step_count": self.parent_step_count,
+                            "max_steps": self.max_steps,
+                            "crossed_at_step": self.parent_step_count,
+                        },
+                    )
+                )
             return out
 
     def should_offer_step_extend(self) -> bool:
@@ -188,7 +208,15 @@ class BudgetGuard:
                 return False
             if self.step_extend_prompted or self.max_steps <= 1:
                 return False
-            return self.step_count > 0 and self.step_count == self.max_steps - 1
+            return self.parent_step_count > 0 and self.parent_step_count == self.max_steps - 1
+
+    def at_final_step_reserve(self) -> bool:
+        """True when the parent should reserve the last step for synthesis (not spawns)."""
+        with self.lock:
+            # Only meaningful when the cap leaves room for work plus a finalize step.
+            if self.max_steps <= config.FINAL_STEP_RESERVE * 2:
+                return False
+            return self.parent_step_count >= self.max_steps - config.FINAL_STEP_RESERVE
 
     def mark_step_extend_prompted(self) -> None:
         with self.lock:
@@ -219,8 +247,8 @@ class BudgetGuard:
             if max_steps is not None:
                 if max_steps < 1:
                     return "max_steps must be >= 1"
-                if max_steps < self.step_count:
-                    return f"max_steps must be >= step_count ({self.step_count})"
+                if max_steps < self.parent_step_count:
+                    return f"max_steps must be >= step_count ({self.parent_step_count})"
                 self.max_steps = max_steps
             if max_tokens is not None:
                 if max_tokens < 1:
@@ -244,7 +272,7 @@ class BudgetGuard:
         """Raise a hard cap after interactive approval."""
         with self.lock:
             if reason == "step_cap":
-                self.max_steps = (self.step_count + 1) if once else (self.max_steps + max(5, self.max_steps // 4))
+                self.max_steps = (self.parent_step_count + 1) if once else (self.max_steps + max(5, self.max_steps // 4))
             elif reason == "token_cap":
                 bump = max(10_000, self.max_tokens // 4)
                 self.max_tokens = (self.running_tokens + bump) if once else (self.max_tokens + bump)

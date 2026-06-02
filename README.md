@@ -52,6 +52,28 @@ parallel summarise, Grilling clarification, cost-cap abort, safety blocks).
 docker compose run --rm -it vg-agent --chat --require-approval writes
 ```
 
+Or from Git Bash: `./start.sh` (builds `vg-agent`, seeds fixture, opens chat).
+
+### Trace Dashboard (Docker, persistent)
+
+Run the trace UI in a **separate** container so agent rebuilds (`./start.sh` or
+`docker compose build vg-agent`) do not stop it:
+
+```bash
+./start-dashboard.sh
+# Open http://127.0.0.1:8787
+```
+
+```powershell
+docker compose build vg-dashboard
+docker compose up -d vg-dashboard
+# docker compose logs -f vg-dashboard
+# docker compose stop vg-dashboard
+```
+
+Shares `./workspace` and `./traces` with the agent. No `OPENROUTER_API_KEY`
+required. For Vite hot reload, use `./start-web.sh` on the host instead.
+
 Chat prints a compact statusline before each prompt with the active model, latest
 parent context size, run token budget, step count, cost, approval events, and
 last run state. Use `/status` to print it on demand; `/budget`, `/finops`,

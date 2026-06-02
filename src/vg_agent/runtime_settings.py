@@ -29,6 +29,7 @@ KNOWN_ENV_VARS: tuple[str, ...] = (
     "VG_MAX_TOKENS_PER_RUN",
     "VG_APPROVAL_MODE",
     "VG_K_COMPACT",
+    "VG_MAX_OUTPUT_TOKENS",
     "VG_STRICT_MODEL_PRICING",
 )
 
@@ -157,6 +158,11 @@ def _apply_env() -> None:
     raw = os.environ.get("VG_K_COMPACT", "").strip()
     if raw:
         config.K_COMPACT = int(raw)
+    raw = os.environ.get("VG_MAX_OUTPUT_TOKENS", "").strip()
+    if raw:
+        parsed = int(raw)
+        if parsed > 0:
+            config.PARENT_MAX_OUTPUT_TOKENS = parsed
 
     _refresh_subagent_model_ids()
 

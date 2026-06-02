@@ -5,3 +5,5 @@ __pycache__/
 *.egg-info/
 fixtures/demo_repo/traces/
 traces/
+dashboard/web/node_modules/
+dashboard/web/dist/

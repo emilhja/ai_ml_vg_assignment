@@ -6,8 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from ..config import active_session_id_override, schema_ready
-from ..db import get_db
+from ..config import active_session_id_override
+from ..db import get_db, sqlite_usable
 from ..schemas import (
     ActiveSessionResponse,
     EventListResponse,
@@ -29,11 +29,14 @@ router = APIRouter(prefix="/sessions", tags=["sessions"])
 
 
 def _db_dep():
-    if not schema_ready():
+    if not sqlite_usable():
         yield None
         return
-    with get_db() as db:
-        yield db
+    try:
+        with get_db() as db:
+            yield db
+    except RuntimeError:
+        yield None
 
 
 @router.get("", response_model=SessionListResponse)

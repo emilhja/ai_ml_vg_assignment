@@ -36,8 +36,7 @@ def dashboard_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestCli
     bootstrap = TraceRecorder(tmp_path)
     bootstrap.emit("session_new")
     clear_path_cache()
-    db_module._engine = None
-    db_module._SessionLocal = None
+    db_module.reset_db_cache()
     trace_backfill._BACKFILLED.clear()
 
     from dashboard.api.main import app
@@ -45,8 +44,7 @@ def dashboard_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestCli
     client = TestClient(app)
     yield client
     clear_path_cache()
-    db_module._engine = None
-    db_module._SessionLocal = None
+    db_module.reset_db_cache()
     trace_backfill._BACKFILLED.clear()
 
 
@@ -71,8 +69,7 @@ def test_list_sessions_backfills_orphan_jsonl(
     import dashboard.api.db as db_module
 
     clear_path_cache()
-    db_module._engine = None
-    db_module._SessionLocal = None
+    db_module.reset_db_cache()
     trace_backfill._BACKFILLED.clear()
 
     response = dashboard_client.get("/api/v1/sessions")
@@ -80,6 +77,38 @@ def test_list_sessions_backfills_orphan_jsonl(
     row = next(item for item in response.json()["items"] if item["session_id"] == session_id)
     assert row["status"] != "jsonl_only"
     assert row["total_turns"] >= 1
+
+
+def test_active_session_with_corrupt_sqlite_and_no_backfill(
+    dashboard_client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import dashboard.api.db as db_module
+    from dashboard.api.paths import clear_path_cache
+    from dashboard.api.services import trace_backfill
+
+    traces = tmp_path / "traces"
+    traces.mkdir(parents=True, exist_ok=True)
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="from jsonl")
+    recorder.emit("run_end", final_status="ok")
+    session_id = str(recorder.session_id)
+
+    db_path = traces / "vg_agent.sqlite3"
+    db_path.write_bytes(b"not-a-valid-sqlite-file")
+    monkeypatch.setenv("VG_SQLITE_PATH", str(db_path))
+    monkeypatch.setenv("VG_DASHBOARD_NO_BACKFILL", "1")
+    clear_path_cache()
+    db_module.reset_db_cache()
+    trace_backfill._BACKFILLED.clear()
+
+    health = dashboard_client.get("/api/v1/health")
+    assert health.status_code == 200
+    assert health.json()["ok"] is False
+    assert "sqlite file exists" in (health.json().get("hint") or "").lower()
+
+    active = dashboard_client.get("/api/v1/sessions/active")
+    assert active.status_code == 200
+    assert active.json()["session_id"] == session_id
 
 
 def test_health(dashboard_client: TestClient, tmp_path: Path) -> None:

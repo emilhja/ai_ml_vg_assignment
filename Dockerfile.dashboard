@@ -1,0 +1,38 @@
+# VG Agent trace dashboard — API + built React UI on one port (8787).
+# Separate from Dockerfile (vg-agent) so agent rebuilds do not invalidate this image.
+
+FROM node:22-alpine AS web-build
+
+WORKDIR /build
+COPY dashboard/web/package.json dashboard/web/package-lock.json ./
+RUN npm ci
+COPY dashboard/web/ ./
+RUN npm run build
+
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV UV_PROJECT_ENVIRONMENT=/app/.venv
+ENV VG_DASHBOARD_HOST=0.0.0.0
+ENV VG_DASHBOARD_SERVE_UI=1
+
+COPY --from=ghcr.io/astral-sh/uv:0.5.31 /uv /usr/local/bin/uv
+
+RUN useradd --create-home --uid 1000 vg
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+COPY src ./src
+COPY dashboard ./dashboard
+COPY --from=web-build /build/dist ./dashboard/web/dist
+
+RUN uv sync --frozen --extra dashboard --no-dev
+
+WORKDIR /workspace
+USER vg
+
+EXPOSE 8787
+
+CMD ["/app/.venv/bin/uvicorn", "dashboard.api.main:app", "--host", "0.0.0.0", "--port", "8787"]

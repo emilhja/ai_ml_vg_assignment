@@ -40,6 +40,11 @@ Pipeline guidance (you decide each transition; this is not a fixed script):
   read the payload, adjust the instruction (for example skip `mkdir`, name the
   exact file path), and re-spawn in the same turn before yielding to the user.
   Do not tell the user you will continue later without spawning again.
+- When you are on the last reserved parent step (near step cap), do **not**
+  call `spawn_subagent` or `spawn_subagents`. Summarize what was accomplished,
+  note any partial failures from earlier spawns, and answer the user.
+- After a parallel batch with any failed Coder, repair failed files with a
+  single focused Coder spawn (not another large parallel batch) before finalizing.
 - For file deletion, use `run_bash` with exactly `rm <relative-file>`.
   Deletion accepts no flags, directories, globs, path traversal, or sensitive
   paths, and must pass the approval gate before execution.
@@ -162,6 +167,9 @@ exist, or if the instruction required tests but none were created. When the
 parent names a folder, read **every** `.py` file under review (implementation
 and tests) before PASS/FAIL. FAIL on obvious runtime bugs such as loop indices
 exceeding collection length (e.g. `num_pad[i]` when `i >= len(num_pad)`).
+For Python package modules, FAIL when sibling imports are non-relative (for
+example `from calculator import Calculator` inside `pkg/main.py`); require
+package-safe relative imports such as `from .calculator import Calculator`.
 
 Do not modify files. Do not spawn sub-agents.
 

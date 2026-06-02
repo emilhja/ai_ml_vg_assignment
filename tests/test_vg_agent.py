@@ -149,7 +149,12 @@ def test_budget_guard_reasons_and_costs() -> None:
     guard = BudgetGuard(max_steps=1)
     assert guard.before_model_call(config.PARENT_MODEL_ID, 100, 100).allowed
     guard.record_model_call(config.PARENT_MODEL_ID, 100, 100)
-    decision = guard.before_model_call(config.PARENT_MODEL_ID, 100, 100)
+    decision = guard.before_model_call(
+        config.PARENT_MODEL_ID,
+        100,
+        100,
+        enforce_parent_step_cap=True,
+    )
     assert not decision.allowed
     assert decision.budget_reason == "step_cap"
 
@@ -756,6 +761,47 @@ def test_live_loop_budget_abort_before_client_call(tmp_path: Path) -> None:
     assert events[-1]["final_status"] == "aborted"
 
 
+def test_parent_step_cap_ignores_subagent_model_calls(tmp_path: Path) -> None:
+    write_fixture(tmp_path)
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "spawn coder",
+                [ToolCall("spawn-coder", "spawn_subagent", {"type": "coder", "question": "create app.py"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("done", input_tokens=100, output_tokens=20),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn(
+                    "read context",
+                    [ToolCall("r1", "read_file", {"path": "README.md"})],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn(
+                    "write file",
+                    [ToolCall("w1", "write_file", {"path": "app.py", "content": "x = 1\n"})],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn("app.py: created file", input_tokens=40, output_tokens=10),
+            ]
+        },
+    )
+    recorder = TraceRecorder(tmp_path)
+    guard = BudgetGuard(max_steps=2)
+    run_live_task(tmp_path, "create app.py", recorder, client=client, guard=guard)
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "x = 1\n"
+    assert guard.parent_step_count == 2
+    assert guard.step_count > guard.parent_step_count
+
+
 def test_cli_exit_code_for_final_status() -> None:
     from vg_agent.__main__ import _exit_code_for_final_status
 
@@ -1111,14 +1157,73 @@ def test_parent_retries_after_subagent_tool_error(tmp_path: Path) -> None:
     run_live_task(tmp_path, "create app.py", recorder, client=client)
     events = read_events(recorder.path)
     spawns = [event for event in events if event["kind"] == "subagent_spawn" and event["agent_type"] == "coder"]
-    assert len(spawns) == 2
+    assert len(spawns) >= 2
     first_return = next(
         event
         for event in events
         if event["kind"] == "subagent_return" and event["child_agent_id"] == spawns[0]["child_agent_id"]
     )
     assert first_return["status"] == "tool_error"
+    assert any(
+        e.get("kind") == "budget_event" and e.get("budget_reason") == "coder_constrained_retry"
+        for e in events
+    )
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "x = 1\n"
+
+
+def test_parent_auto_constrained_retry_for_actionable_coder_tool_error(tmp_path: Path) -> None:
+    (tmp_path / "calc_haiku_2").mkdir(parents=True, exist_ok=True)
+    fail_turns = [
+        ModelTurn(
+            f"bad read {i}",
+            [ToolCall(f"bad-read-{i}", "read_file", {"path": "calc_haiku_2"})],
+            stop_reason="tool_use",
+            input_tokens=60,
+            output_tokens=20,
+        )
+        for i in range(config.MAX_SUBAGENT_STEPS)
+    ]
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "spawn coder",
+                [ToolCall("spawn-1", "spawn_subagent", {"type": "coder", "question": "Fix import in calc_haiku_2/main.py"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("import fixed", input_tokens=80, output_tokens=20),
+        ],
+        by_type={
+            "coder": fail_turns
+            + [
+                ModelTurn(
+                    "write fixed file",
+                    [ToolCall("fix-write", "write_file", {"path": "calc_haiku_2/main.py", "content": "from .calculator import Calculator\n"})],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn("calc_haiku_2/main.py: fixed import", input_tokens=40, output_tokens=10),
+            ]
+        },
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "fix import", recorder, client=client)
+    events = read_events(recorder.path)
+    coder_spawns = [e for e in events if e.get("kind") == "subagent_spawn" and e.get("agent_type") == "coder"]
+    assert len(coder_spawns) == 2
+    assert any(
+        e.get("kind") == "budget_event" and e.get("budget_reason") == "coder_constrained_retry"
+        for e in events
+    )
+    spawn_result = next(
+        e for e in events if e.get("kind") == "tool_result" and e.get("tool") == "spawn_subagent"
+    )
+    payload = json.loads(str(spawn_result["result_full"]))
+    assert payload["initial"]["status"] == "tool_error"
+    assert payload["retry"]["status"] == "ok"
+    assert (tmp_path / "calc_haiku_2" / "main.py").exists()
 
 
 def test_trace_event_sink_receives_progress_events(tmp_path: Path) -> None:
@@ -1311,6 +1416,235 @@ def test_parallel_cap_and_coder_conflict(tmp_path: Path) -> None:
     assert "conflict" in statuses  # second Coder serialised
     assert "tool_error" in statuses  # fifth request over the cap
     assert any(item["payload"] == "parallel cap exceeded" for item in payload)
+
+
+def test_near_cap_blocks_spawn_subagents(tmp_path: Path) -> None:
+    guard = BudgetGuard(max_steps=15)
+    guard.parent_step_count = 14
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "try spawn at cap",
+                [
+                    ToolCall(
+                        "spawn-many",
+                        "spawn_subagents",
+                        {
+                            "requests": [
+                                {"type": "explorer", "question": "list auth/"},
+                                {"type": "explorer", "question": "list utils.py"},
+                            ]
+                        },
+                    )
+                ],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn(
+                "calc_haiku_3 is ready with engine, ui, and main.",
+                input_tokens=80,
+                output_tokens=20,
+            ),
+        ],
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "finish calculator", recorder, client=client, guard=guard)
+    spawn_result = next(
+        e for e in read_events(recorder.path) if e["kind"] == "tool_result" and e["tool"] == "spawn_subagents"
+    )
+    payload = json.loads(str(spawn_result["result_full"]))
+    assert payload["status"] == "near_cap_blocked"
+    assert "final step" in payload["message"].lower()
+    assert not any(e["kind"] == "subagent_spawn" for e in read_events(recorder.path))
+
+
+def test_spawn_repetition_abort_on_identical_parallel_batch(tmp_path: Path) -> None:
+    same_requests = {
+        "requests": [
+            {"type": "explorer", "question": "auth/"},
+            {"type": "explorer", "question": "utils.py"},
+        ]
+    }
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "batch 1",
+                [ToolCall("s1", "spawn_subagents", dict(same_requests))],
+                stop_reason="tool_use",
+                input_tokens=50,
+                output_tokens=20,
+            ),
+            ModelTurn(
+                "batch 2",
+                [ToolCall("s2", "spawn_subagents", dict(same_requests))],
+                stop_reason="tool_use",
+                input_tokens=50,
+                output_tokens=20,
+            ),
+            ModelTurn(
+                "batch 3",
+                [ToolCall("s3", "spawn_subagents", dict(same_requests))],
+                stop_reason="tool_use",
+                input_tokens=50,
+                output_tokens=20,
+            ),
+            ModelTurn("stopped repeating.", input_tokens=40, output_tokens=10),
+        ],
+    )
+    recorder = TraceRecorder(tmp_path)
+    guard = BudgetGuard(max_steps=20)
+    run_live_task(tmp_path, "repeat parallel spawn", recorder, client=client, guard=guard)
+    events = read_events(recorder.path)
+    assert any(
+        e.get("kind") == "budget_event" and e.get("budget_reason") == "repetition_abort" for e in events
+    )
+    spawn_results = [e for e in events if e["kind"] == "tool_result" and e["tool"] == "spawn_subagents"]
+    assert len(spawn_results) == 3
+    assert "repetition_abort" in str(spawn_results[-1]["result_full"])
+
+
+def test_parallel_failed_coder_constrained_retry(tmp_path: Path) -> None:
+    (tmp_path / "calc_haiku_3").mkdir(parents=True, exist_ok=True)
+    fail_turns = [
+        ModelTurn(
+            f"bad read {i}",
+            [ToolCall(f"bad-read-{i}", "read_file", {"path": "calc_haiku_3"})],
+            stop_reason="tool_use",
+            input_tokens=60,
+            output_tokens=20,
+        )
+        for i in range(config.MAX_SUBAGENT_STEPS)
+    ]
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "parallel coder + explorer",
+                [
+                    ToolCall(
+                        "spawn-p",
+                        "spawn_subagents",
+                        {
+                            "requests": [
+                                {"type": "coder", "question": "Create calc_haiku_3/x.py with x=1"},
+                                {"type": "explorer", "question": "List calc_haiku_3 files"},
+                            ]
+                        },
+                    )
+                ],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("Files created.", input_tokens=80, output_tokens=20),
+        ],
+        by_type={
+            "coder": fail_turns
+            + [
+                ModelTurn(
+                    "write fixed",
+                    [ToolCall("fix-write", "write_file", {"path": "calc_haiku_3/x.py", "content": "x = 1\n"})],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn("calc_haiku_3/x.py: created", input_tokens=40, output_tokens=10),
+            ],
+        },
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "parallel coder retry", recorder, client=client)
+    events = read_events(recorder.path)
+    assert any(
+        e.get("kind") == "budget_event" and e.get("budget_reason") == "coder_constrained_retry" for e in events
+    )
+    spawn_result = next(e for e in events if e["kind"] == "tool_result" and e["tool"] == "spawn_subagents")
+    payload = json.loads(str(spawn_result["result_full"]))
+    coder_entry = next(item for item in payload if item.get("agent_type") == "coder")
+    assert "retry" in coder_entry
+    assert coder_entry["retry"]["status"] == "ok"
+    assert (tmp_path / "calc_haiku_3" / "x.py").read_text(encoding="utf-8") == "x = 1\n"
+
+
+def test_parallel_aborted_when_slice_exceeded(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    expensive = ModelTurn(
+        "inspect",
+        [ToolCall("read", "read_file", {"path": "app.py"})],
+        stop_reason="tool_use",
+        input_tokens=100,
+        output_tokens=50,
+        cost_usd=0.03,
+    )
+    cheap_done = ModelTurn("done", input_tokens=10, output_tokens=5, cost_usd=0.001)
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "parallel explore",
+                [
+                    ToolCall(
+                        "spawn-p",
+                        "spawn_subagents",
+                        {
+                            "requests": [
+                                {"type": "explorer", "question": "read app.py"},
+                                {"type": "explorer", "question": "read app.py again"},
+                            ]
+                        },
+                    )
+                ],
+                stop_reason="tool_use",
+                input_tokens=50,
+                output_tokens=20,
+            ),
+            ModelTurn("Partial parallel results noted.", input_tokens=50, output_tokens=20),
+        ],
+        by_type={"explorer": [expensive, cheap_done, expensive, cheap_done]},
+    )
+    guard = BudgetGuard(max_usd=0.05, max_tokens=100_000)
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "parallel slice", recorder, client=client, guard=guard)
+    events = read_events(recorder.path)
+    assert any(
+        e.get("kind") == "budget_event" and e.get("budget_reason") == "parallel_aborted" for e in events
+    )
+    payload = json.loads(
+        str(next(e for e in events if e["kind"] == "tool_result" and e["tool"] == "spawn_subagents")["result_full"])
+    )
+    assert any(item.get("status") == "parallel_aborted" for item in payload)
+
+
+def test_subagent_structured_summary_without_terminal_text(tmp_path: Path) -> None:
+    recorder = TraceRecorder(tmp_path)
+    client = PipelineClient(
+        parent_turns=[ModelTurn("done", input_tokens=10, output_tokens=5)],
+        by_type={
+            "coder": [
+                ModelTurn(
+                    "no tools",
+                    [],
+                    stop_reason="stop",
+                    input_tokens=10,
+                    output_tokens=5,
+                )
+            ]
+        },
+    )
+    guard = BudgetGuard()
+    summary, status, writes_ok, reads_ok, failure_reason = _run_live_subagent(
+        tmp_path,
+        "coder",
+        "write nothing",
+        recorder,
+        client,
+        guard,
+        "coder-test-1",
+        time.perf_counter(),
+        ApprovalPolicy(mode="off"),
+    )
+    assert status == "tool_error"
+    assert failure_reason == "no_write"
+    assert "reason=no_write" in summary
 
 
 def test_literal_tool_output_tail_preview_large_file(tmp_path: Path) -> None:
@@ -2851,7 +3185,7 @@ def test_coder_empty_turn_retries_then_writes_successfully(tmp_path: Path) -> No
     guard = BudgetGuard(max_steps=20, max_tokens=1_000_000, max_usd=10.0, daily_remaining_usd=10.0)
     policy = ApprovalPolicy(mode="off")
 
-    summary, status, writes_ok, _reads_ok = _run_live_subagent(
+    summary, status, writes_ok, _reads_ok, failure_reason = _run_live_subagent(
         tmp_path,
         "coder",
         "Create calc3/calculator.py",
@@ -2866,6 +3200,7 @@ def test_coder_empty_turn_retries_then_writes_successfully(tmp_path: Path) -> No
     assert status == "ok"
     assert writes_ok == 1
     assert "calc3/calculator.py" in summary
+    assert failure_reason is None
     assert (tmp_path / "calc3" / "calculator.py").exists()
     events = read_events(recorder.path)
     retry_events = [
@@ -2896,7 +3231,7 @@ def test_coder_truncated_turn_retries_then_writes_successfully(tmp_path: Path) -
     guard = BudgetGuard(max_steps=20, max_tokens=1_000_000, max_usd=10.0, daily_remaining_usd=10.0)
     policy = ApprovalPolicy(mode="off")
 
-    summary, status, writes_ok, _reads_ok = _run_live_subagent(
+    summary, status, writes_ok, _reads_ok, failure_reason = _run_live_subagent(
         tmp_path,
         "coder",
         "Create calc4/calculator.py",
@@ -2911,6 +3246,7 @@ def test_coder_truncated_turn_retries_then_writes_successfully(tmp_path: Path) -
     assert status == "ok"
     assert writes_ok == 1
     assert "calc4/calculator.py" in summary
+    assert failure_reason is None
     assert (tmp_path / "calc4" / "calculator.py").exists()
     events = read_events(recorder.path)
     retry_events = [
@@ -2931,7 +3267,7 @@ def test_coder_empty_turn_retries_exhausted_is_tool_error(tmp_path: Path) -> Non
     guard = BudgetGuard(max_steps=20, max_tokens=1_000_000, max_usd=10.0, daily_remaining_usd=10.0)
     policy = ApprovalPolicy(mode="off")
 
-    summary, status, writes_ok, _reads_ok = _run_live_subagent(
+    summary, status, writes_ok, _reads_ok, failure_reason = _run_live_subagent(
         tmp_path,
         "coder",
         "Create calc3/calculator.py",
@@ -2946,6 +3282,7 @@ def test_coder_empty_turn_retries_exhausted_is_tool_error(tmp_path: Path) -> Non
     assert status == "tool_error"
     assert writes_ok == 0
     assert "repeated empty responses" in summary
+    assert failure_reason == "no_terminal_summary"
     events = read_events(recorder.path)
     assert any(
         e.get("kind") == "budget_event" and e.get("budget_reason") == "subagent_empty_turn_abort"
@@ -3173,7 +3510,7 @@ def test_reviewer_verdict_fallback_on_step_exhaustion(tmp_path: Path) -> None:
     )
     policy = ApprovalPolicy(mode="writes", prompt=lambda _req: ApprovalOutcome(decision="denied", reason="no"))
 
-    summary, status, _writes_ok, _reads_ok = _run_live_subagent(
+    summary, status, _writes_ok, _reads_ok, _reason = _run_live_subagent(
         tmp_path,
         "reviewer",
         "verify README.md",
@@ -3199,7 +3536,7 @@ def test_reviewer_verdict_fallback_on_budget_cap_abort(tmp_path: Path) -> None:
     )
     policy = ApprovalPolicy(mode="writes", prompt=lambda _req: ApprovalOutcome(decision="denied", reason="no"))
 
-    summary, status, _writes_ok, _reads_ok = _run_live_subagent(
+    summary, status, _writes_ok, _reads_ok, _reason = _run_live_subagent(
         tmp_path,
         "reviewer",
         "verify README.md",

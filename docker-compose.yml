@@ -18,3 +18,26 @@ services:
     security_opt:
       - no-new-privileges
     pids_limit: 128
+
+  vg-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    working_dir: /workspace
+    environment:
+      VG_WORKSPACE_ROOT: "."
+      VG_DASHBOARD_HOST: "0.0.0.0"
+      VG_DASHBOARD_PORT: "8787"
+      VG_DASHBOARD_SERVE_UI: "1"
+      # Agent owns SQLite writes; dashboard reads JSONL/SQLite only.
+      VG_DASHBOARD_NO_BACKFILL: "1"
+    volumes:
+      - ./workspace:/workspace
+      - ./traces:/workspace/traces
+    ports:
+      - "8787:8787"
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges

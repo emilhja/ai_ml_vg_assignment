@@ -123,12 +123,36 @@ overlapping `subagent_spawn` events in the trace.
 - Coder may not be invoked in parallel with another Coder targeting the same
   workspace — the runtime serialises Coders by detecting overlapping write
   paths and returning `subagent_return{status:"conflict"}` for the second.
-- Each parallel sub-agent receives its own `BudgetGuard` slice equal to
-  `remaining_budget / len(requests)`. If any slice exceeds, the remaining
-  in-flight sub-agents are cancelled and one
-  `budget_event{reason:"parallel_aborted", offender_agent_id:"…"}` is emitted.
+- Each parallel sub-agent receives its own budget slice equal to
+  `remaining_run_budget / len(requests)` (USD and tokens from the shared
+  parent `BudgetGuard`). If any child exceeds its slice, the runtime sets a
+  batch abort flag, cancels remaining in-flight peers at the next safe
+  checkpoint, and emits one
+  `budget_event{budget_reason:"parallel_aborted", offender_agent_id:"…"}`.
+  Cancelled children return `subagent_return{status:"parallel_aborted"}`.
 - `subagent_spawn` and `subagent_return` events carry `started_at` and
   `ended_at` (UTC ISO-8601). Overlap is observable directly from the trace.
+
+### Near-cap finalization (parent step reserve)
+
+- `FINAL_STEP_RESERVE = 1`: when `parent_step_count >= max_steps - 1`, the
+  parent must not call `spawn_subagent` or `spawn_subagents` (reserved for
+  synthesis / user-facing completion). The runtime blocks these tools with a
+  soft `tool_result` payload (`near_cap_blocked`) so the parent can finalize
+  instead of burning the last step on new sub-agent work.
+- This is independent of the proactive `step_extend` offer at 14/15.
+
+### Parallel failure recovery
+
+- When `spawn_subagents` returns one or more non-`ok` Coder entries with an
+  actionable `failure_reason` (`invalid_path_kind`, `no_write`,
+  `no_terminal_summary`, blocked-shell reasons, generic `tool_error`), the
+  runtime performs a **bounded same-turn constrained retry** for each failed
+  Coder (max **2** retries per parent tool call) before the parent sees the
+  payload. Each retry emits `budget_event{budget_reason:"coder_constrained_retry"}`.
+- If retries are exhausted, the parent receives the failed payload plus
+  explicit recovery hints; it must not launch another parallel batch on the
+  final reserved step.
 
 ## Failure modes
 
@@ -141,7 +165,12 @@ Every `subagent_return` has a `status` field. The parent must branch on it.
 | `oversize` | return >2 KB after one retry instruction | use truncated payload, mark in final answer |
 | `tool_error` | a tool inside the sub-agent failed and the sub-agent exhausted `MAX_SUBAGENT_STEPS` without completing | sub-agent may retry within `MAX_SUBAGENT_STEPS` after a tool error; parent reads `reason`, decides retry vs. yield |
 | `conflict` | Coder write-path conflict | serialise: re-spawn after the prior Coder returns |
-| `parallel_aborted` | budget slice exceeded | yield with `run_end{final_status:"aborted"}` |
+| `parallel_aborted` | budget slice exceeded in a parallel batch | parent reads offender id; do not re-spawn in parallel on the reserved final step |
+| `near_cap_blocked` | parent at `max_steps - FINAL_STEP_RESERVE` tried to spawn | parent must synthesize and answer; no new spawns this turn |
+
+Sub-agent terminal summaries use structured reasons, e.g.
+`coder exited without summary (reason=no_terminal_summary)`, not a generic
+"stopped before producing a final summary" string.
 
 A failed sub-agent return is **never** silently dropped. Tests assert that
 every non-`ok` status produces either a follow-up `subagent_spawn` or a

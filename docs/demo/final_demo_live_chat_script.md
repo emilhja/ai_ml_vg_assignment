@@ -1,7 +1,3 @@
-# STILL TESTING
-make a calculator in tkinter in subfolder tkinter_calc
-
-
 # Final Demo Live Chat Script
 
 Goal: pass the VG live-demo requirement by proving every hard gate and all nine
@@ -43,8 +39,13 @@ Have these visible and ready:
 - A clean fixture workspace seeded before starting chat.
 - Pre-recorded dry-run values: [dry_run_notes.md](dry_run_notes.md) (step **N**,
   trace paths, `warn_usd` / hard-cap commands).
-- HG-1 approval checklist: [hg1_requirement_spec_status.md](hg1_requirement_spec_status.md).
-- HG-2 session exports: [hg2_prompt_evidence.md](hg2_prompt_evidence.md).
+- HG-1 approval record: [hg1_requirement_spec_status.md](hg1_requirement_spec_status.md)
+  (approved, recorded 2026-06-02).
+- HG-2 provenance evidence: [hg2_prompt_evidence.md](hg2_prompt_evidence.md);
+  show `specs/`, `plans/`, `docs/plans/`, `PROMPTS.md`, `MODEL_CONFIG.md`,
+  and the green generated-source reproducibility test.
+- Trace evidence index: [trace_evidence.md](trace_evidence.md), after the
+  trace-safety scan below.
 
 Setup commands:
 
@@ -55,6 +56,17 @@ New-Item -ItemType Directory -Force workspace,traces
 docker compose build
 docker compose run --rm vg-agent --seed-fixture
 ```
+
+Trace-safety scan before sharing or copying trace evidence:
+
+```powershell
+rg -n "sk-or-v1|OPENROUTER_API_KEY=.+|Bearer [A-Za-z0-9._-]+|AKIA[0-9A-Z]{16}|BEGIN (RSA|OPENSSH|PRIVATE) KEY" traces workspace\traces docs\demo\evidence
+```
+
+Expected outcome: no real provider key or private-key material. Demo fixture
+strings such as `fixture-secret` are not real API keys; if visible in a trace,
+call them fixture data and do not confuse them with `.env` secrets. Never open
+or export `.env` during the demo.
 
 Start the actual live chat:
 
@@ -510,17 +522,22 @@ Say:
 
 ## Prompt 9 - Trace Evidence For The Grader (VG-HG-0, VG-HG-4, S1/S2)
 
-Every run writes a JSONL trace under `traces/`. Open the trace for this chat session
-(statusline or `/status` prints the path) and inspect it:
+Every run writes a JSONL trace under `traces/` or `workspace/traces/`, depending
+on the process working directory and `VG_WORKSPACE_ROOT`. Open the trace for this
+chat session (statusline or `/status` prints the path) and inspect it:
 
 ```powershell
 Get-Content traces/<run_id>.jsonl | Select-Object -First 40
+# or, if the run wrote under workspace:
+Get-Content workspace\traces\<run_id>.jsonl | Select-Object -First 40
 ```
 
 Compaction-specific verification (Prompt 3 scene):
 
 ```powershell
 Select-String -Path traces\<run_id>.jsonl -Pattern '"kind": "compaction"'
+# or:
+Select-String -Path workspace\traces\<run_id>.jsonl -Pattern '"kind": "compaction"'
 ```
 
 On the matching line(s), confirm these JSON fields are present:
@@ -589,8 +606,9 @@ If asked about the weakest part:
 
 Before ending the demo, make sure the grader has seen:
 
-- [ ] Approved spec/pitch and build artifacts opened (VG-HG-0/1).
-- [ ] Generated-source / no-hand-written-code story stated (VG-HG-2).
+- [ ] Approved spec/pitch and build artifacts opened (VG-HG-0/1; approval recorded 2026-06-02).
+- [ ] Generated-source / no-hand-written-code story stated with repo-local markdown/spec/plans provenance and green reproducibility test (VG-HG-2).
+- [ ] Trace evidence secret scan completed; `.env` was not opened or exported.
 - [ ] Live chat running through Docker (VG.7, VG-HG-4).
 - [ ] Statusline / `/budget` showing tokens + USD live (VG.3).
 - [ ] Config file vs env-secret story: `config.example.toml`, `.env.example`,

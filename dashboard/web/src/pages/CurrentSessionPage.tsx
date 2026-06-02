@@ -37,8 +37,9 @@ export default function CurrentSessionPage() {
       <div className="space-y-2">
         <p className="text-red-400">Cannot reach dashboard API: {(error as Error).message}</p>
         <p className="text-sm text-muted">
-          Start the API on port 8787 and ensure Vite proxies <code className="text-xs">/api</code>{" "}
-          (npm run dev in dashboard/web).
+          Start the API on port 8787 (<code className="text-xs">./start-dashboard.sh</code> or{" "}
+          <code className="text-xs">./start-web.sh</code> for Vite on 5173 with{" "}
+          <code className="text-xs">/api</code> proxied).
         </p>
       </div>
     );

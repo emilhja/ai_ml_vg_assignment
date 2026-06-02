@@ -147,7 +147,7 @@ def _print_budget(guard: BudgetGuard) -> None:
     from .budget import format_usd_number
 
     sys.stdout.write(
-        f"steps {guard.step_count}/{guard.max_steps}  "
+        f"steps {guard.parent_step_count}/{guard.max_steps}  "
         f"session_tokens {guard.running_tokens}/{guard.max_tokens}  "
         f"usd {format_usd_number(guard.running_usd)}/{format_usd_number(guard.max_usd)}  "
         f"daily_remaining {format_usd_number(guard.daily_remaining_usd)}\n"

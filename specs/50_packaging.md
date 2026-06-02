@@ -22,9 +22,21 @@ approval policy) holds regardless of Docker.
 - Default entrypoint: `python -m vg_agent`. `CMD` left empty so the user
   passes the task on the command line.
 
+## Dockerfile.dashboard
+
+Optional trace-analysis UI (`specs/70_dashboard.md`). Separate from the agent
+image so `docker compose build vg-agent` does not invalidate the dashboard cache.
+
+- Stage 1: `node:22-alpine` — `npm ci` + `npm run build` in `dashboard/web/`.
+- Stage 2: `python:3.12-slim` — `uv sync --frozen --extra dashboard`, copy
+  `src/`, `dashboard/`, and built `dashboard/web/dist/`.
+- `VG_DASHBOARD_HOST=0.0.0.0`, `VG_DASHBOARD_SERVE_UI=1` baked in.
+- `WORKDIR /workspace`; `CMD` uvicorn on port 8787 (no `--reload`).
+
 ## docker-compose.yml
 
-A single live service runs every demo:
+Two services share the same workspace/trace mounts; only `vg-agent` needs
+`OPENROUTER_API_KEY`.
 
 ```yaml
 services:
@@ -33,8 +45,6 @@ services:
     working_dir: /workspace
     environment:
       VG_WORKSPACE_ROOT: "."
-    # bridged network for OpenRouter only; the agent's egress pin rejects
-    # any non-openrouter.ai endpoint even if the network allows it.
     volumes:
       - ./workspace:/workspace
       - ./traces:/workspace/traces
@@ -44,10 +54,34 @@ services:
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges"]
     pids_limit: 128
+
+  vg-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    working_dir: /workspace
+    environment:
+      VG_WORKSPACE_ROOT: "."
+      VG_DASHBOARD_HOST: "0.0.0.0"
+      VG_DASHBOARD_PORT: "8787"
+      VG_DASHBOARD_SERVE_UI: "1"
+    volumes:
+      - ./workspace:/workspace
+      - ./traces:/workspace/traces
+    ports:
+      - "8787:8787"
+    restart: unless-stopped
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges"]
 ```
 
 - `vg-agent` runs the live agent against OpenRouter; every scene in
-  `specs/70_demo_runbook.md` uses it.
+  `specs/70_demo_runbook.md` uses it. Started with `docker compose run --rm`
+  (ephemeral). [`start.sh`](start.sh) builds only this service.
+- `vg-dashboard` serves API + built React on **http://127.0.0.1:8787**.
+  Started with `docker compose up -d vg-dashboard` via [`start-dashboard.sh`](start-dashboard.sh).
+  Stays running across agent image rebuilds and chat sessions. No `env_file` /
+  API key required.
 - `working_dir` is `/workspace` with `VG_WORKSPACE_ROOT=.` so traces and SQLite
   land in `/workspace/traces` (host `./traces`), not a nested
   `/workspace/workspace/traces` path.

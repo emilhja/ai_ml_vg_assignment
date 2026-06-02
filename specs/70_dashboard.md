@@ -8,12 +8,15 @@ the audit source; SQLite is the primary query store (`specs/60_observability.md`
 
 - **In scope:** `dashboard/api/` (Python), `dashboard/web/` (Vite/React/Tailwind),
   optional `[dashboard]` deps in `pyproject.toml`, `start-web.sh` (Git Bash / WSL),
-  `scripts/run_dashboard.ps1` (PowerShell).
-- **Out of scope:** Docker sidecar, hosted multi-user auth, run compare, export PDF.
+  `scripts/run_dashboard.ps1` (PowerShell), Docker production path
+  (`Dockerfile.dashboard`, `vg-dashboard` Compose service, `start-dashboard.sh`).
+- **Out of scope:** Vite HMR inside Docker, hosted multi-user auth, run compare,
+  export PDF.
 
 ## Security
 
-- Bind API to `127.0.0.1` only.
+- Bind API to `127.0.0.1` on the host (local dev). Docker service binds
+  `0.0.0.0` inside the container only; publish `8787:8787` to localhost.
 - No authentication in v1 (local machine).
 - UI shows a warning that traces may contain redacted-but-sensitive content.
 - API must not log full `payload_json` bodies.
@@ -28,6 +31,8 @@ the audit source; SQLite is the primary query store (`specs/60_observability.md`
 | `VG_ACTIVE_SESSION_ID` | unset | Force active session for live tab |
 | `VG_DASHBOARD_HOST` | `127.0.0.1` | Uvicorn bind |
 | `VG_DASHBOARD_PORT` | `8787` | API port |
+| `VG_DASHBOARD_SERVE_UI` | unset | When `1`/`true`/`yes` and `dashboard/web/dist/index.html` exists, serve the built React app from this process (Docker / single-port production) |
+| `VG_DASHBOARD_NO_BACKFILL` | unset | When `1`/`true`/`yes`, never write JSONL into the agent SQLite file (required for Docker sidecar while the agent is running) |
 
 SQLite path: resolved automatically — `workspace/traces/vg_agent.sqlite3` if it
 has the mirror schema, otherwise `traces/vg_agent.sqlite3` at the repo root
@@ -281,3 +286,10 @@ Node: Vite, React, Tailwind, TanStack Query, React Router, Recharts.
 **Local dev:** from repo root run `./start-web.sh` (Git Bash / WSL) so uvicorn’s
 cwd resolves `traces/` correctly; use `scripts/run_dashboard.ps1` on PowerShell.
 Do not start the API from `dashboard/web` without `VG_TRACES_DIR` / `VG_SQLITE_PATH`.
+
+**Docker (persistent):** `./start-dashboard.sh` builds `vg-dashboard` (when needed)
+and runs `docker compose up -d vg-dashboard`. Open http://127.0.0.1:8787 — API and
+UI share one origin (`/api/v1` relative paths). Uses the same `./workspace` and
+`./traces` mounts as `vg-agent` (`VG_WORKSPACE_ROOT=.`). Rebuilding or restarting
+the agent container does not stop the dashboard. Rebuild the dashboard image only
+after UI/API changes: `docker compose build vg-dashboard && docker compose up -d vg-dashboard`.

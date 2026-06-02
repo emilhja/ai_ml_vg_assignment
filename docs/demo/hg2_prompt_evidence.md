@@ -10,21 +10,33 @@ hand-written) and that **chat sessions can be shown on request**.
 > `python scripts/generate_project.py --clean`. Provenance is verified by
 > `test_generated_source_reproducible` in CI.
 
+The human-authored surface for this submission is markdown/spec/planning text
+plus local `.env` secrets. Executable agent code is not treated as the authored
+source of truth; it must be reproducible from the repo-local generation inputs.
+
 ## In-repo evidence (always available)
 
 | Evidence | Path |
 |----------|------|
 | Spec-first contract | [specs/05_source_of_truth_and_generation.md](../../specs/05_source_of_truth_and_generation.md) |
+| Approved requirement spec | [specs/00_overview.md](../../specs/00_overview.md) + linked `specs/*.md` |
 | System prompts fed to generator | [PROMPTS.md](../../PROMPTS.md) |
 | Model IDs and pricing | [MODEL_CONFIG.md](../../MODEL_CONFIG.md) |
+| Planning / prompting record | [plans/](../../plans/) + [docs/plans/](../../docs/plans/) |
 | Generator + embedded templates | [scripts/generate_project.py](../../scripts/generate_project.py) |
 | Digest pinned in generated code | `SPEC_DIGEST` in `src/vg_agent/__init__.py` |
 | Reproducibility test | `tests/test_vg_agent.py::test_generated_source_reproducible` |
 
-## Chat sessions to export (prepare before exam)
+## Prompt/session evidence to show
 
-Export or screenshot **Cursor / Claude / Codex** sessions that show you
-*prompting* the build, not typing Python by hand. Suggested bundles:
+The strongest always-available evidence is the repo-local markdown trail:
+`specs/`, `plans/`, `docs/plans/`, `PROMPTS.md`, `MODEL_CONFIG.md`, and this
+demo folder. These files show prompting/specification work and the generated
+runtime can be checked against them.
+
+If the examiner asks for external chat sessions, screen-share Cursor / Claude /
+Codex history that shows you prompting the build, not typing Python by hand.
+Suggested bundles:
 
 1. **Initial architecture** — sessions where you defined sub-agents, compaction,
    and budget design (maps to early `specs/` commits).
@@ -51,6 +63,8 @@ to screen-share without scrolling.
   tests fail.
 - If the examiner asks for a specific file's origin, trace: spec markdown →
   generator template → generated file → `SPEC_DIGEST` match.
+- Do not show or export `.env`; it is local secret material and is excluded from
+  provenance evidence.
 
 ## Quick verification command
 

@@ -2,7 +2,14 @@
 
 Constants:
 
-- `MAX_PARENT_STEPS = 15`
+- `MAX_PARENT_STEPS = 15` (counts parent model turns only; sub-agent and compactor
+  turns do not consume this cap)
+- `FINAL_STEP_RESERVE = 1` (when `max_steps > 2` and
+  `parent_step_count >= max_steps - 1`, block parent `spawn_subagent` /
+  `spawn_subagents` so the last step is reserved for synthesis; returns soft
+  `near_cap_blocked` payload)
+- `MAX_PARALLEL_CODER_RETRIES_PER_CALL = 2` (bounded constrained retries after
+  `spawn_subagents` when Coder children return actionable `tool_error`)
 - `MAX_SUBAGENT_STEPS = 8`
 - `MAX_SUBAGENT_DEPTH = 1`
 - `MAX_PARALLEL_SUBAGENTS = 4`
@@ -15,6 +22,7 @@ Constants:
 - `WALL_CLOCK_TIMEOUT = 120`
 - `TOOL_TIMEOUT = 30`
 - `K_COMPACT = 4000`
+- `PARENT_MAX_OUTPUT_TOKENS = 4096` (per-turn output cap for the parent model loop; also the worst-case output used by the budget preflight; overridable via `VG_MAX_OUTPUT_TOKENS`)
 - `COMPACTOR_MAX_OUTPUT_TOKENS = 400`
 - `COMPACTOR_MAX_INPUT_CHARS = 120_000` (payload cap sent to compactor; remainder noted with trace pointer)
 - `COMPACTOR_MAX_SUMMARY_TOKENS = 300`
@@ -63,7 +71,8 @@ Budget events:
   Details include `openrouter_provider`, `model_id`, `step_idx`, `agent_id`,
   `cost_usd`.
 - `warn_*` reasons are emitted **once** when their respective fraction is
-  first crossed; they do not abort the run.
+  first crossed; they do not abort the run. `warn_steps` uses parent-step
+  progress (`parent_step_count / MAX_PARENT_STEPS`).
 - **Proactive step extend** (`step_extend`): when interactive approval is
   configured and `STEP_EXTEND_PROMPT_ON_LAST_STEP` is enabled, the parent loop
   may offer **once per run** to raise `max_steps` immediately before the next
@@ -72,7 +81,14 @@ Budget events:
   from `warn_steps` (80% log-only).
 - `parallel_aborted` is emitted when any per-slice budget is exceeded inside
   a parallel `spawn_subagents` call; remaining in-flight sub-agents are
-  cancelled.
+  cancelled at the next sub-agent loop checkpoint.
+- `coder_constrained_retry` is emitted when the runtime auto-retries a failed
+  Coder spawn (single or parallel batch) with a stricter constrained instruction
+  after actionable sub-agent tool errors.
+- **Spawn repetition guard:** `record_tool_signature` applies to
+  `spawn_subagent` and `spawn_subagents` (normalized request payload). Three
+  identical spawn signatures in a row emit `repetition_abort` (same as
+  `run_bash`).
 - Live model calls must check budget before each LiteLLM/OpenRouter request
   using a conservative token estimate and record actual returned usage
   afterward. If OpenRouter/LiteLLM returns explicit USD cost, use it;

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 from .config import dashboard_host, dashboard_port
 from .routes import health, runs, sessions, stats_route
@@ -55,28 +59,48 @@ def _log_resolved_paths() -> None:
 _UI_DEV_URL = "http://127.0.0.1:5173"
 
 
-@app.get("/", include_in_schema=False)
-def root() -> RedirectResponse:
-    """Browser hint: the React UI is served by Vite, not this API process."""
-    return RedirectResponse(url=_UI_DEV_URL, status_code=307)
+def _ui_dist_dir() -> Path | None:
+    dist = Path(__file__).resolve().parents[1] / "web" / "dist"
+    if (dist / "index.html").is_file():
+        return dist
+    return None
+
+
+def _serve_built_ui() -> bool:
+    flag = os.environ.get("VG_DASHBOARD_SERVE_UI", "").strip().lower()
+    return flag in ("1", "true", "yes") and _ui_dist_dir() is not None
 
 
 @app.get("/api", include_in_schema=False)
 def api_index() -> JSONResponse:
-    return JSONResponse(
-        {
-            "service": "vg-agent-dashboard-api",
-            "docs": "/docs",
-            "health": f"{API_PREFIX}/health",
-            "ui_dev": _UI_DEV_URL,
-            "note": "Run `npm run dev` in dashboard/web, then open the UI URL above.",
-        }
-    )
+    body: dict[str, str] = {
+        "service": "vg-agent-dashboard-api",
+        "docs": "/docs",
+        "health": f"{API_PREFIX}/health",
+    }
+    if _serve_built_ui():
+        body["ui"] = "/"
+        body["note"] = "React UI is served from this process (production / Docker)."
+    else:
+        body["ui_dev"] = _UI_DEV_URL
+        body["note"] = "Run `npm run dev` in dashboard/web, then open the UI URL above."
+    return JSONResponse(body)
 
 
-@app.get("/favicon.ico", include_in_schema=False)
-def favicon() -> Response:
-    return Response(status_code=204)
+if not _serve_built_ui():
+
+    @app.get("/", include_in_schema=False)
+    def root() -> RedirectResponse:
+        """Browser hint: the React UI is served by Vite, not this API process."""
+        return RedirectResponse(url=_UI_DEV_URL, status_code=307)
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    def favicon() -> Response:
+        return Response(status_code=204)
+else:
+    _dist = _ui_dist_dir()
+    assert _dist is not None
+    app.mount("/", StaticFiles(directory=str(_dist), html=True), name="ui")
 
 
 def run() -> None:
