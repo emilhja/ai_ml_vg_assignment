@@ -57,6 +57,7 @@ def _normalise_agent_type(value: object) -> str:
 
 GATED_WRITES = {"write_file", "edit_file", "run_bash", "run_tests", "spawn_subagent", "spawn_subagents"}
 SOFT_RECOVERABLE_PARENT_TOOLS = {"run_tests"}
+TERMINAL_APPROVAL_FAILURE_REASONS = frozenset({"approval_denied", "approval_aborted"})
 GATED_ALL = {"read_file", "read_file_range"} | GATED_WRITES
 BUDGET_CAP_TOOL = "budget_cap"
 
@@ -1085,6 +1086,10 @@ def _is_impl_file_path(path: str) -> bool:
 
 def _subagent_error_reason_from_tool_result(tool_name: str, result_text: str) -> str:
     text = str(result_text or "").lower()
+    if text.startswith("approval denied:"):
+        return "approval_denied"
+    if text == "approval aborted by user":
+        return "approval_aborted"
     if tool_name in {"read_file", "read_file_range"} and ("is a directory" in text or "not a regular file" in text):
         return "invalid_path_kind"
     if tool_name == "run_bash" and "shell control or redirection marker" in text:
@@ -1420,8 +1425,13 @@ def _run_live_subagent(
             if result["status"] != "ok":
                 had_tool_error = True
                 failure_reason = _subagent_error_reason_from_tool_result(c.name, str(result["result_full"]))
+                if failure_reason in TERMINAL_APPROVAL_FAILURE_REASONS:
+                    status = "tool_error"
+                    completed = True
                 break
         messages.append({"role": "user", "content": tool_blocks})
+        if failure_reason in TERMINAL_APPROVAL_FAILURE_REASONS:
+            break
 
     if agent_type == "reviewer" and not _is_reviewer_verdict(final_summary):
         # Contract: reviewer `subagent_return.payload` must start with
@@ -1669,6 +1679,8 @@ def _should_retry_coder_spawn(payload: dict[str, object], *, retry_used: bool) -
     if str(payload.get("status") or "") != "tool_error":
         return False
     reason = str(payload.get("failure_reason") or "")
+    if reason in TERMINAL_APPROVAL_FAILURE_REASONS:
+        return False
     return reason in {
         "invalid_path_kind",
         "blocked_shell_control",
@@ -1687,6 +1699,29 @@ def _constrained_retry_question(original_question: str, reason: str) -> str:
         "Return only after at least one successful write_file or edit_file."
     )
     return f"{original_question}\n\nFailure reason from previous attempt: {reason}\n{constraints}"
+
+
+def _is_terminal_coder_approval_failure(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("agent_type") or "") != "coder":
+        return False
+    if str(payload.get("status") or "") != "tool_error":
+        return False
+    return str(payload.get("failure_reason") or "") in TERMINAL_APPROVAL_FAILURE_REASONS
+
+
+def _contains_terminal_coder_approval_failure(payload: object) -> bool:
+    if _is_terminal_coder_approval_failure(payload):
+        return True
+    if isinstance(payload, list):
+        return any(_contains_terminal_coder_approval_failure(item) for item in payload)
+    if isinstance(payload, dict):
+        return any(
+            _contains_terminal_coder_approval_failure(payload.get(key))
+            for key in ("initial", "retry")
+        )
+    return False
 
 
 def _parallel_spawn_question(entry: dict[str, object]) -> str:
@@ -1883,6 +1918,7 @@ def run_live_task(
 
         tool_blocks: list[dict[str, Any]] = []
         for call in turn.tool_calls:
+            terminal_coder_approval_failure = False
             result = _execute_live_tool(
                 root=root,
                 call=call,
@@ -1911,6 +1947,9 @@ def run_live_task(
                         started,
                         policy,
                     )
+                    terminal_coder_approval_failure = _contains_terminal_coder_approval_failure(
+                        retried
+                    )
                     if any(
                         "retry" in item
                         for item in retried
@@ -1922,6 +1961,9 @@ def run_live_task(
                         }
             if call.name == "spawn_subagent":
                 payload = _parse_spawn_payload(result)
+                terminal_coder_approval_failure = _contains_terminal_coder_approval_failure(
+                    payload
+                )
                 if isinstance(payload, dict) and _should_retry_coder_spawn(payload, retry_used=constrained_coder_retry_used):
                     retry_question = _constrained_retry_question(
                         str(call.args.get("question") or ""),
@@ -1976,6 +2018,15 @@ def run_live_task(
                     f"trace pointer {recorder.run_id}:event:{event['event_idx']}]"
                 )
             tool_blocks.append({"type": "tool_result", "tool_use_id": call.tool_use_id, "content": content, "is_error": result["status"] != "ok"})
+            if terminal_coder_approval_failure:
+                recorder.emit(
+                    "run_end",
+                    final_status="tool_error",
+                    total_cost_usd=round(guard.running_usd, 6),
+                    total_tokens=guard.running_tokens,
+                    duration_s=round(time.perf_counter() - started, 3),
+                )
+                return recorder
             if result["status"] != "ok":
                 if call.name not in SOFT_RECOVERABLE_PARENT_TOOLS:
                     recorder.emit(

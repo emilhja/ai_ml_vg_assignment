@@ -1388,6 +1388,172 @@ def test_parent_auto_constrained_retry_for_actionable_coder_tool_error(tmp_path:
     assert (tmp_path / "calc_haiku_2" / "main.py").exists()
 
 
+def test_coder_approval_denial_stops_same_turn_retry(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("from auth.middleware import require_auth\n", encoding="utf-8")
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "spawn coder",
+                [
+                    ToolCall(
+                        "spawn-1",
+                        "spawn_subagent",
+                        {
+                            "type": "coder",
+                            "question": "prepend a to app.py",
+                        },
+                    )
+                ],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn(
+                "should not continue",
+                [ToolCall("find-app", "run_bash", {"command": 'find . -maxdepth 2 -name "app.py"'})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn(
+                    "try edit",
+                    [
+                        ToolCall(
+                            "edit-1",
+                            "edit_file",
+                            {
+                                "path": "app.py",
+                                "old": "from auth.middleware import require_auth",
+                                "new": "afrom auth.middleware import require_auth",
+                            },
+                        )
+                    ],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn(
+                    "should not fallback",
+                    [
+                        ToolCall(
+                            "write-1",
+                            "write_file",
+                            {
+                                "path": "app.py",
+                                "content": "afrom auth.middleware import require_auth\n",
+                            },
+                        )
+                    ],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+            ]
+        },
+    )
+
+    def approve_spawn_only(request: ApprovalRequest) -> ApprovalOutcome:
+        if request.tool == "spawn_subagent":
+            return ApprovalOutcome(decision="approved", reason="test approve spawn")
+        return ApprovalOutcome(decision="denied", reason="user no")
+
+    recorder = TraceRecorder(tmp_path)
+    policy = ApprovalPolicy(mode="writes", prompt=approve_spawn_only)
+    run_live_task(tmp_path, "add an a as first character in app.py", recorder, client=client, policy=policy)
+    events = read_events(recorder.path)
+
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "from auth.middleware import require_auth\n"
+    assert len([e for e in events if e.get("kind") == "subagent_spawn" and e.get("agent_type") == "coder"]) == 1
+    assert not any(e.get("kind") == "budget_event" and e.get("budget_reason") == "coder_constrained_retry" for e in events)
+    assert len(client.parent_turns) == 1
+    assert len(client.by_type["coder"]) == 1
+    coder_return = next(e for e in events if e.get("kind") == "subagent_return")
+    assert coder_return["failure_reason"] == "approval_denied"
+    assert events[-1]["kind"] == "run_end"
+    assert events[-1]["final_status"] == "tool_error"
+
+
+def test_parallel_coder_approval_denial_is_not_retried(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "parallel coder + explorer",
+                [
+                    ToolCall(
+                        "spawn-p",
+                        "spawn_subagents",
+                        {
+                            "requests": [
+                                {"type": "coder", "question": "change app.py to x = 2"},
+                                {"type": "explorer", "question": "inspect app.py"},
+                            ]
+                        },
+                    )
+                ],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("should not continue", input_tokens=80, output_tokens=20),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn(
+                    "try edit",
+                    [
+                        ToolCall(
+                            "edit-1",
+                            "edit_file",
+                            {"path": "app.py", "old": "x = 1", "new": "x = 2"},
+                        )
+                    ],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn(
+                    "should not retry",
+                    [
+                        ToolCall(
+                            "write-1",
+                            "write_file",
+                            {"path": "app.py", "content": "x = 2\n"},
+                        )
+                    ],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+            ]
+        },
+    )
+
+    def approve_batch_only(request: ApprovalRequest) -> ApprovalOutcome:
+        if request.tool == "spawn_subagents":
+            return ApprovalOutcome(decision="approved", reason="test approve batch")
+        return ApprovalOutcome(decision="denied", reason="user no")
+
+    recorder = TraceRecorder(tmp_path)
+    policy = ApprovalPolicy(mode="writes", prompt=approve_batch_only)
+    run_live_task(tmp_path, "parallel edit app.py and inspect it", recorder, client=client, policy=policy)
+    events = read_events(recorder.path)
+
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "x = 1\n"
+    assert len([e for e in events if e.get("kind") == "subagent_spawn" and e.get("agent_type") == "coder"]) == 1
+    assert not any(e.get("kind") == "budget_event" and e.get("budget_reason") == "coder_constrained_retry" for e in events)
+    spawn_result = next(e for e in events if e.get("kind") == "tool_result" and e.get("tool") == "spawn_subagents")
+    payload = json.loads(str(spawn_result["result_full"]))
+    coder_entry = next(item for item in payload if item.get("agent_type") == "coder")
+    assert "retry" not in coder_entry
+    assert coder_entry["failure_reason"] == "approval_denied"
+    assert events[-1]["kind"] == "run_end"
+    assert events[-1]["final_status"] == "tool_error"
+
+
 def test_trace_event_sink_receives_progress_events(tmp_path: Path) -> None:
     seen: list[dict[str, object]] = []
     recorder = TraceRecorder(tmp_path, event_sink=seen.append)
@@ -2240,7 +2406,8 @@ def test_documented_generation_command(tmp_path: Path) -> None:
         capture_output=True,
     )
     assert (sandbox / "src" / "vg_agent" / "agent.py").exists()
-    assert (sandbox / "fixtures" / "demo_repo" / "data" / "sample.log").stat().st_size > 200_000
+    sample_log_size = (sandbox / "fixtures" / "demo_repo" / "data" / "sample.log").stat().st_size
+    assert 200_000 < sample_log_size < 600_000
 
 
 def test_find_exec_and_delete_blocked() -> None:
@@ -2631,6 +2798,58 @@ def test_literal_tool_output_fallback_for_listing_requests(tmp_path: Path) -> No
 
     outputs = _literal_tool_outputs(recorder.events, 0, "list all files", "Here is the list of files.")
     assert outputs == ["Tool output (ls -l):\ntotal 1\n-rw-r--r-- 1 user user 7 app.py"]
+
+
+def test_literal_tool_output_keeps_file_read_echoed_in_answer(tmp_path: Path) -> None:
+    """A ``show <file>`` read still surfaces its panel even when the model
+    pastes the same content into its prose answer."""
+    recorder = TraceRecorder(tmp_path)
+    file_body = "from auth.middleware import require_auth\n\ndef foo():\n    return 1"
+    recorder.emit("user_prompt", prompt="show app.py")
+    recorder.emit("tool_call", tool="read_file", tool_use_id="read-app", args={"path": "app.py"})
+    recorder.emit(
+        "tool_result",
+        tool="read_file",
+        tool_use_id="read-app",
+        result_full=file_body,
+        bytes=len(file_body.encode()),
+        tokens=20,
+        latency_ms=1,
+        status="ok",
+    )
+    answer = f"Here is the contents of `app.py`:\n\n```python\n{file_body}\n```\n\nIt defines `foo`."
+    recorder.emit("assistant_step", assistant_text=answer, tool_calls=[], stop_reason="end_turn")
+
+    from vg_agent.__main__ import _literal_tool_outputs
+
+    outputs = _literal_tool_outputs(recorder.events, 0, "show app.py", answer)
+    assert len(outputs) == 1
+    assert outputs[0].startswith("Tool output (app.py):\n")
+    assert "def foo():" in outputs[0]
+
+
+def test_literal_tool_output_still_suppresses_run_bash_echoed_in_answer(tmp_path: Path) -> None:
+    """Non-file tools (run_bash) remain suppressed when the answer quotes them."""
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="grep foo")
+    recorder.emit("tool_call", tool="run_bash", tool_use_id="bash-1", command="grep foo app.py", args={})
+    recorder.emit(
+        "tool_result",
+        tool="run_bash",
+        tool_use_id="bash-1",
+        result_full="app.py:def foo():",
+        bytes=18,
+        tokens=8,
+        latency_ms=1,
+        status="ok",
+    )
+    answer = "I found one match: app.py:def foo():"
+    recorder.emit("assistant_step", assistant_text=answer, tool_calls=[], stop_reason="end_turn")
+
+    from vg_agent.__main__ import _literal_tool_outputs
+
+    outputs = _literal_tool_outputs(recorder.events, 0, "grep foo", answer)
+    assert outputs == []
 
 
 def test_literal_tool_output_includes_read_errors(tmp_path: Path) -> None:
@@ -3125,7 +3344,7 @@ def test_chat_status_slash_command_writes_report(tmp_path: Path, monkeypatch: py
         "print_chat_dashboard_cleared",
         lambda **_k: dashboard_calls.append(True),
     )
-    monkeypatch.setattr(cli, "render_input_top_rule", lambda: None)
+    monkeypatch.setattr(cli, "render_chat_prompt_ready", lambda **_k: None)
     monkeypatch.setattr(cli, "render_input_bottom_and_footer", lambda **_k: None)
 
     prompts = iter(["/status", "/exit"])
@@ -3145,6 +3364,89 @@ def test_chat_status_slash_command_writes_report(tmp_path: Path, monkeypatch: py
     out = buffer.getvalue()
     assert "steps " in out
     assert "trace:" in out
+
+
+def test_chat_loop_isolates_read_only_followup_after_denied_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vg_agent import __main__ as cli
+
+    monkeypatch.setattr(cli, "use_rich_ui", lambda: False)
+    monkeypatch.setattr(cli.LiveModelClient, "from_env", lambda **_k: object())
+
+    prompts = iter(
+        [
+            'add function debug_info() to app.py that returns "debug"; make the smallest edit',
+            "show app.py",
+            "/exit",
+        ]
+    )
+    monkeypatch.setattr(cli, "_make_chat_prompt", lambda _history_path: (lambda: next(prompts), lambda: None))
+
+    history_lengths: list[int] = []
+
+    def fake_run_live_task(
+        root: Path,
+        task: str,
+        recorder: TraceRecorder,
+        *,
+        client: object,
+        guard: BudgetGuard,
+        policy: ApprovalPolicy,
+        history: list[dict[str, object]],
+    ) -> TraceRecorder:
+        history_lengths.append(len(history))
+        history.append({"role": "user", "content": task})
+        recorder.emit("user_prompt", prompt=task, live_model=True)
+        if task.startswith("add function"):
+            recorder.emit(
+                "approval",
+                tool="spawn_subagent",
+                tool_use_id="spawn-1",
+                decision="denied",
+                reason="user no",
+            )
+            recorder.emit("run_end", final_status="tool_error", total_tokens=1, total_cost_usd=0.0)
+        else:
+            recorder.emit(
+                "assistant_step",
+                agent_id="parent",
+                model="fake",
+                model_id="fake",
+                step_idx=1,
+                assistant_text="app.py contents",
+                tool_calls=[],
+            )
+            recorder.emit("run_end", final_status="ok", total_tokens=1, total_cost_usd=0.0)
+        return recorder
+
+    monkeypatch.setattr(cli, "run_live_task", fake_run_live_task)
+
+    args = SimpleNamespace(
+        no_redact=False,
+        require_approval="off",
+        yes=False,
+        live_model=True,
+    )
+    assert cli._chat_loop(tmp_path, args) == 0
+    assert history_lengths == [0, 0]
+
+
+def test_read_only_followup_isolation_predicate() -> None:
+    from vg_agent import __main__ as cli
+
+    assert cli._should_isolate_read_only_followup(
+        "show app.py", previous_mutation_blocked=True
+    )
+    assert cli._should_isolate_read_only_followup(
+        "show the contents of app.py", previous_mutation_blocked=True
+    )
+    assert not cli._should_isolate_read_only_followup(
+        "show app.py and add debug_info", previous_mutation_blocked=True
+    )
+    assert not cli._should_isolate_read_only_followup(
+        "show app.py", previous_mutation_blocked=False
+    )
 
 
 def test_chat_ui_non_tty_skips_rich(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3180,6 +3482,101 @@ def test_chat_ui_turn_output_plain_on_tty(monkeypatch: pytest.MonkeyPatch) -> No
     assert "./auth" in out
     assert "\u2500" not in out
     assert "Response" not in out
+
+
+def test_chat_ui_renders_file_literal_output_as_file_panel(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    from vg_agent import chat_ui
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    buffer = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+    assert (
+        chat_ui.print_turn_output(
+            answer="Here is app.py",
+            literal_outputs=[
+                "Tool output (app.py):\n"
+                "from auth.middleware import require_auth\n"
+                "\n"
+                "def foo():\n"
+                "    return 1\n"
+            ],
+        )
+        is True
+    )
+    out = buffer.getvalue()
+    assert "File app.py" in out
+    assert "from auth.middleware import require_auth" in out
+    assert "    return 1" in out
+
+
+def test_chat_ui_keeps_file_literal_output_even_if_answer_mentions_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+
+    from vg_agent import chat_ui
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    buffer = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+    assert (
+        chat_ui.print_turn_output(
+            answer="from auth.middleware import require_auth\n    return 1",
+            literal_outputs=[
+                "Tool output (app.py):\n"
+                "from auth.middleware import require_auth\n"
+                "def foo():\n"
+                "    return 1\n"
+            ],
+        )
+        is True
+    )
+    assert "File app.py" in buffer.getvalue()
+
+
+def test_chat_ui_strips_duplicate_file_code_block_from_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the file is shown in its own panel, the duplicate fenced block in the
+    answer prose is removed but the surrounding prose is kept."""
+    import io
+
+    from vg_agent import chat_ui
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    buffer = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+    body = "from auth.middleware import require_auth\n\ndef foo():\n    return 1"
+    answer = f"Here is the contents of app.py:\n\n```python\n{body}\n```\n\nIt defines foo."
+    assert (
+        chat_ui.print_turn_output(
+            answer=answer,
+            literal_outputs=[f"Tool output (app.py):\n{body}\n"],
+        )
+        is True
+    )
+    out = buffer.getvalue()
+    assert "File app.py" in out  # rich panel rendered
+    assert "Here is the contents of app.py" in out  # intro prose kept
+    assert "It defines foo" in out  # trailing prose kept
+    # The fenced ``` markers from the duplicated block are gone (panel is sole source).
+    assert "```" not in out
+
+
+def test_strip_redundant_file_code_blocks_keeps_unrelated_blocks() -> None:
+    from vg_agent.chat_ui import _strip_redundant_file_code_blocks
+
+    body = "def foo():\n    return 1"
+    answer = (
+        f"The file says:\n\n```python\n{body}\n```\n\n"
+        "But you should change it to:\n\n```python\ndef bar():\n    return 2\n```"
+    )
+    stripped = _strip_redundant_file_code_blocks(answer, [body])
+    assert "def foo()" not in stripped
+    assert "def bar()" in stripped  # unrelated suggestion block preserved
+    assert "But you should change it to:" in stripped
 
 
 def test_chat_ui_turn_output_plain_when_non_tty(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3322,6 +3719,37 @@ def test_chat_ui_status_bar_throttled_while_running(
     printed.clear()
     chat_ui.refresh_chat_status_bar(**kwargs, force=True)
     assert len(printed) > 1
+
+
+def test_render_chat_prompt_ready_redraws_status_hint_and_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vg_agent import chat_ui
+
+    printed: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    class FakeConsole:
+        def print(self, *args: object, **kwargs: object) -> None:
+            printed.append((args, kwargs))
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    monkeypatch.setattr(chat_ui, "_console", lambda: FakeConsole())
+    from vg_agent.budget import BudgetGuard
+    from vg_agent.trace import TraceRecorder
+
+    recorder = TraceRecorder(tmp_path, sqlite_enabled=False)
+    guard = BudgetGuard.for_workspace(tmp_path)
+    chat_ui.render_chat_prompt_ready(
+        root=tmp_path,
+        recorder=recorder,
+        guard=guard,
+        live_model=True,
+        since_event_idx=0,
+    )
+
+    assert len(printed) >= 5
+    assert any("/help for commands" in str(args[0]) for args, _kwargs in printed if args)
+    assert any(getattr(args[0], "title", None) == "input" for args, _kwargs in printed if args)
 
 
 def test_chat_ui_turn_output_skips_progress_shown_changes(

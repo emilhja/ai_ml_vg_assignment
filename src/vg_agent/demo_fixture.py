@@ -70,7 +70,7 @@ UTILS = """def render_response(name: str, user_id: str) -> str:
 
 def sample_log() -> str:
     lines = []
-    for i in range(6200):
+    for i in range(4600):
         lines.append(f"2026-05-10T12:{i % 60:02d}:00Z INFO request_id=req-{i:05d} route=/health status=200 latency_ms={20 + (i % 17)}")
     return "\n".join(lines) + "\n"
 

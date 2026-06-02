@@ -45,9 +45,9 @@ from .chat_ui import (
     progress_diff_lines,
     progress_stderr_lock,
     prompt_approval,
+    render_chat_prompt_ready,
     refresh_chat_status_bar,
     render_input_bottom_and_footer,
-    render_input_top_rule,
     reset_dashboard_mode,
     sanitize_summary_text,
     use_rich_ui,
@@ -879,6 +879,54 @@ def _wants_literal_tool_output(prompt: str) -> bool:
     return any(marker in lower for marker in LITERAL_OUTPUT_PROMPT_MARKERS)
 
 
+_READ_ONLY_PROMPT_PREFIXES = ("show", "read", "list", "display", "print", "cat", "head", "tail")
+_MUTATING_PROMPT_WORDS = (
+    "add",
+    "append",
+    "change",
+    "create",
+    "delete",
+    "edit",
+    "fix",
+    "implement",
+    "make",
+    "modify",
+    "remove",
+    "rename",
+    "update",
+    "write",
+)
+_MUTATING_TOOLS = frozenset({"edit_file", "write_file", "spawn_subagent", "spawn_subagents"})
+
+
+def _is_direct_read_only_prompt(prompt: str) -> bool:
+    lower = prompt.strip().lower()
+    if not lower:
+        return False
+    if re.search(r"\b(" + "|".join(_MUTATING_PROMPT_WORDS) + r")\b", lower):
+        return False
+    if lower in {"pwd", "ls", "ls -l", "dir"}:
+        return True
+    if any(lower.startswith(f"{prefix} ") for prefix in _READ_ONLY_PROMPT_PREFIXES):
+        return True
+    return "contents of " in lower or "content of " in lower
+
+
+def _turn_had_blocked_mutation(events: list[dict[str, object]], start_idx: int) -> bool:
+    for event in events[start_idx:]:
+        if event.get("kind") != "approval":
+            continue
+        if event.get("decision") not in {"denied", "aborted"}:
+            continue
+        if event.get("tool") in _MUTATING_TOOLS:
+            return True
+    return False
+
+
+def _should_isolate_read_only_followup(prompt: str, *, previous_mutation_blocked: bool) -> bool:
+    return previous_mutation_blocked and _is_direct_read_only_prompt(prompt)
+
+
 def _parent_tool_calls(events: list[dict[str, object]], start_idx: int) -> dict[str, dict[str, object]]:
     calls: dict[str, dict[str, object]] = {}
     for event in events[start_idx:]:
@@ -913,7 +961,13 @@ def _literal_tool_outputs(
         if event.get("tool") not in LITERAL_OUTPUT_TOOLS:
             continue
         content = clarify_tool_error(str(event.get("tool") or ""), str(event.get("result_full") or "")).strip()
-        if not content or (answer_text and content in answer_text):
+        if not content:
+            continue
+        is_file_read = event.get("tool") in {"read_file", "read_file_range"}
+        # File reads always surface as their own rich black-background panel; the chat
+        # UI strips any duplicate fenced block the model echoed into its answer. Other
+        # tools (e.g. run_bash) stay suppressed when the answer already quotes them.
+        if not is_file_read and answer_text and content in answer_text:
             continue
         tool_use_id = str(event.get("tool_use_id") or "")
         call = calls.get(tool_use_id, {})
@@ -1055,7 +1109,7 @@ def _guard_overrides(args: argparse.Namespace) -> dict[str, object]:
 
 def _chat_loop(root: Path, args: argparse.Namespace) -> int:
     guard = BudgetGuard.for_workspace(root, **_guard_overrides(args))
-    turn_state: dict[str, Any] = {"turn": 0}
+    turn_state: dict[str, Any] = {"turn": 0, "previous_mutation_blocked": False}
     ui_since = 0
 
     def on_parent_status() -> None:
@@ -1088,7 +1142,9 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
     try:
         while True:
             try:
-                render_input_top_rule()
+                render_chat_prompt_ready(
+                    **_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since)
+                )
                 prompt = read_prompt().strip()
             except KeyboardInterrupt:
                 recorder.emit("budget_event", budget_reason="user_abort", details={})
@@ -1118,6 +1174,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 guard = BudgetGuard.for_workspace(root, **_guard_overrides(args))
                 conversation.clear()
                 last_intent_prompt = ""
+                turn_state["previous_mutation_blocked"] = False
                 ui_since = len(recorder.events)
                 reset_dashboard_mode()
                 recorder.emit("session_reset")
@@ -1129,6 +1186,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 guard = BudgetGuard.for_workspace(root, **_guard_overrides(args))
                 conversation.clear()
                 last_intent_prompt = ""
+                turn_state["previous_mutation_blocked"] = False
                 ui_since = 0
                 reset_dashboard_mode()
                 turn_state["turn"] = 0
@@ -1241,7 +1299,23 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 sys.stderr.write(f"error: {exc}\n")
                 return 2
             try:
-                run_live_task(root, prompt, recorder, client=client, guard=guard, policy=policy, history=conversation)
+                history_for_turn = (
+                    []
+                    if _should_isolate_read_only_followup(
+                        prompt,
+                        previous_mutation_blocked=bool(turn_state.get("previous_mutation_blocked")),
+                    )
+                    else conversation
+                )
+                run_live_task(
+                    root,
+                    prompt,
+                    recorder,
+                    client=client,
+                    guard=guard,
+                    policy=policy,
+                    history=history_for_turn,
+                )
             except KeyboardInterrupt:
                 recorder.emit("budget_event", budget_reason="user_abort", details={})
                 if not any(
@@ -1285,6 +1359,9 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             )
             if not _is_ack_prompt(prompt):
                 last_intent_prompt = prompt
+            turn_state["previous_mutation_blocked"] = _turn_had_blocked_mutation(
+                recorder.events, start_idx
+            )
     finally:
         save_history()
     return 0

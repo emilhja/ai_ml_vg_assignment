@@ -2494,7 +2494,7 @@ UTILS = """def render_response(name: str, user_id: str) -> str:
 
 def sample_log() -> str:
     lines = []
-    for i in range(6200):
+    for i in range(4600):
         lines.append(f"2026-05-10T12:{i % 60:02d}:00Z INFO request_id=req-{i:05d} route=/health status=200 latency_ms={20 + (i % 17)}")
     return "\\n".join(lines) + "\\n"
 
@@ -2570,6 +2570,7 @@ def _normalise_agent_type(value: object) -> str:
 
 GATED_WRITES = {"write_file", "edit_file", "run_bash", "run_tests", "spawn_subagent", "spawn_subagents"}
 SOFT_RECOVERABLE_PARENT_TOOLS = {"run_tests"}
+TERMINAL_APPROVAL_FAILURE_REASONS = frozenset({"approval_denied", "approval_aborted"})
 GATED_ALL = {"read_file", "read_file_range"} | GATED_WRITES
 BUDGET_CAP_TOOL = "budget_cap"
 
@@ -3598,6 +3599,10 @@ def _is_impl_file_path(path: str) -> bool:
 
 def _subagent_error_reason_from_tool_result(tool_name: str, result_text: str) -> str:
     text = str(result_text or "").lower()
+    if text.startswith("approval denied:"):
+        return "approval_denied"
+    if text == "approval aborted by user":
+        return "approval_aborted"
     if tool_name in {"read_file", "read_file_range"} and ("is a directory" in text or "not a regular file" in text):
         return "invalid_path_kind"
     if tool_name == "run_bash" and "shell control or redirection marker" in text:
@@ -3933,8 +3938,13 @@ def _run_live_subagent(
             if result["status"] != "ok":
                 had_tool_error = True
                 failure_reason = _subagent_error_reason_from_tool_result(c.name, str(result["result_full"]))
+                if failure_reason in TERMINAL_APPROVAL_FAILURE_REASONS:
+                    status = "tool_error"
+                    completed = True
                 break
         messages.append({"role": "user", "content": tool_blocks})
+        if failure_reason in TERMINAL_APPROVAL_FAILURE_REASONS:
+            break
 
     if agent_type == "reviewer" and not _is_reviewer_verdict(final_summary):
         # Contract: reviewer `subagent_return.payload` must start with
@@ -4182,6 +4192,8 @@ def _should_retry_coder_spawn(payload: dict[str, object], *, retry_used: bool) -
     if str(payload.get("status") or "") != "tool_error":
         return False
     reason = str(payload.get("failure_reason") or "")
+    if reason in TERMINAL_APPROVAL_FAILURE_REASONS:
+        return False
     return reason in {
         "invalid_path_kind",
         "blocked_shell_control",
@@ -4200,6 +4212,29 @@ def _constrained_retry_question(original_question: str, reason: str) -> str:
         "Return only after at least one successful write_file or edit_file."
     )
     return f"{original_question}\\n\\nFailure reason from previous attempt: {reason}\\n{constraints}"
+
+
+def _is_terminal_coder_approval_failure(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("agent_type") or "") != "coder":
+        return False
+    if str(payload.get("status") or "") != "tool_error":
+        return False
+    return str(payload.get("failure_reason") or "") in TERMINAL_APPROVAL_FAILURE_REASONS
+
+
+def _contains_terminal_coder_approval_failure(payload: object) -> bool:
+    if _is_terminal_coder_approval_failure(payload):
+        return True
+    if isinstance(payload, list):
+        return any(_contains_terminal_coder_approval_failure(item) for item in payload)
+    if isinstance(payload, dict):
+        return any(
+            _contains_terminal_coder_approval_failure(payload.get(key))
+            for key in ("initial", "retry")
+        )
+    return False
 
 
 def _parallel_spawn_question(entry: dict[str, object]) -> str:
@@ -4396,6 +4431,7 @@ def run_live_task(
 
         tool_blocks: list[dict[str, Any]] = []
         for call in turn.tool_calls:
+            terminal_coder_approval_failure = False
             result = _execute_live_tool(
                 root=root,
                 call=call,
@@ -4424,6 +4460,9 @@ def run_live_task(
                         started,
                         policy,
                     )
+                    terminal_coder_approval_failure = _contains_terminal_coder_approval_failure(
+                        retried
+                    )
                     if any(
                         "retry" in item
                         for item in retried
@@ -4435,6 +4474,9 @@ def run_live_task(
                         }
             if call.name == "spawn_subagent":
                 payload = _parse_spawn_payload(result)
+                terminal_coder_approval_failure = _contains_terminal_coder_approval_failure(
+                    payload
+                )
                 if isinstance(payload, dict) and _should_retry_coder_spawn(payload, retry_used=constrained_coder_retry_used):
                     retry_question = _constrained_retry_question(
                         str(call.args.get("question") or ""),
@@ -4489,6 +4531,15 @@ def run_live_task(
                     f"trace pointer {recorder.run_id}:event:{event['event_idx']}]"
                 )
             tool_blocks.append({"type": "tool_result", "tool_use_id": call.tool_use_id, "content": content, "is_error": result["status"] != "ok"})
+            if terminal_coder_approval_failure:
+                recorder.emit(
+                    "run_end",
+                    final_status="tool_error",
+                    total_cost_usd=round(guard.running_usd, 6),
+                    total_tokens=guard.running_tokens,
+                    duration_s=round(time.perf_counter() - started, 3),
+                )
+                return recorder
             if result["status"] != "ok":
                 if call.name not in SOFT_RECOVERABLE_PARENT_TOOLS:
                     recorder.emit(
@@ -4548,9 +4599,9 @@ from .chat_ui import (
     progress_diff_lines,
     progress_stderr_lock,
     prompt_approval,
+    render_chat_prompt_ready,
     refresh_chat_status_bar,
     render_input_bottom_and_footer,
-    render_input_top_rule,
     reset_dashboard_mode,
     sanitize_summary_text,
     use_rich_ui,
@@ -5382,6 +5433,54 @@ def _wants_literal_tool_output(prompt: str) -> bool:
     return any(marker in lower for marker in LITERAL_OUTPUT_PROMPT_MARKERS)
 
 
+_READ_ONLY_PROMPT_PREFIXES = ("show", "read", "list", "display", "print", "cat", "head", "tail")
+_MUTATING_PROMPT_WORDS = (
+    "add",
+    "append",
+    "change",
+    "create",
+    "delete",
+    "edit",
+    "fix",
+    "implement",
+    "make",
+    "modify",
+    "remove",
+    "rename",
+    "update",
+    "write",
+)
+_MUTATING_TOOLS = frozenset({"edit_file", "write_file", "spawn_subagent", "spawn_subagents"})
+
+
+def _is_direct_read_only_prompt(prompt: str) -> bool:
+    lower = prompt.strip().lower()
+    if not lower:
+        return False
+    if re.search(r"\\b(" + "|".join(_MUTATING_PROMPT_WORDS) + r")\\b", lower):
+        return False
+    if lower in {"pwd", "ls", "ls -l", "dir"}:
+        return True
+    if any(lower.startswith(f"{prefix} ") for prefix in _READ_ONLY_PROMPT_PREFIXES):
+        return True
+    return "contents of " in lower or "content of " in lower
+
+
+def _turn_had_blocked_mutation(events: list[dict[str, object]], start_idx: int) -> bool:
+    for event in events[start_idx:]:
+        if event.get("kind") != "approval":
+            continue
+        if event.get("decision") not in {"denied", "aborted"}:
+            continue
+        if event.get("tool") in _MUTATING_TOOLS:
+            return True
+    return False
+
+
+def _should_isolate_read_only_followup(prompt: str, *, previous_mutation_blocked: bool) -> bool:
+    return previous_mutation_blocked and _is_direct_read_only_prompt(prompt)
+
+
 def _parent_tool_calls(events: list[dict[str, object]], start_idx: int) -> dict[str, dict[str, object]]:
     calls: dict[str, dict[str, object]] = {}
     for event in events[start_idx:]:
@@ -5416,7 +5515,13 @@ def _literal_tool_outputs(
         if event.get("tool") not in LITERAL_OUTPUT_TOOLS:
             continue
         content = clarify_tool_error(str(event.get("tool") or ""), str(event.get("result_full") or "")).strip()
-        if not content or (answer_text and content in answer_text):
+        if not content:
+            continue
+        is_file_read = event.get("tool") in {"read_file", "read_file_range"}
+        # File reads always surface as their own rich black-background panel; the chat
+        # UI strips any duplicate fenced block the model echoed into its answer. Other
+        # tools (e.g. run_bash) stay suppressed when the answer already quotes them.
+        if not is_file_read and answer_text and content in answer_text:
             continue
         tool_use_id = str(event.get("tool_use_id") or "")
         call = calls.get(tool_use_id, {})
@@ -5558,7 +5663,7 @@ def _guard_overrides(args: argparse.Namespace) -> dict[str, object]:
 
 def _chat_loop(root: Path, args: argparse.Namespace) -> int:
     guard = BudgetGuard.for_workspace(root, **_guard_overrides(args))
-    turn_state: dict[str, Any] = {"turn": 0}
+    turn_state: dict[str, Any] = {"turn": 0, "previous_mutation_blocked": False}
     ui_since = 0
 
     def on_parent_status() -> None:
@@ -5591,7 +5696,9 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
     try:
         while True:
             try:
-                render_input_top_rule()
+                render_chat_prompt_ready(
+                    **_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since)
+                )
                 prompt = read_prompt().strip()
             except KeyboardInterrupt:
                 recorder.emit("budget_event", budget_reason="user_abort", details={})
@@ -5621,6 +5728,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 guard = BudgetGuard.for_workspace(root, **_guard_overrides(args))
                 conversation.clear()
                 last_intent_prompt = ""
+                turn_state["previous_mutation_blocked"] = False
                 ui_since = len(recorder.events)
                 reset_dashboard_mode()
                 recorder.emit("session_reset")
@@ -5632,6 +5740,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 guard = BudgetGuard.for_workspace(root, **_guard_overrides(args))
                 conversation.clear()
                 last_intent_prompt = ""
+                turn_state["previous_mutation_blocked"] = False
                 ui_since = 0
                 reset_dashboard_mode()
                 turn_state["turn"] = 0
@@ -5744,7 +5853,23 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 sys.stderr.write(f"error: {exc}\\n")
                 return 2
             try:
-                run_live_task(root, prompt, recorder, client=client, guard=guard, policy=policy, history=conversation)
+                history_for_turn = (
+                    []
+                    if _should_isolate_read_only_followup(
+                        prompt,
+                        previous_mutation_blocked=bool(turn_state.get("previous_mutation_blocked")),
+                    )
+                    else conversation
+                )
+                run_live_task(
+                    root,
+                    prompt,
+                    recorder,
+                    client=client,
+                    guard=guard,
+                    policy=policy,
+                    history=history_for_turn,
+                )
             except KeyboardInterrupt:
                 recorder.emit("budget_event", budget_reason="user_abort", details={})
                 if not any(
@@ -5788,6 +5913,9 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             )
             if not _is_ack_prompt(prompt):
                 last_intent_prompt = prompt
+            turn_state["previous_mutation_blocked"] = _turn_had_blocked_mutation(
+                recorder.events, start_idx
+            )
     finally:
         save_history()
     return 0

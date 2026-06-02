@@ -798,10 +798,11 @@ def render_input_top_rule() -> None:
         return
     from rich.rule import Rule
 
-    console = _console()
-    console.print()
-    console.print()
-    console.print(Rule("input", style="dim"))
+    with progress_stderr_lock:
+        console = _console()
+        console.print()
+        console.print()
+        console.print(Rule("input", style="dim"))
 
 
 def render_input_bottom_and_footer(
@@ -817,19 +818,43 @@ def render_input_bottom_and_footer(
         return
     from rich.rule import Rule
 
-    console = _console()
-    console.print(Rule(style="dim"))
-    if show_status:
-        _write_status_bar(
-            console,
+    with progress_stderr_lock:
+        console = _console()
+        console.print(Rule(style="dim"))
+        if show_status:
+            _write_status_bar(
+                console,
+                root=root,
+                recorder=recorder,
+                guard=guard,
+                live_model=live_model,
+                since_event_idx=since_event_idx,
+            )
+            _write_hint(console)
+            _write_secondary(console, recorder.events, since_event_idx=since_event_idx)
+
+
+def render_chat_prompt_ready(
+    *,
+    root: Path,
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    live_model: bool,
+    since_event_idx: int = 0,
+) -> None:
+    """Redraw the compact chat chrome immediately before accepting input."""
+    if not use_rich_ui():
+        return
+    with progress_stderr_lock:
+        refresh_chat_status_bar(
             root=root,
             recorder=recorder,
             guard=guard,
             live_model=live_model,
             since_event_idx=since_event_idx,
+            force=True,
         )
-        _write_hint(console)
-        _write_secondary(console, recorder.events, since_event_idx=since_event_idx)
+        render_input_top_rule()
 
 
 def _lines_already_in_answer(answer: str, content: str) -> bool:
@@ -1122,6 +1147,99 @@ def _render_directory_tree(text: str) -> Any | None:
     return root
 
 
+def _literal_output_parts(output: str) -> tuple[str, str, str] | None:
+    title, sep, body = output.partition(":\n")
+    if not sep:
+        return None
+    match = re.match(r"^(Tool output|Blocked|Tool error) \((.+)\)$", title)
+    if not match:
+        return None
+    return match.group(1), match.group(2), body
+
+
+def _syntax_language_for_path(path: str) -> str:
+    suffix = Path(path.replace("\\", "/")).suffix.lower()
+    return {
+        ".css": "css",
+        ".html": "html",
+        ".js": "javascript",
+        ".json": "json",
+        ".jsx": "jsx",
+        ".log": "text",
+        ".md": "markdown",
+        ".py": "python",
+        ".sh": "bash",
+        ".toml": "toml",
+        ".ts": "typescript",
+        ".tsx": "tsx",
+        ".txt": "text",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+    }.get(suffix, "text")
+
+
+def _is_file_literal_output(output: str) -> bool:
+    parts = _literal_output_parts(output)
+    if parts is None:
+        return False
+    label, target, body = parts
+    if label != "Tool output" or not body:
+        return False
+    if any(char.isspace() for char in target):
+        return False
+    name = Path(target.replace("\\", "/")).name
+    return bool(name and (Path(name).suffix or "/" in target or target.startswith(".")))
+
+
+def _render_file_literal_panel(console: Any, path: str, body: str) -> None:
+    from rich.panel import Panel
+    from rich.syntax import Syntax
+
+    syntax = Syntax(
+        body,
+        _syntax_language_for_path(path),
+        line_numbers=True,
+        word_wrap=False,
+        background_color="black",
+    )
+    console.print(
+        Panel(
+            syntax,
+            title=f"File {path}",
+            border_style="cyan",
+            style=_DIFF_PANEL_STYLE,
+        )
+    )
+
+
+_FENCED_CODE_BLOCK = re.compile(r"```[^\n]*\n(?P<code>.*?)\n```", re.DOTALL)
+
+
+def _strip_redundant_file_code_blocks(answer: str, file_bodies: list[str]) -> str:
+    """Drop fenced code blocks that merely echo a file body already shown in a panel.
+
+    When a read-only ``show <file>`` turn renders the file in its own black-background
+    panel, the model often also pastes the same content into its prose as a fenced
+    block. Remove that duplicate so the panel is the single source of truth; keep any
+    surrounding prose (intro line, bullet summary) intact.
+    """
+    if not answer or not file_bodies:
+        return answer
+
+    def _norm(text: str) -> str:
+        return "\n".join(line.rstrip() for line in text.strip().splitlines())
+
+    targets = {_norm(body) for body in file_bodies if body.strip()}
+    if not targets:
+        return answer
+
+    def _replace(match: "re.Match[str]") -> str:
+        return "" if _norm(match.group("code")) in targets else match.group(0)
+
+    stripped = _FENCED_CODE_BLOCK.sub(_replace, answer)
+    return re.sub(r"\n{3,}", "\n\n", stripped).strip()
+
+
 def print_turn_output(
     *,
     answer: str,
@@ -1139,7 +1257,11 @@ def print_turn_output(
         if not output:
             continue
         body = output.split(":", 1)[-1].strip() if output.startswith(("Tool output", "Blocked", "Tool error")) else output
-        if answer_text and _lines_already_in_answer(answer_text, body):
+        if (
+            answer_text
+            and not _is_file_literal_output(output)
+            and _lines_already_in_answer(answer_text, body)
+        ):
             continue
         filtered_outputs.append(output)
     changes: list[FileChange] = []
@@ -1149,6 +1271,14 @@ def print_turn_output(
         )
         if skip_change_paths:
             changes = [change for change in changes if change.path not in skip_change_paths]
+    file_bodies = [
+        parts[2]
+        for output in filtered_outputs
+        if _is_file_literal_output(output)
+        and (parts := _literal_output_parts(output)) is not None
+    ]
+    if file_bodies:
+        answer_text = _strip_redundant_file_code_blocks(answer_text, file_bodies)
     if not answer_text and not filtered_outputs and not changes:
         return False
     if use_rich_ui():
@@ -1162,6 +1292,10 @@ def print_turn_output(
         for output in filtered_outputs:
             if "\n" in output:
                 title, _, body = output.partition(":\n")
+                literal_parts = _literal_output_parts(output)
+                if literal_parts is not None and _is_file_literal_output(output):
+                    _render_file_literal_panel(console, literal_parts[1], literal_parts[2])
+                    continue
                 tree = _render_directory_tree(body)
                 if tree is not None:
                     console.print(Panel(tree, title=title or "Tool output", border_style="dim"))
@@ -1213,27 +1347,28 @@ def refresh_chat_status_bar(
     global _last_status_bar_refresh
     if not use_rich_ui():
         return
-    if not force and force_state == "running":
-        now = time.monotonic()
-        if now - _last_status_bar_refresh < _STATUS_THROTTLE_S:
+    with progress_stderr_lock:
+        if not force and force_state == "running":
+            now = time.monotonic()
+            if now - _last_status_bar_refresh < _STATUS_THROTTLE_S:
+                return
+            _last_status_bar_refresh = now
+        elif force_state != "running":
+            _last_status_bar_refresh = 0.0
+        console = _console()
+        _write_status_bar(
+            console,
+            root=root,
+            recorder=recorder,
+            guard=guard,
+            live_model=live_model,
+            since_event_idx=since_event_idx,
+            force_state=force_state,
+        )
+        if force_state == "running" and not force:
             return
-        _last_status_bar_refresh = now
-    elif force_state != "running":
-        _last_status_bar_refresh = 0.0
-    console = _console()
-    _write_status_bar(
-        console,
-        root=root,
-        recorder=recorder,
-        guard=guard,
-        live_model=live_model,
-        since_event_idx=since_event_idx,
-        force_state=force_state,
-    )
-    if force_state == "running" and not force:
-        return
-    _write_hint(console)
-    _write_secondary(console, recorder.events, since_event_idx=since_event_idx)
+        _write_hint(console)
+        _write_secondary(console, recorder.events, since_event_idx=since_event_idx)
 
 
 def format_compaction_banner(event: dict[str, object]) -> str | None:
