@@ -48,6 +48,9 @@ This is a narrow, run-specific comparison from this repo and tooling path
 (VG agent shell + LiteLLM/OpenRouter). It is not a universal benchmark of
 either model family.
 
+Method note: these are pre-protocol sample observations. For formal future
+comparisons, apply the evaluation contract in `specs/41_runtime_quality_eval.md`.
+
 Compared traces:
 
 - `traces/293ed45ebd6f.jsonl` (Haiku coder/reviewer path)
@@ -101,6 +104,8 @@ Critical assessment of the Gemini "finished but not working" finding:
   reliable despite higher cost in the rerun pair.
 - This is still a small sample; keep cost/latency/quality comparisons tied to
   repeated task suites rather than single traces.
+- Re-run this comparison under `specs/41_runtime_quality_eval.md` before
+  treating these observations as policy-setting evidence.
 
 ## Pricelist
 

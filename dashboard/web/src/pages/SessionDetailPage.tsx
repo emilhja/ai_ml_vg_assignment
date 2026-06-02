@@ -154,48 +154,6 @@ export default function SessionDetailPage() {
     }
   }, [tab, highlightEventIdx, eventsData]);
 
-  if (!sessionId) {
-    return (
-      <div className="space-y-3">
-        <p className="text-red-400">Invalid session id in URL.</p>
-        <Link to="/history" className="text-sm text-accent hover:underline">
-          ← Back to history
-        </Link>
-      </div>
-    );
-  }
-
-  if (isLoading) {
-    return <p className="text-muted">Loading session…</p>;
-  }
-
-  if (isError) {
-    const message = (error as Error)?.message ?? "Unknown error";
-    return (
-      <div className="space-y-3">
-        <p className="text-red-400">
-          Cannot load session <span className="font-mono">{sessionId}</span>: {message}
-        </p>
-        <Link to="/history" className="text-sm text-accent hover:underline">
-          ← Back to history
-        </Link>
-      </div>
-    );
-  }
-
-  if (!detail) {
-    return (
-      <div className="space-y-3">
-        <p className="text-red-400">
-          Session <span className="font-mono">{sessionId}</span> was not found.
-        </p>
-        <Link to="/history" className="text-sm text-accent hover:underline">
-          ← Back to history
-        </Link>
-      </div>
-    );
-  }
-
   const tabs: { id: Tab; label: string }[] = [
     { id: "timeline", label: "Timeline" },
     { id: "cost", label: "Cost" },
@@ -205,7 +163,7 @@ export default function SessionDetailPage() {
     { id: "events", label: "Events" },
   ];
 
-  const runTotals = detail.runs.find((r) => r.run_id === runId);
+  const runTotals = detail?.runs.find((r) => r.run_id === runId);
 
   const turnSeries = useMemo(
     () =>
@@ -288,6 +246,48 @@ export default function SessionDetailPage() {
   const toolCalls = timeline?.tool_calls.length ?? 0;
   const toolErrorCount = toolErrors.length;
   const toolErrorRate = toolCalls > 0 ? (toolErrorCount / toolCalls) * 100 : 0;
+
+  if (!sessionId) {
+    return (
+      <div className="space-y-3">
+        <p className="text-red-400">Invalid session id in URL.</p>
+        <Link to="/history" className="text-sm text-accent hover:underline">
+          ← Back to history
+        </Link>
+      </div>
+    );
+  }
+
+  if (isLoading) {
+    return <p className="text-muted">Loading session…</p>;
+  }
+
+  if (isError) {
+    const message = (error as Error)?.message ?? "Unknown error";
+    return (
+      <div className="space-y-3">
+        <p className="text-red-400">
+          Cannot load session <span className="font-mono">{sessionId}</span>: {message}
+        </p>
+        <Link to="/history" className="text-sm text-accent hover:underline">
+          ← Back to history
+        </Link>
+      </div>
+    );
+  }
+
+  if (!detail) {
+    return (
+      <div className="space-y-3">
+        <p className="text-red-400">
+          Session <span className="font-mono">{sessionId}</span> was not found.
+        </p>
+        <Link to="/history" className="text-sm text-accent hover:underline">
+          ← Back to history
+        </Link>
+      </div>
+    );
+  }
 
   return (
     <div className={`space-y-6 ${tab === "events" ? "flex flex-col flex-1 min-h-0" : "overflow-y-auto"}`}>

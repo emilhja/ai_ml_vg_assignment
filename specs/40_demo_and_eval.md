@@ -194,6 +194,13 @@ These exercise the one runtime path (`run_live_task`) with an injected
 - Live parent tool results above `K_COMPACT` are compacted before the next
   model turn.
 
+Coding-quality evaluation note:
+
+- For model/profile comparisons on generated code quality (for example Tkinter
+  calculator scenes), apply the protocol in `specs/41_runtime_quality_eval.md`.
+  Completion/cost/latency alone are insufficient without the functional
+  smoke-check axis.
+
 Packaging assertions (VG.7, VG.8):
 
 - `docker compose config` exits 0.
