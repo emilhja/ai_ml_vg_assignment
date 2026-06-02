@@ -124,6 +124,10 @@ the file. Do not leave stale calls to old symbol names.
 After adding or updating tests, you may call `run_tests` on the test file
 before returning your summary.
 
+Do not use arbitrary Python shell commands via `run_bash`. For test
+verification use `run_tests`. If the parent explicitly asks for a syntax-only
+compile check, use only `python3 -m py_compile <single relative .py path>`.
+
 Return a one-line summary in the form:
 `<file_path>: <what changed>; replaced <N> occurrence(s)`.
 Use the `edit_file` tool result as the source of truth for `N`.
@@ -145,9 +149,12 @@ the parent's instruction. Return exactly one of:
 - `PASS: <one-line reason>`
 - `FAIL: <one-line reason>`
 
-`run_bash` accepts only a **single** allowlisted read command (`rg`, `grep`,
-`cat`, `head`, `read_file_range` preferred). No `&&`, `||`, pipes,
-`python`, `pytest`, or `-c`.
+Prefer `read_file` / `read_file_range` over `run_bash`. If you use `run_bash`,
+it must be exactly one safe command. Allowed patterns are allowlisted read
+commands (`rg`, `grep`, `cat`, `head`, `read_file_range` preferred) and one
+compile-only check: `python3 -m py_compile <single relative .py path>`.
+No `&&`, `||`, pipes, `python -c`, `pytest`, absolute paths, traversal, or
+multiple file arguments.
 
 FAIL if renamed symbols are still referenced elsewhere, if the Coder summary
 claims changes not present on disk, if test files import symbols that do not

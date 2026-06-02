@@ -1203,7 +1203,24 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             except MissingOpenRouterKey as exc:
                 sys.stderr.write(f"error: {exc}\n")
                 return 2
-            run_live_task(root, prompt, recorder, client=client, guard=guard, policy=policy, history=conversation)
+            try:
+                run_live_task(root, prompt, recorder, client=client, guard=guard, policy=policy, history=conversation)
+            except KeyboardInterrupt:
+                recorder.emit("budget_event", budget_reason="user_abort", details={})
+                if not any(
+                    e.get("kind") == "run_end"
+                    and int(e.get("event_idx", -1)) >= start_idx
+                    for e in recorder.events
+                ):
+                    recorder.emit(
+                        "run_end",
+                        final_status="aborted",
+                        total_cost_usd=round(guard.running_usd, 6),
+                        total_tokens=guard.running_tokens,
+                        duration_s=0.0,
+                    )
+                sys.stderr.write("\n")
+                break
             turn_state["force_state"] = None
             answer = _latest_parent_answer(recorder.events, start_idx)
             literal_outputs = _literal_tool_outputs(
@@ -1288,7 +1305,17 @@ def main(argv: list[str] | None = None) -> int:
     except MissingOpenRouterKey as exc:
         parser.exit(2, f"error: {exc}\n")
     guard = BudgetGuard.for_workspace(root, **_guard_overrides(args))
-    run_live_task(root, args.task, recorder, client=client, guard=guard, policy=policy)
+    try:
+        run_live_task(root, args.task, recorder, client=client, guard=guard, policy=policy)
+    except KeyboardInterrupt:
+        recorder.emit("budget_event", budget_reason="user_abort", details={})
+        recorder.emit(
+            "run_end",
+            final_status="aborted",
+            total_cost_usd=round(guard.running_usd, 6),
+            total_tokens=guard.running_tokens,
+            duration_s=0.0,
+        )
     answer = _latest_parent_answer(recorder.events)
     if answer:
         print(answer)

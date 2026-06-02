@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from vg_agent.agent import (
     PARENT_TOOL_SCHEMAS,
     _build_review_slice,
     _resolve_review_coder_id,
+    _run_live_subagent,
     run_live_task,
 )
 from vg_agent.live_model_client import (
@@ -41,6 +43,7 @@ from vg_agent.tools import (
     validate_run_tests_path,
     validate_sensitive_path,
     validate_shell_command,
+    validate_shell_command_for_workspace,
     write_file,
 )
 from vg_agent.trace import TraceRecorder, _redact, show_context
@@ -650,6 +653,39 @@ def test_run_bash_rejects_dangerous_commands(tmp_path: Path) -> None:
     assert validate_shell_command("mkdir -p /tmp/outside-mkdir-test") is not None
 
 
+def test_run_bash_py_compile_strict_allowlist(tmp_path: Path) -> None:
+    target = tmp_path / "module_ok.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+
+    allowed = "python3 -m py_compile module_ok.py"
+    assert validate_shell_command(allowed) is None
+    assert validate_shell_command_for_workspace(tmp_path, allowed) is None
+    ok = run_bash(tmp_path, allowed, "py-compile-ok")
+    assert ok["status"] == "ok"
+    assert "__pycache__" not in str(ok["result_full"])
+
+    assert validate_shell_command("python3 module_ok.py") is not None
+    assert validate_shell_command("python3 -c 'print(1)'") is not None
+    assert validate_shell_command("python3 -m pytest module_ok.py") is not None
+    assert validate_shell_command("python3 -m py_compile module_ok.py another.py") is not None
+    assert validate_shell_command("python3 -m py_compile module_ok.py && ls") is not None
+    assert validate_shell_command("python3 -m py_compile ../outside.py") is not None
+    assert validate_shell_command("python3 -m py_compile /tmp/abs.py") is not None
+
+    missing = validate_shell_command_for_workspace(tmp_path, "python3 -m py_compile missing.py")
+    assert missing is not None
+    assert "does not exist" in missing
+
+    not_file = tmp_path / "pkgdir"
+    not_file.mkdir()
+    not_regular = validate_shell_command_for_workspace(tmp_path, "python3 -m py_compile pkgdir")
+    assert not_regular is not None
+
+    sensitive = validate_shell_command_for_workspace(tmp_path, "python3 -m py_compile .env")
+    assert sensitive is not None
+    assert "sensitive path" in sensitive
+
+
 def test_live_model_cli_requires_openrouter_key(tmp_path: Path) -> None:
     env = os.environ.copy()
     env.pop("OPENROUTER_API_KEY", None)
@@ -839,6 +875,62 @@ def test_budget_cap_approval_step_copy() -> None:
     assert "14/15" in body
     assert "Cap (--max-usd)" not in body
     assert "step cap" in body.lower() or "Step cap" in body
+
+
+def test_budget_cap_choice_2_scoped_scope_key_is_reason() -> None:
+    from vg_agent.chat_ui import _parse_approval_choice
+
+    req = SimpleNamespace(tool="budget_cap", path="token_cap", args={}, summary="")
+    outcome = _parse_approval_choice("2", req)
+    assert outcome.decision == "approved_scoped"
+    assert outcome.scope_key == "token_cap"
+
+
+def test_budget_cap_scope_cache_avoids_re_prompt_for_same_reason() -> None:
+    prompt_calls = 0
+
+    def approve(req: ApprovalRequest) -> ApprovalOutcome:
+        nonlocal prompt_calls
+        prompt_calls += 1
+        assert req.tool == "budget_cap"
+        assert req.path == "token_cap"
+        return ApprovalOutcome(decision="approved_scoped", scope_key=str(req.path), reason="test grant")
+
+    policy = ApprovalPolicy(mode="writes", prompt=approve)
+    details = {"tokens": 79_000, "max_tokens": 80_000}
+    summary = "token_cap test"
+
+    out1 = policy.check_budget_cap("token_cap", details, summary)
+    out2 = policy.check_budget_cap("token_cap", details, summary)
+
+    assert out1.decision == "approved_scoped"
+    assert out1.scope_key == "token_cap"
+    assert out2.decision == "approved_scoped"
+    assert out2.scope_key == "token_cap"
+    assert out2.reason == "budget scope cache hit"
+    assert prompt_calls == 1
+
+
+def test_budget_cap_token_prompt_shows_bump_and_new_maxes() -> None:
+    from vg_agent.chat_ui import format_budget_cap_approval_text
+
+    tokens = 79_000
+    max_tokens = 80_000
+    bump = max(10_000, max_tokens // 4)
+    new_once = tokens + bump
+    new_scoped = max_tokens + bump
+
+    body = format_budget_cap_approval_text(
+        "token_cap",
+        {
+            "tokens": tokens,
+            "max_tokens": max_tokens,
+        },
+    )
+
+    assert f"Bump:                ~{bump:,} tokens" in body
+    assert f"1/y (one-time) max: ~{new_once:,}" in body
+    assert f"2/3 (this cap) max: ~{new_scoped:,}" in body
 
 
 def test_sqlite_mirror_survives_parallel_subagents(tmp_path: Path) -> None:
@@ -2737,6 +2829,163 @@ def test_coder_read_only_exit_is_tool_error(tmp_path: Path) -> None:
     assert returns[-1]["writes_ok"] == 0
 
 
+def test_coder_empty_turn_retries_then_writes_successfully(tmp_path: Path) -> None:
+    recorder = TraceRecorder(tmp_path)
+    client = FakeClient(
+        [
+            ModelTurn("", input_tokens=20, output_tokens=1),
+            ModelTurn(
+                "",
+                [ToolCall("write-1", "write_file", {"path": "calc3/calculator.py", "content": "print('ok')\n"})],
+                stop_reason="tool_use",
+                input_tokens=30,
+                output_tokens=20,
+            ),
+            ModelTurn(
+                "calc3/calculator.py: created file; replaced 0 occurrence(s)",
+                input_tokens=15,
+                output_tokens=10,
+            ),
+        ]
+    )
+    guard = BudgetGuard(max_steps=20, max_tokens=1_000_000, max_usd=10.0, daily_remaining_usd=10.0)
+    policy = ApprovalPolicy(mode="off")
+
+    summary, status, writes_ok, _reads_ok = _run_live_subagent(
+        tmp_path,
+        "coder",
+        "Create calc3/calculator.py",
+        recorder,
+        client,
+        guard,
+        child_id="coder-1",
+        started=time.perf_counter(),
+        policy=policy,
+    )
+
+    assert status == "ok"
+    assert writes_ok == 1
+    assert "calc3/calculator.py" in summary
+    assert (tmp_path / "calc3" / "calculator.py").exists()
+    events = read_events(recorder.path)
+    retry_events = [
+        e for e in events if e.get("kind") == "budget_event" and e.get("budget_reason") == "subagent_empty_turn_retry"
+    ]
+    assert retry_events
+
+
+def test_coder_truncated_turn_retries_then_writes_successfully(tmp_path: Path) -> None:
+    recorder = TraceRecorder(tmp_path)
+    client = FakeClient(
+        [
+            ModelTurn("", stop_reason="length", input_tokens=20, output_tokens=2048),
+            ModelTurn(
+                "",
+                [ToolCall("write-1", "write_file", {"path": "calc4/calculator.py", "content": "print('ok')\n"})],
+                stop_reason="tool_use",
+                input_tokens=30,
+                output_tokens=20,
+            ),
+            ModelTurn(
+                "calc4/calculator.py: created file; replaced 0 occurrence(s)",
+                input_tokens=15,
+                output_tokens=10,
+            ),
+        ]
+    )
+    guard = BudgetGuard(max_steps=20, max_tokens=1_000_000, max_usd=10.0, daily_remaining_usd=10.0)
+    policy = ApprovalPolicy(mode="off")
+
+    summary, status, writes_ok, _reads_ok = _run_live_subagent(
+        tmp_path,
+        "coder",
+        "Create calc4/calculator.py",
+        recorder,
+        client,
+        guard,
+        child_id="coder-1",
+        started=time.perf_counter(),
+        policy=policy,
+    )
+
+    assert status == "ok"
+    assert writes_ok == 1
+    assert "calc4/calculator.py" in summary
+    assert (tmp_path / "calc4" / "calculator.py").exists()
+    events = read_events(recorder.path)
+    retry_events = [
+        e for e in events if e.get("kind") == "budget_event" and e.get("budget_reason") == "subagent_empty_turn_retry"
+    ]
+    assert retry_events
+
+
+def test_coder_empty_turn_retries_exhausted_is_tool_error(tmp_path: Path) -> None:
+    recorder = TraceRecorder(tmp_path)
+    client = FakeClient(
+        [
+            ModelTurn("", input_tokens=20, output_tokens=1),
+            ModelTurn("", input_tokens=20, output_tokens=1),
+            ModelTurn("", input_tokens=20, output_tokens=1),
+        ]
+    )
+    guard = BudgetGuard(max_steps=20, max_tokens=1_000_000, max_usd=10.0, daily_remaining_usd=10.0)
+    policy = ApprovalPolicy(mode="off")
+
+    summary, status, writes_ok, _reads_ok = _run_live_subagent(
+        tmp_path,
+        "coder",
+        "Create calc3/calculator.py",
+        recorder,
+        client,
+        guard,
+        child_id="coder-1",
+        started=time.perf_counter(),
+        policy=policy,
+    )
+
+    assert status == "tool_error"
+    assert writes_ok == 0
+    assert "repeated empty responses" in summary
+    events = read_events(recorder.path)
+    assert any(
+        e.get("kind") == "budget_event" and e.get("budget_reason") == "subagent_empty_turn_abort"
+        for e in events
+    )
+
+
+def test_chat_loop_emits_run_end_on_keyboard_interrupt_during_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vg_agent import __main__ as cli
+
+    write_fixture(tmp_path)
+    prompts = iter(["do work"])
+    monkeypatch.setattr(cli, "use_rich_ui", lambda: False)
+    monkeypatch.setattr(cli, "_make_chat_prompt", lambda _history_path: (lambda: next(prompts), lambda: None))
+    monkeypatch.setattr(cli, "LiveModelClient", SimpleNamespace(from_env=lambda recorder=None: object()))
+
+    def fake_run_live_task(
+        root: Path,
+        prompt: str,
+        recorder: TraceRecorder,
+        *,
+        client: object,
+        guard: BudgetGuard,
+        policy: ApprovalPolicy,
+        history: list[dict[str, object]],
+    ) -> TraceRecorder:
+        recorder.emit("user_prompt", prompt=prompt)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "run_live_task", fake_run_live_task)
+    args = SimpleNamespace(no_redact=False, require_approval="off", yes=False, live_model=True)
+    assert cli._chat_loop(tmp_path, args) == 0
+    events = read_events(next(iter((tmp_path / "traces").glob("*.jsonl"))))
+    assert any(e.get("kind") == "budget_event" and e.get("budget_reason") == "user_abort" for e in events)
+    assert any(e.get("kind") == "run_end" and e.get("final_status") == "aborted" for e in events)
+
+
 def test_reviewer_spawn_includes_review_slice(tmp_path: Path) -> None:
     write_fixture(tmp_path)
     client = PipelineClient(
@@ -2796,6 +3045,67 @@ def test_reviewer_spawn_includes_review_slice(tmp_path: Path) -> None:
     assert rev_return["reads_ok"] >= 1
 
 
+def test_reviewer_py_compile_flow_returns_clean_verdict(tmp_path: Path) -> None:
+    write_fixture(tmp_path)
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Coder then reviewer.",
+                [ToolCall("spawn-c", "spawn_subagent", {"type": "coder", "question": "rename foo to baz in app.py"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn(
+                "Review coder.",
+                [ToolCall("spawn-r", "spawn_subagent", {"type": "reviewer", "question": "verify app.py edit"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("Review complete.", input_tokens=100, output_tokens=20),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn(
+                    "Edit.",
+                    [ToolCall("edit", "edit_file", {"path": "app.py", "old": "foo", "new": "baz"})],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn("app.py: renamed foo to baz", input_tokens=40, output_tokens=10),
+            ],
+            "reviewer": [
+                ModelTurn(
+                    "Compile check and pass.",
+                    [ToolCall("compile", "run_bash", {"command": "python3 -m py_compile app.py"})],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn("PASS: py_compile succeeded and edit is present", input_tokens=40, output_tokens=10),
+            ],
+        },
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "rename and review app.py", recorder, client=client)
+    events = read_events(recorder.path)
+    rev_return = next(
+        e for e in events if e["kind"] == "subagent_return" and e["agent_type"] == "reviewer"
+    )
+    assert rev_return["status"] == "ok"
+    assert str(rev_return["summary"]).startswith("PASS:")
+    reviewer_tool_results = [
+        e
+        for e in events
+        if e.get("kind") == "tool_result" and e.get("agent_type") == "reviewer" and e.get("tool") == "run_bash"
+    ]
+    assert reviewer_tool_results
+    assert all(e.get("status") == "ok" for e in reviewer_tool_results)
+    assert all("run_bash blocked" not in str(e.get("result_full") or "") for e in reviewer_tool_results)
+
+
 def test_reviewer_no_read_is_tool_error(tmp_path: Path) -> None:
     write_fixture(tmp_path)
     client = PipelineClient(
@@ -2838,6 +3148,70 @@ def test_reviewer_no_read_is_tool_error(tmp_path: Path) -> None:
         e for e in read_events(recorder.path) if e["kind"] == "subagent_return" and e["agent_type"] == "reviewer"
     )
     assert rev_return["status"] == "tool_error"
+
+
+def test_reviewer_verdict_fallback_on_step_exhaustion(tmp_path: Path) -> None:
+    write_fixture(tmp_path)
+    recorder = TraceRecorder(tmp_path)
+    turns: list[ModelTurn] = []
+    for i in range(config.MAX_SUBAGENT_STEPS):
+        turns.append(
+            ModelTurn(
+                "",
+                [ToolCall(f"t{i}", "read_file", {"path": "README.md"})],
+                stop_reason="tool_use",
+                input_tokens=10,
+                output_tokens=5,
+            )
+        )
+    client = FakeClient(turns)
+    guard = BudgetGuard(
+        max_steps=config.MAX_SUBAGENT_STEPS + 5,
+        max_tokens=1_000_000,
+        max_usd=10.0,
+        daily_remaining_usd=10.0,
+    )
+    policy = ApprovalPolicy(mode="writes", prompt=lambda _req: ApprovalOutcome(decision="denied", reason="no"))
+
+    summary, status, _writes_ok, _reads_ok = _run_live_subagent(
+        tmp_path,
+        "reviewer",
+        "verify README.md",
+        recorder,
+        client,
+        guard,
+        child_id="reviewer-1",
+        started=0.0,
+        policy=policy,
+    )
+    assert summary.startswith("FAIL:")
+    assert status == "tool_error"
+
+
+def test_reviewer_verdict_fallback_on_budget_cap_abort(tmp_path: Path) -> None:
+    recorder = TraceRecorder(tmp_path)
+    client = FakeClient([])
+    guard = BudgetGuard(
+        max_steps=0,
+        max_tokens=1_000_000,
+        max_usd=10.0,
+        daily_remaining_usd=10.0,
+    )
+    policy = ApprovalPolicy(mode="writes", prompt=lambda _req: ApprovalOutcome(decision="denied", reason="no"))
+
+    summary, status, _writes_ok, _reads_ok = _run_live_subagent(
+        tmp_path,
+        "reviewer",
+        "verify README.md",
+        recorder,
+        client,
+        guard,
+        child_id="reviewer-1",
+        started=0.0,
+        policy=policy,
+    )
+    assert summary.startswith("FAIL:")
+    assert status == "tool_error"
 
 
 def test_build_review_slice_and_resolve_coder_id(tmp_path: Path) -> None:

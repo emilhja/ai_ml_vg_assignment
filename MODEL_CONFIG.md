@@ -7,17 +7,18 @@ Sources:
 - https://docs.litellm.ai/docs/providers/openrouter
 - https://openrouter.ai/docs
 
-## Default Profile - Gemini 2.5 Flash OpenRouter
+## Default Profile - Hybrid OpenRouter
 
-The default profile uses LiteLLM executable OpenRouter model IDs for the
-parent and every sub-agent. This keeps demo cost low and is the configuration
-tested by the spec assertions in `specs/40_demo_and_eval.md`.
+The default profile uses LiteLLM executable OpenRouter model IDs with a
+Haiku coder override to reduce empty coder turns while preserving low-cost
+routing for read-mostly roles. This is the configuration tested by the spec
+assertions in `specs/40_demo_and_eval.md`.
 
 ```yaml
 PARENT_MODEL_ID: openrouter/google/gemini-2.5-flash
 GRILLING_MODEL_ID: openrouter/google/gemini-2.5-flash
 EXPLORER_MODEL_ID: openrouter/google/gemini-2.5-flash
-CODER_MODEL_ID: openrouter/google/gemini-2.5-flash
+CODER_MODEL_ID: openrouter/anthropic/claude-haiku-4.5
 REVIEWER_MODEL_ID: openrouter/google/gemini-2.5-flash
 COMPACTOR_MODEL_ID: openrouter/google/gemini-2.5-flash
 ```
@@ -48,12 +49,12 @@ Use different models per role when quality matters more than uniform cost:
 | Reviewer (verify) | `openrouter/anthropic/claude-haiku-4.5` or same tier as parent — **not lite** | Must read files and return PASS/FAIL |
 | Compactor | `openrouter/google/gemini-2.5-flash-lite` | Summarisation only |
 
-**Active demo profile (Sonnet parent + Haiku reviewer):**
+**Active demo profile (Sonnet parent + Haiku coder/reviewer):**
 
 ```yaml
 VG_PARENT_MODEL: openrouter/anthropic/claude-sonnet-4.6
 VG_REVIEWER_MODEL: openrouter/anthropic/claude-haiku-4.5
-VG_CODER_MODEL: openrouter/google/gemini-2.5-flash
+VG_CODER_MODEL: openrouter/anthropic/claude-haiku-4.5
 VG_EXPLORER_MODEL: openrouter/google/gemini-2.5-flash-lite
 VG_GRILLING_MODEL: openrouter/google/gemini-2.5-flash-lite
 VG_COMPACTOR_MODEL: openrouter/google/gemini-2.5-flash-lite

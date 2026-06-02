@@ -281,12 +281,12 @@ export const api = {
       session: SessionDetail | null;
       recent_events: EventItem[];
     }>("/sessions/active"),
-  session: (id: string) => get<SessionDetail>(`/sessions/${id}`),
+  session: (id: string) => get<SessionDetail>(`/sessions/${encodeURIComponent(id)}`),
   renameSession: (id: string, display_name: string | null) =>
-    patch<SessionSummary>(`/sessions/${id}`, { display_name }),
+    patch<SessionSummary>(`/sessions/${encodeURIComponent(id)}`, { display_name }),
   events: (id: string, from = -1, limit = 200) =>
     get<{ items: EventItem[]; has_more: boolean }>(
-      `/sessions/${id}/events?from_event_idx=${from}&limit=${limit}`,
+      `/sessions/${encodeURIComponent(id)}/events?from_event_idx=${from}&limit=${limit}`,
     ),
   timeline: (runId: string) => get<Timeline>(`/runs/${runId}/timeline`),
   context: (runId: string, stepIdx: number) =>

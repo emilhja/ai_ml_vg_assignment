@@ -1,12 +1,24 @@
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import { api } from "../api";
 import CompactionStatsBadge from "../components/CompactionStatsBadge";
 import EventFeed from "../components/EventFeed";
 import { SessionCard } from "../components/SessionCards";
 
-const TAB_IDS = ["timeline", "context", "tools", "safety", "events"] as const;
+const TAB_IDS = ["timeline", "cost", "context", "tools", "safety", "events"] as const;
 type Tab = (typeof TAB_IDS)[number];
 
 function parseTab(value: string | null): Tab {
@@ -51,7 +63,12 @@ export default function SessionDetailPage() {
     );
   };
 
-  const { data: detail, isLoading } = useQuery({
+  const {
+    data: detail,
+    isLoading,
+    isError,
+    error,
+  } = useQuery({
     queryKey: ["session", sessionId],
     queryFn: () => api.session(sessionId),
     enabled: !!sessionId,
@@ -68,7 +85,7 @@ export default function SessionDetailPage() {
   const { data: timeline } = useQuery({
     queryKey: ["timeline", runId],
     queryFn: () => api.timeline(runId),
-    enabled: !!runId && (tab === "timeline" || tab === "tools"),
+    enabled: !!runId && (tab === "timeline" || tab === "cost" || tab === "tools"),
   });
 
   const { data: maxStep } = useQuery({
@@ -137,17 +154,140 @@ export default function SessionDetailPage() {
     }
   }, [tab, highlightEventIdx, eventsData]);
 
-  if (isLoading || !detail) {
+  if (!sessionId) {
+    return (
+      <div className="space-y-3">
+        <p className="text-red-400">Invalid session id in URL.</p>
+        <Link to="/history" className="text-sm text-accent hover:underline">
+          ← Back to history
+        </Link>
+      </div>
+    );
+  }
+
+  if (isLoading) {
     return <p className="text-muted">Loading session…</p>;
+  }
+
+  if (isError) {
+    const message = (error as Error)?.message ?? "Unknown error";
+    return (
+      <div className="space-y-3">
+        <p className="text-red-400">
+          Cannot load session <span className="font-mono">{sessionId}</span>: {message}
+        </p>
+        <Link to="/history" className="text-sm text-accent hover:underline">
+          ← Back to history
+        </Link>
+      </div>
+    );
+  }
+
+  if (!detail) {
+    return (
+      <div className="space-y-3">
+        <p className="text-red-400">
+          Session <span className="font-mono">{sessionId}</span> was not found.
+        </p>
+        <Link to="/history" className="text-sm text-accent hover:underline">
+          ← Back to history
+        </Link>
+      </div>
+    );
   }
 
   const tabs: { id: Tab; label: string }[] = [
     { id: "timeline", label: "Timeline" },
+    { id: "cost", label: "Cost" },
     { id: "context", label: "Parent context" },
     { id: "tools", label: "Tools & errors" },
     { id: "safety", label: "Safety / FinOps" },
     { id: "events", label: "Events" },
   ];
+
+  const runTotals = detail.runs.find((r) => r.run_id === runId);
+
+  const turnSeries = useMemo(
+    () =>
+      (timeline?.turns ?? [])
+        .slice()
+        .sort((a, b) => (a.turn_index ?? 0) - (b.turn_index ?? 0))
+        .map((turn, idx) => {
+          const turnIndex = turn.turn_index ?? idx;
+          const totalTokens = Number(turn.total_tokens ?? 0);
+          return {
+            turnIndex,
+            label: `T${turnIndex}`,
+            totalTokens,
+            totalCostUsd: Number(turn.total_cost_usd ?? 0),
+            toolCalls: Number(turn.total_tool_calls ?? 0),
+          };
+        }),
+    [timeline],
+  );
+
+  const modelCostByModel = useMemo(() => {
+    const grouped = new Map<string, { model: string; costUsd: number; calls: number }>();
+    for (const call of timeline?.model_calls ?? []) {
+      const model = call.model_id ?? "unknown";
+      const current = grouped.get(model) ?? { model, costUsd: 0, calls: 0 };
+      current.costUsd += Number(call.cost_usd ?? 0);
+      current.calls += 1;
+      grouped.set(model, current);
+    }
+    return Array.from(grouped.values())
+      .sort((a, b) => b.costUsd - a.costUsd)
+      .slice(0, 10);
+  }, [timeline]);
+
+  const toolUsageByTool = useMemo(() => {
+    const grouped = new Map<
+      string,
+      { tool: string; calls: number; errors: number; totalLatencyMs: number; latencySamples: number }
+    >();
+    for (const call of timeline?.tool_calls ?? []) {
+      const tool = call.tool ?? "unknown";
+      const current = grouped.get(tool) ?? {
+        tool,
+        calls: 0,
+        errors: 0,
+        totalLatencyMs: 0,
+        latencySamples: 0,
+      };
+      current.calls += 1;
+      if (call.status !== "ok") current.errors += 1;
+      if (call.latency_ms != null) {
+        current.totalLatencyMs += Number(call.latency_ms);
+        current.latencySamples += 1;
+      }
+      grouped.set(tool, current);
+    }
+    return Array.from(grouped.values())
+      .map((row) => ({
+        tool: row.tool,
+        calls: row.calls,
+        errors: row.errors,
+        avgLatencyMs: row.latencySamples > 0 ? Math.round(row.totalLatencyMs / row.latencySamples) : 0,
+      }))
+      .sort((a, b) => b.calls - a.calls)
+      .slice(0, 12);
+  }, [timeline]);
+
+  const toolCallsByTime = useMemo(() => {
+    return (timeline?.tool_calls ?? [])
+      .slice()
+      .sort((a, b) => (a.started_at ?? "").localeCompare(b.started_at ?? ""))
+      .map((call, idx) => ({
+        idx: idx + 1,
+        ok: call.status === "ok" ? 1 : 0,
+        error: call.status === "ok" ? 0 : 1,
+      }));
+  }, [timeline]);
+
+  const modelCalls = timeline?.model_calls.length ?? 0;
+  const toolCalls = timeline?.tool_calls.length ?? 0;
+  const toolErrorCount = toolErrors.length;
+  const toolErrorRate = toolCalls > 0 ? (toolErrorCount / toolCalls) * 100 : 0;
 
   return (
     <div className={`space-y-6 ${tab === "events" ? "flex flex-col flex-1 min-h-0" : "overflow-y-auto"}`}>
@@ -264,6 +404,162 @@ export default function SessionDetailPage() {
               </table>
             </div>
           </section>
+        </div>
+      )}
+
+      {tab === "cost" && (
+        <div className="space-y-6">
+          {!timeline ? (
+            <p className="text-sm text-muted">Loading cost telemetry…</p>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                <Kpi label="Run tokens" value={(runTotals?.total_tokens ?? 0).toLocaleString()} />
+                <Kpi label="Run cost" value={`$${(runTotals?.total_cost_usd ?? 0).toFixed(4)}`} />
+                <Kpi label="Model calls" value={modelCalls.toLocaleString()} />
+                <Kpi label="Tool calls" value={toolCalls.toLocaleString()} />
+                <Kpi label="Tool error rate" value={`${toolErrorRate.toFixed(1)}%`} />
+              </div>
+
+              {turnSeries.length > 0 ? (
+                <section>
+                  <h3 className="text-sm font-medium text-muted mb-2">Per-turn tokens, cost, and tool calls</h3>
+                  <div className="h-64 bg-panel/50 rounded-lg p-2">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={turnSeries}>
+                        <CartesianGrid stroke="#334155" strokeDasharray="3 3" />
+                        <XAxis dataKey="label" tick={{ fill: "#8b9cb3", fontSize: 11 }} />
+                        <YAxis yAxisId="left" tick={{ fill: "#8b9cb3", fontSize: 11 }} />
+                        <YAxis yAxisId="right" orientation="right" tick={{ fill: "#8b9cb3", fontSize: 11 }} />
+                        <Tooltip contentStyle={{ background: "#1a2332", border: "1px solid #334155" }} />
+                        <Legend />
+                        <Line
+                          yAxisId="left"
+                          type="monotone"
+                          dataKey="totalTokens"
+                          stroke="#e07a5f"
+                          dot={false}
+                          name="Tokens"
+                        />
+                        <Line
+                          yAxisId="right"
+                          type="monotone"
+                          dataKey="totalCostUsd"
+                          stroke="#34d399"
+                          dot={false}
+                          name="Cost USD"
+                        />
+                        <Line
+                          yAxisId="left"
+                          type="monotone"
+                          dataKey="toolCalls"
+                          stroke="#818cf8"
+                          dot={false}
+                          name="Tool calls"
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                </section>
+              ) : (
+                <p className="text-sm text-muted">No turn-level token/cost data available for this run.</p>
+              )}
+
+              <div className="grid lg:grid-cols-2 gap-6">
+                <section>
+                  <h3 className="text-sm font-medium text-muted mb-2">Top models by cost</h3>
+                  {modelCostByModel.length > 0 ? (
+                    <div className="h-72 bg-panel/50 rounded-lg p-2">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={modelCostByModel} layout="vertical" margin={{ left: 8, right: 8 }}>
+                          <CartesianGrid stroke="#334155" strokeDasharray="3 3" />
+                          <XAxis type="number" tick={{ fill: "#8b9cb3", fontSize: 11 }} />
+                          <YAxis
+                            type="category"
+                            dataKey="model"
+                            width={190}
+                            tick={{ fill: "#8b9cb3", fontSize: 10 }}
+                          />
+                          <Tooltip contentStyle={{ background: "#1a2332", border: "1px solid #334155" }} />
+                          <Bar dataKey="costUsd" fill="#e07a5f" name="Cost USD" radius={[0, 4, 4, 0]} />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-muted">No model call cost data available for this run.</p>
+                  )}
+                </section>
+
+                <section>
+                  <h3 className="text-sm font-medium text-muted mb-2">Tool calls and errors by tool</h3>
+                  {toolUsageByTool.length > 0 ? (
+                    <div className="h-72 bg-panel/50 rounded-lg p-2">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={toolUsageByTool} margin={{ left: 8, right: 8 }}>
+                          <CartesianGrid stroke="#334155" strokeDasharray="3 3" />
+                          <XAxis dataKey="tool" tick={{ fill: "#8b9cb3", fontSize: 10 }} interval={0} />
+                          <YAxis tick={{ fill: "#8b9cb3", fontSize: 11 }} />
+                          <Tooltip contentStyle={{ background: "#1a2332", border: "1px solid #334155" }} />
+                          <Legend />
+                          <Bar dataKey="calls" fill="#818cf8" name="Calls" radius={[4, 4, 0, 0]} />
+                          <Bar dataKey="errors" fill="#f87171" name="Errors" radius={[4, 4, 0, 0]} />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-muted">No tool telemetry available for this run.</p>
+                  )}
+                </section>
+              </div>
+
+              {toolUsageByTool.length > 0 && (
+                <section className="overflow-x-auto">
+                  <h3 className="text-sm font-medium text-muted mb-2">Tool latency summary</h3>
+                  <table className="w-full text-xs">
+                    <thead className="text-muted text-left">
+                      <tr>
+                        <th className="py-1">Tool</th>
+                        <th>Calls</th>
+                        <th>Errors</th>
+                        <th>Avg latency</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {toolUsageByTool.map((row) => (
+                        <tr key={row.tool} className="border-t border-slate-700/30">
+                          <td className="py-1 font-mono">{row.tool}</td>
+                          <td>{row.calls}</td>
+                          <td className={row.errors > 0 ? "text-red-400" : "text-emerald-400"}>
+                            {row.errors}
+                          </td>
+                          <td>{row.avgLatencyMs > 0 ? `${row.avgLatencyMs}ms` : "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </section>
+              )}
+
+              {toolCallsByTime.length > 0 && (
+                <section>
+                  <h3 className="text-sm font-medium text-muted mb-2">Tool call outcomes over sequence</h3>
+                  <div className="h-56 bg-panel/50 rounded-lg p-2">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={toolCallsByTime}>
+                        <CartesianGrid stroke="#334155" strokeDasharray="3 3" />
+                        <XAxis dataKey="idx" tick={{ fill: "#8b9cb3", fontSize: 11 }} />
+                        <YAxis tick={{ fill: "#8b9cb3", fontSize: 11 }} />
+                        <Tooltip contentStyle={{ background: "#1a2332", border: "1px solid #334155" }} />
+                        <Legend />
+                        <Bar dataKey="ok" stackId="outcome" fill="#34d399" name="OK" />
+                        <Bar dataKey="error" stackId="outcome" fill="#f87171" name="Error" />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </section>
+              )}
+            </>
+          )}
         </div>
       )}
 
@@ -475,6 +771,15 @@ export default function SessionDetailPage() {
           />
         </div>
       )}
+    </div>
+  );
+}
+
+function Kpi({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg border border-slate-700/50 bg-panel p-3">
+      <p className="text-xs text-muted">{label}</p>
+      <p className="text-base font-semibold mt-1">{value}</p>
     </div>
   );
 }

@@ -251,7 +251,7 @@ export default function HistoryPage() {
               <tr key={s.session_id} className="border-t border-slate-700/40 hover:bg-panel/40">
                 <td className="px-4 py-2">
                   <Link
-                    to={`/history/${s.session_id}${s.has_tool_compaction ? "?tab=context" : ""}`}
+                    to={`/history/${encodeURIComponent(s.session_id)}${s.has_tool_compaction ? "?tab=context" : ""}`}
                     className="text-accent hover:underline font-medium"
                   >
                     {s.display_name?.trim() || `${s.session_id.slice(0, 12)}…`}

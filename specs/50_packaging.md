@@ -70,7 +70,7 @@ packaged configuration surface is the TOML schema below:
 parent = "openrouter/google/gemini-2.5-flash"
 grilling = "openrouter/google/gemini-2.5-flash"
 explorer = "openrouter/google/gemini-2.5-flash"
-coder = "openrouter/google/gemini-2.5-flash"
+coder = "openrouter/anthropic/claude-haiku-4.5"
 reviewer = "openrouter/google/gemini-2.5-flash"
 compactor = "openrouter/google/gemini-2.5-flash"
 
@@ -142,7 +142,7 @@ OPENROUTER_EXPENSIVE_PROVIDERS=alibaba,morph,parasail/fp8
 VG_PARENT_MODEL=openrouter/google/gemini-2.5-flash
 VG_GRILLING_MODEL=openrouter/google/gemini-2.5-flash
 VG_EXPLORER_MODEL=openrouter/google/gemini-2.5-flash
-VG_CODER_MODEL=openrouter/google/gemini-2.5-flash
+VG_CODER_MODEL=openrouter/anthropic/claude-haiku-4.5
 VG_REVIEWER_MODEL=openrouter/google/gemini-2.5-flash
 VG_COMPACTOR_MODEL=openrouter/google/gemini-2.5-flash
 VG_MAX_USD_PER_RUN=0.50

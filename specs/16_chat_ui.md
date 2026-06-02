@@ -164,6 +164,9 @@ When `--require-approval` is not `off` and `use_rich_ui()` is true:
 - Show a cyan-bordered Rich `Panel` on stderr with tool summary, optional diff
   (see **File-edit diffs**), and shortcuts:
   `1/y yes`, `2 yes (scoped)`, `3/a always`, `4/n no`, `5 abort`.
+- For `budget_cap` prompts, option `2 yes (this cap)` is cached by the
+  `budget_reason` (e.g. `step_cap`, `token_cap`) rather than by a filesystem
+  folder path, so the agent won’t re-prompt for the same cap type repeatedly.
 - Use `prompt_toolkit` for input when available; otherwise numbered menu on stderr.
 - Record `approval` events unchanged; progress stream still logs
   `[approval] decision=…` after the choice.

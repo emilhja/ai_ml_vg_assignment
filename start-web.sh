@@ -200,4 +200,7 @@ echo "API ready (pid $API_PID). Starting Vite (foreground; Ctrl+C stops both)...
 echo ""
 
 cd "$ROOT_DIR/dashboard/web"
+echo "Building dashboard web app..."
+npm run build
+echo "Build complete. Starting Vite dev server..."
 exec npm run dev

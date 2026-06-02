@@ -448,15 +448,24 @@ def format_budget_cap_approval_text(reason: str, details: dict[str, Any]) -> str
             f"{headline}\n"
             f"  Parent steps used:   {steps}/{max_steps}\n"
             f"  1/y yes adds:        1 step (→ {bump_once} max)\n"
-            f"  2 scoped adds:       {bump_scoped - max_steps} steps (→ {bump_scoped} max)\n"
+            f"  2 this cap adds:     {bump_scoped - max_steps} steps (→ {bump_scoped} max)\n"
             f"Approve to raise the step cap for this run, or n/abort to stop."
         )
     if reason == "token_cap":
         tokens = int(details.get("tokens") or details.get("running_tokens") or 0)
         max_tokens = int(details.get("max_tokens") or 0)
+        bump = max(10_000, max_tokens // 4) if max_tokens > 0 else 0
+        # Choices:
+        # - `1/y yes` is a one-time bump: new max = running_tokens + bump
+        # - `2/3` is "this cap"/"always": new max = max_tokens + bump
+        new_max_once = tokens + bump
+        new_max_scoped = max_tokens + bump
         return (
             f"Token cap reached ({tokens:,}/{max_tokens:,}).\n"
-            f"Approve to raise the token cap for this run, or n/abort to stop."
+            f"  Bump:                ~{bump:,} tokens\n"
+            f"  1/y (one-time) max: ~{new_max_once:,}\n"
+            f"  2/3 (this cap) max: ~{new_max_scoped:,}\n"
+            f"Approve to raise the token cap (1/y for one-time, 2 to cache for this cap type), or n/abort to stop."
         )
     if reason == "usd_cap":
         cap = float(details.get("max_usd") or 0.0)
@@ -1153,6 +1162,14 @@ def _parse_approval_choice(line: str, request: Any) -> Any:
         return ApprovalOutcome(decision="approved", reason="user yes")
     if choice == "2":
         path = request.path or ""
+        # `budget_cap` requests use `request.path` to carry the cap reason
+        # (e.g. "step_cap", "token_cap"), not a filesystem path. Cache the
+        # user's choice per cap reason so we don't re-prompt for the same
+        # cap type repeatedly.
+        if request.tool == "budget_cap":
+            scope = str(path)
+            return ApprovalOutcome(decision="approved_scoped", scope_key=scope, reason="user yes-folder")
+
         normalized = path.replace("\\", "/")
         parent = "/".join(normalized.split("/")[:-1])
         if request.tool == "run_bash" and not request.path:

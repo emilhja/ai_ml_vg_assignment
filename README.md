@@ -111,15 +111,26 @@ OpenRouter/LiteLLM docs checked on 2026-05-28:
 
 ## Command safety
 
-`run_bash` is intentionally not a general shell escape. The generated tool
-accepts only simple read-only inspection commands and rejects shell control
+`run_bash` is intentionally not a general shell escape. The generated tool is
+deny-by-default: it accepts simple read-only inspection commands (`grep`, `rg`,
+`find`, `ls`, `pwd`, `cat`, `head`, `tail`, `wc`) and rejects shell control
 operators, redirection, command substitution, and destructive command tokens
-such as `rm`, `del`, `rmdir`, `Remove-Item`, `mv`, `cp`, `chmod`, `mkfs`,
-`dd`, `git`, `ssh`, `scp`, and any package installer or foreign-language
-runtime. `sed` is excluded from the allowlist because `sed -i` mutates files
-in place. Argument tokens that shell out (`-exec`, `-execdir`, `-delete`,
-`-ok`, `-okdir`, `-fprint`, anything starting with `--exec`) are also
-rejected. Rejected commands are returned as tool errors and are not executed.
+such as `del`, `rmdir`, `Remove-Item`, `mv`, `cp`, `chmod`, `mkfs`, `dd`,
+`git`, `ssh`, `scp`, and any package installer or foreign-language runtime.
+`sed` is excluded from the allowlist because `sed -i` mutates files in place.
+Argument tokens that shell out (`-exec`, `-execdir`, `-delete`, `-ok`,
+`-okdir`, `-fprint`, anything starting with `--exec`) are also rejected.
+Rejected commands are returned as tool errors and are not executed.
+
+Three narrowly scoped workspace operations are allowed (see
+[`specs/20_tools.md`](specs/20_tools.md) for the exact validation):
+
+- `rm <file>` — deletes exactly one existing regular file under the workspace
+  root. No flags, no directories, no globs.
+- `mkdir [-p] <dir> …` — creates workspace-relative directories. `-p` is the
+  only permitted flag; no globs or `..` traversal.
+- `python3 -m py_compile <relative .py>` — syntax-only check on a single
+  workspace-relative target. No other flags, paths, or `python` invocations.
 
 File tools (`read_file`, `read_file_range`, `write_file`, `edit_file`) refuse
 any path matching the sensitive-path denylist (`.env`, `id_rsa`, `*.pem`,
@@ -185,18 +196,23 @@ directory. If you run uvicorn inside `dashboard/web`, startup will log
 uv sync --extra dashboard --extra dev
 ```
 
-**Recommended (Git Bash / WSL)** — one command from repo root starts API + Vite:
+**Recommended (Git Bash / WSL)** — one command from the repo root starts both
+the API (from the repo root, where it can find the traces) and the Vite dev
+server, then opens http://127.0.0.1:5173:
 
 ```bash
 ./start-web.sh
 # Optional: ./start-web.sh --no-install --api-port 8787
 ```
 
+Requires `uv` and `npm` on `PATH`. `--no-install` skips dependency installs for
+a faster restart; `--api-port` overrides the default API port (8787).
+
 **Manual two-terminal setup** (fallback):
 
 ```powershell
-# From repo root: C:\Users\emil_\vscode\vg_assignment
-cd C:\Users\emil_\vscode\vg_assignment
+# From the repo root:
+cd <repo-root>
 
 # Terminal 1 — API (must be repo root)
 $env:VG_WORKSPACE_ROOT = "workspace"
@@ -238,8 +254,8 @@ Do **not** run `uvicorn` from `dashboard/web` unless you set `VG_TRACES_DIR` /
 
 ```powershell
 cd dashboard\web
-$env:VG_TRACES_DIR = "C:\Users\emil_\vscode\vg_assignment\traces"
-$env:VG_SQLITE_PATH = "C:\Users\emil_\vscode\vg_assignment\traces\vg_agent.sqlite3"
+$env:VG_TRACES_DIR = "<repo-root>\traces"
+$env:VG_SQLITE_PATH = "<repo-root>\traces\vg_agent.sqlite3"
 uv run uvicorn dashboard.api.main:app --host 127.0.0.1 --port 8787 --reload
 ```
 
@@ -252,8 +268,11 @@ Quick checks:
 
 | Topic | Path |
 |-------|------|
+| Source-of-truth specs | [`specs/`](specs/) |
 | Architecture | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
 | Pricing / models | [`docs/PRICE.md`](docs/PRICE.md), [`MODEL_CONFIG.md`](MODEL_CONFIG.md) |
+| Model selection notes | [`specs/model_experience.md`](specs/model_experience.md) |
+| Context windows (generator input) | [`CONTEXT_WINDOWS.md`](CONTEXT_WINDOWS.md) |
 | Live demo script | [`docs/demo/final_demo_live_chat_script.md`](docs/demo/final_demo_live_chat_script.md) |
 | Demo review notes | [`docs/demo/demo_review.md`](docs/demo/demo_review.md) |
 | Command safety | [`docs/dev/dangerous_cli.md`](docs/dev/dangerous_cli.md) |

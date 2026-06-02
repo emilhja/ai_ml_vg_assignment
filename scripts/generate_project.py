@@ -1248,6 +1248,38 @@ def _mkdir_paths_from_tokens(tokens: list[str]) -> tuple[list[str], str | None]:
     return paths, None
 
 
+def _py_compile_target_from_tokens(tokens: list[str]) -> str | None:
+    if len(tokens) != 4:
+        return None
+    head = Path(tokens[0]).name.lower()
+    if head.endswith(".exe"):
+        head = head[:-4]
+    if head != "python3":
+        return None
+    if tokens[1] != "-m" or tokens[2] != "py_compile":
+        return None
+    return tokens[3]
+
+
+def _validate_py_compile_tokens(tokens: list[str]) -> str | None:
+    target = _py_compile_target_from_tokens(tokens)
+    if target is None:
+        return "only `python3 -m py_compile <single relative .py path>` is allowed"
+    if target.startswith("-"):
+        return "py_compile target must be a workspace-relative .py file"
+    if any(marker in target for marker in GLOB_MARKERS):
+        return "py_compile glob patterns are not allowed"
+    sensitive = validate_sensitive_path(target)
+    if sensitive:
+        return sensitive
+    path_error = _path_token_error(target)
+    if path_error:
+        return path_error
+    if not target.endswith(".py"):
+        return "py_compile target must be a .py file"
+    return None
+
+
 def _validate_mkdir_target(target: str) -> str | None:
     if target in {"..", "../"}:
         return "mkdir target must stay inside the workspace"
@@ -1305,6 +1337,9 @@ def validate_shell_command(command: str) -> str | None:
         if base.endswith(".exe"):
             base = base[:-4]
         normalized.append(base)
+    py_compile_target = _py_compile_target_from_tokens(tokens)
+    if py_compile_target is not None:
+        return _validate_py_compile_tokens(tokens)
     if normalized[0] == "rm":
         return _validate_rm_tokens(tokens)
     if normalized[0] == "mkdir":
@@ -1329,6 +1364,21 @@ def validate_shell_command_for_workspace(root: Path, command: str) -> str | None
     syntax_error = validate_shell_command(command)
     if syntax_error:
         return syntax_error
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return "could not parse command"
+    py_compile_target = _py_compile_target_from_tokens(tokens)
+    if py_compile_target is not None:
+        try:
+            path = resolve_workspace_path(root, py_compile_target)
+        except ValueError as exc:
+            return str(exc)
+        if not path.exists():
+            return f"py_compile target {py_compile_target!r} does not exist"
+        if not path.is_file():
+            return "py_compile target must be a regular file"
+        return None
     target = rm_delete_target(command)
     if target is not None:
         try:
@@ -3330,6 +3380,8 @@ def _run_live_subagent(
     verdict_retry_used = False
     require_impl_read = agent_type == "coder" and _question_requires_tests(question)
     impl_read_ok = False
+    empty_turn_retries = 0
+    max_empty_turn_retries = 2
 
     for local_step in range(1, config.MAX_SUBAGENT_STEPS + 1):
         if _wall_clock_exceeded(started, guard):
@@ -3426,6 +3478,55 @@ def _run_live_subagent(
         messages.append({"role": "assistant", "content": _assistant_content(turn)})
         if not turn.tool_calls:
             final_summary = turn.assistant_text[:2048]
+            empty_or_truncated_coder_turn = (
+                agent_type == "coder"
+                and (
+                    not str(turn.assistant_text or "").strip()
+                    or str(turn.stop_reason or "").strip().lower() == "length"
+                )
+            )
+            if empty_or_truncated_coder_turn:
+                empty_turn_retries += 1
+                recorder.emit(
+                    "budget_event",
+                    agent_id=child_id,
+                    parent_id="parent",
+                    agent_type=agent_type,
+                    budget_reason="subagent_empty_turn_retry",
+                    details={
+                        "empty_turn_retries": empty_turn_retries,
+                        "max_empty_turn_retries": max_empty_turn_retries,
+                    },
+                )
+                if empty_turn_retries <= max_empty_turn_retries:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your previous response did not complete a valid tool call. "
+                                "For this mutation task you must call write_file or edit_file now. "
+                                "Do not return empty or truncated text."
+                            ),
+                        }
+                    )
+                    continue
+                status = "tool_error"
+                final_summary = (
+                    "Coder returned repeated empty responses without any tool calls."
+                )
+                recorder.emit(
+                    "budget_event",
+                    agent_id=child_id,
+                    parent_id="parent",
+                    agent_type=agent_type,
+                    budget_reason="subagent_empty_turn_abort",
+                    details={
+                        "empty_turn_retries": empty_turn_retries,
+                        "max_empty_turn_retries": max_empty_turn_retries,
+                    },
+                )
+                completed = True
+                break
             if agent_type == "reviewer":
                 if read_tools_ok == 0:
                     if not verdict_retry_used:
@@ -3507,13 +3608,29 @@ def _run_live_subagent(
                 break
         messages.append({"role": "user", "content": tool_blocks})
 
-    if not final_summary:
+    if agent_type == "reviewer" and not _is_reviewer_verdict(final_summary):
+        # Contract: reviewer `subagent_return.payload` must start with
+        # `PASS:` or `FAIL:` so the parent can always surface a readable
+        # verdict (even on budget/timeout/step exhaustion).
+        if status == "timeout":
+            stop_reason = "timed out"
+        elif not completed and status == "ok":
+            stop_reason = "reached the reviewer step limit"
+        else:
+            stop_reason = "stopped before returning a verdict"
+        final_summary = f"FAIL: Reviewer did not return PASS:/FAIL: ({stop_reason})."
+        status = "tool_error"
+        completed = True
+    elif not final_summary:
         final_summary = f"{agent_type} stopped before producing a final summary."
     if not completed and status == "ok" and had_tool_error:
         status = "tool_error"
     if agent_type == "coder" and completed and status == "ok" and writes_ok == 0:
         status = "tool_error"
-        final_summary = "Coder returned without writing or editing any file."
+        if empty_turn_retries > 0:
+            final_summary = "Coder did not write any file after empty-turn retries."
+        else:
+            final_summary = "Coder returned without writing or editing any file."
     if agent_type == "coder" and completed and status == "ok" and require_impl_read and writes_ok > 0 and not impl_read_ok:
         status = "tool_error"
         final_summary = "Coder wrote tests without reading the implementation file first."
@@ -5022,7 +5139,24 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             except MissingOpenRouterKey as exc:
                 sys.stderr.write(f"error: {exc}\\n")
                 return 2
-            run_live_task(root, prompt, recorder, client=client, guard=guard, policy=policy, history=conversation)
+            try:
+                run_live_task(root, prompt, recorder, client=client, guard=guard, policy=policy, history=conversation)
+            except KeyboardInterrupt:
+                recorder.emit("budget_event", budget_reason="user_abort", details={})
+                if not any(
+                    e.get("kind") == "run_end"
+                    and int(e.get("event_idx", -1)) >= start_idx
+                    for e in recorder.events
+                ):
+                    recorder.emit(
+                        "run_end",
+                        final_status="aborted",
+                        total_cost_usd=round(guard.running_usd, 6),
+                        total_tokens=guard.running_tokens,
+                        duration_s=0.0,
+                    )
+                sys.stderr.write("\\n")
+                break
             turn_state["force_state"] = None
             answer = _latest_parent_answer(recorder.events, start_idx)
             literal_outputs = _literal_tool_outputs(
@@ -5107,7 +5241,17 @@ def main(argv: list[str] | None = None) -> int:
     except MissingOpenRouterKey as exc:
         parser.exit(2, f"error: {exc}\\n")
     guard = BudgetGuard.for_workspace(root, **_guard_overrides(args))
-    run_live_task(root, args.task, recorder, client=client, guard=guard, policy=policy)
+    try:
+        run_live_task(root, args.task, recorder, client=client, guard=guard, policy=policy)
+    except KeyboardInterrupt:
+        recorder.emit("budget_event", budget_reason="user_abort", details={})
+        recorder.emit(
+            "run_end",
+            final_status="aborted",
+            total_cost_usd=round(guard.running_usd, 6),
+            total_tokens=guard.running_tokens,
+            duration_s=0.0,
+        )
     answer = _latest_parent_answer(recorder.events)
     if answer:
         print(answer)

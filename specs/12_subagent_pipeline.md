@@ -57,7 +57,10 @@ the JSONL trace slice for the Coder run under review:
 - Reviewer must call at least one read tool (`read_file`, `read_file_range`,
   or allowlisted `run_bash`) before returning; text-only exits are
   `tool_error`.
-- Reviewer final message must start with `PASS:` or `FAIL:`.
+- Reviewer final message must start with `PASS:` or `FAIL:`. If the reviewer
+  runs out of budget/steps or otherwise stops before producing a verdict, the
+  runtime returns a deterministic `FAIL:` with a short reason (and marks the
+  sub-agent status as `tool_error`).
 - Spawning `reviewer` without a prior Coder in the current run trace returns
   `tool_error` with guidance to use Explorer for read-only review.
 
@@ -66,6 +69,20 @@ the JSONL trace slice for the Coder run under review:
 When the spawn `question` mentions `test_*.py`, pytest, or tests, Coder must
 successfully `read_file` or `read_file_range` an implementation `.py` (non-test)
 before `write_file` on a test file. Violations are `tool_error`.
+
+### Coder empty-turn hardening
+
+Some live providers occasionally return an empty Coder step (`assistant_text`
+blank and no `tool_calls`) even for explicit write instructions. Runtime must:
+
+- detect this as an `empty_turn` condition (not a normal completion),
+- retry Coder locally with a deterministic nudge that explicitly requires
+  `write_file` or `edit_file`,
+- cap retries (bounded, no infinite loop),
+- emit trace diagnostics so this failure mode is visible during review.
+
+If retries are exhausted, Coder returns `tool_error` with a deterministic reason
+indicating repeated empty turns.
 
 ### Verify loop (fix + test)
 

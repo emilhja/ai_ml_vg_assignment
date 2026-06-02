@@ -67,10 +67,11 @@ each sub-agent in a `spawn_subagents` call receives
 Explorers where one inspects a 1-line file and the other a 10k-line
 directory — can starve the large one even when the small one returns with
 budget to spare. The mitigation (re-slice on early return) is listed as
-future work in `specs/12_subagent_pipeline.md`. Second weakness: the
-heuristic that triggers Grilling is keyword-based and will over-fire on
-short but unambiguous tasks; the `--no-grill` flag is the user-facing
-escape hatch.
+future work in `specs/12_subagent_pipeline.md`. Second weakness: whether to
+invoke Grilling is left to the parent model rather than a deterministic gate,
+so on a short but genuinely ambiguous task the parent may over-fire and spend
+one clarifying round-trip — but because there is no flag forcing it, the parent
+can also skip Grilling and proceed when the task is already concrete.
 
 ## Failure modes (quick reference)
 

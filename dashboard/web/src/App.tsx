@@ -12,8 +12,10 @@ function NavItem({ to, children }: { to: string; children: React.ReactNode }) {
     <NavLink
       to={to}
       className={({ isActive }) =>
-        `px-3 py-2 rounded-md text-sm font-medium ${
-          isActive ? "bg-accent/20 text-accent" : "text-muted hover:text-white"
+        `block w-full px-3 py-2 rounded-md text-sm font-medium text-center transition-colors ${
+          isActive
+            ? "bg-accent/20 text-accent"
+            : "text-muted hover:text-white hover:bg-slate-800/60"
         }`
       }
     >
@@ -30,23 +32,25 @@ export default function App() {
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
-      <header className="shrink-0 border-b border-slate-700/60 bg-panel/80 backdrop-blur z-10">
-        <div className={`${shellWidth} py-3 flex items-center justify-between gap-4`}>
-          <div>
+      <header className="shrink-0 sticky top-0 z-20 border-b border-slate-700/60 bg-panel/90 backdrop-blur">
+        <div className={`${shellWidth} py-3 flex items-start justify-between gap-4`}>
+          <div className="min-w-0">
             <h1 className="text-lg font-semibold text-white">VG Agent Dashboard</h1>
             <p className="text-xs text-amber-200/80">
               Traces may contain redacted-but-sensitive data. Local use only.
             </p>
             <StatusBanner />
           </div>
-          <div className="flex items-center gap-2">
+          <div className="shrink-0">
             <WideScreenToggle />
-            <nav className="flex gap-1">
+          </div>
+        </div>
+        <div className={`${shellWidth} pb-3`}>
+          <nav className="grid grid-cols-3 gap-2">
               <NavItem to="/">Current</NavItem>
               <NavItem to="/history">History</NavItem>
               <NavItem to="/stats">Statistics</NavItem>
-            </nav>
-          </div>
+          </nav>
         </div>
       </header>
       <main className={`flex-1 min-h-0 flex flex-col overflow-hidden ${shellWidth} py-4`}>

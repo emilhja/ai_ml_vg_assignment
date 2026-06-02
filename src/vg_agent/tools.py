@@ -158,6 +158,38 @@ def _mkdir_paths_from_tokens(tokens: list[str]) -> tuple[list[str], str | None]:
     return paths, None
 
 
+def _py_compile_target_from_tokens(tokens: list[str]) -> str | None:
+    if len(tokens) != 4:
+        return None
+    head = Path(tokens[0]).name.lower()
+    if head.endswith(".exe"):
+        head = head[:-4]
+    if head != "python3":
+        return None
+    if tokens[1] != "-m" or tokens[2] != "py_compile":
+        return None
+    return tokens[3]
+
+
+def _validate_py_compile_tokens(tokens: list[str]) -> str | None:
+    target = _py_compile_target_from_tokens(tokens)
+    if target is None:
+        return "only `python3 -m py_compile <single relative .py path>` is allowed"
+    if target.startswith("-"):
+        return "py_compile target must be a workspace-relative .py file"
+    if any(marker in target for marker in GLOB_MARKERS):
+        return "py_compile glob patterns are not allowed"
+    sensitive = validate_sensitive_path(target)
+    if sensitive:
+        return sensitive
+    path_error = _path_token_error(target)
+    if path_error:
+        return path_error
+    if not target.endswith(".py"):
+        return "py_compile target must be a .py file"
+    return None
+
+
 def _validate_mkdir_target(target: str) -> str | None:
     if target in {"..", "../"}:
         return "mkdir target must stay inside the workspace"
@@ -215,6 +247,9 @@ def validate_shell_command(command: str) -> str | None:
         if base.endswith(".exe"):
             base = base[:-4]
         normalized.append(base)
+    py_compile_target = _py_compile_target_from_tokens(tokens)
+    if py_compile_target is not None:
+        return _validate_py_compile_tokens(tokens)
     if normalized[0] == "rm":
         return _validate_rm_tokens(tokens)
     if normalized[0] == "mkdir":
@@ -239,6 +274,21 @@ def validate_shell_command_for_workspace(root: Path, command: str) -> str | None
     syntax_error = validate_shell_command(command)
     if syntax_error:
         return syntax_error
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return "could not parse command"
+    py_compile_target = _py_compile_target_from_tokens(tokens)
+    if py_compile_target is not None:
+        try:
+            path = resolve_workspace_path(root, py_compile_target)
+        except ValueError as exc:
+            return str(exc)
+        if not path.exists():
+            return f"py_compile target {py_compile_target!r} does not exist"
+        if not path.is_file():
+            return "py_compile target must be a regular file"
+        return None
     target = rm_delete_target(command)
     if target is not None:
         try:
