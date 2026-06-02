@@ -1,4 +1,4 @@
-# parallel test?
+# parallel test - this also works
 Use one spawn_subagents call with two Explorer requests (read-only):
 - Summarize public API of calc_haiku_4/calculator_engine.py (classes, methods, how UI should call it).
 - Summarize public API of calc_haiku_4/calculator_ui.py (constructor args, run/mainloop).

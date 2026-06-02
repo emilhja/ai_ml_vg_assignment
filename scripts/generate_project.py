@@ -1286,8 +1286,8 @@ def _mkdir_paths_from_tokens(tokens: list[str]) -> tuple[list[str], str | None]:
     return paths, None
 
 
-def _py_compile_target_from_tokens(tokens: list[str]) -> str | None:
-    if len(tokens) != 4:
+def _py_compile_targets_from_tokens(tokens: list[str]) -> list[str] | None:
+    if len(tokens) < 4:
         return None
     head = Path(tokens[0]).name.lower()
     if head.endswith(".exe"):
@@ -1296,13 +1296,13 @@ def _py_compile_target_from_tokens(tokens: list[str]) -> str | None:
         return None
     if tokens[1] != "-m" or tokens[2] != "py_compile":
         return None
-    return tokens[3]
+    targets = tokens[3:]
+    if not targets:
+        return None
+    return targets
 
 
-def _validate_py_compile_tokens(tokens: list[str]) -> str | None:
-    target = _py_compile_target_from_tokens(tokens)
-    if target is None:
-        return "only `python3 -m py_compile <single relative .py path>` is allowed"
+def _validate_py_compile_target(target: str) -> str | None:
     if target.startswith("-"):
         return "py_compile target must be a workspace-relative .py file"
     if any(marker in target for marker in GLOB_MARKERS):
@@ -1315,6 +1315,19 @@ def _validate_py_compile_tokens(tokens: list[str]) -> str | None:
         return path_error
     if not target.endswith(".py"):
         return "py_compile target must be a .py file"
+    return None
+
+
+def _validate_py_compile_tokens(tokens: list[str]) -> str | None:
+    targets = _py_compile_targets_from_tokens(tokens)
+    if targets is None:
+        return "only `python3 -m py_compile <relative .py path> [...]` is allowed"
+    if len(targets) > MAX_PY_COMPILE_TARGETS:
+        return f"py_compile accepts at most {MAX_PY_COMPILE_TARGETS} files per command"
+    for target in targets:
+        target_error = _validate_py_compile_target(target)
+        if target_error:
+            return target_error
     return None
 
 
@@ -1375,13 +1388,15 @@ def validate_shell_command(command: str) -> str | None:
         if base.endswith(".exe"):
             base = base[:-4]
         normalized.append(base)
-    py_compile_target = _py_compile_target_from_tokens(tokens)
-    if py_compile_target is not None:
+    py_compile_targets = _py_compile_targets_from_tokens(tokens)
+    if py_compile_targets is not None:
         return _validate_py_compile_tokens(tokens)
     if normalized[0] == "rm":
         return _validate_rm_tokens(tokens)
     if normalized[0] == "mkdir":
         return _validate_mkdir_tokens(tokens)
+    if normalized[0] == "python3":
+        return "only `python3 -m py_compile <relative .py path> [...]` is allowed"
     if normalized[0] not in SAFE_COMMANDS:
         return f"command {normalized[0]!r} is not in the read-only allowlist"
     for token in normalized:
@@ -1406,16 +1421,17 @@ def validate_shell_command_for_workspace(root: Path, command: str) -> str | None
         tokens = shlex.split(command, posix=True)
     except ValueError:
         return "could not parse command"
-    py_compile_target = _py_compile_target_from_tokens(tokens)
-    if py_compile_target is not None:
-        try:
-            path = resolve_workspace_path(root, py_compile_target)
-        except ValueError as exc:
-            return str(exc)
-        if not path.exists():
-            return f"py_compile target {py_compile_target!r} does not exist"
-        if not path.is_file():
-            return "py_compile target must be a regular file"
+    py_compile_targets = _py_compile_targets_from_tokens(tokens)
+    if py_compile_targets is not None:
+        for py_compile_target in py_compile_targets:
+            try:
+                path = resolve_workspace_path(root, py_compile_target)
+            except ValueError as exc:
+                return str(exc)
+            if not path.exists():
+                return f"py_compile target {py_compile_target!r} does not exist"
+            if not path.is_file():
+                return "py_compile target must be a regular file"
         return None
     target = rm_delete_target(command)
     if target is not None:
@@ -4123,7 +4139,7 @@ def _constrained_retry_question(original_question: str, reason: str) -> str:
     constraints = (
         "Retry this coding task with strict constraints: use read_file on the exact file path "
         "(not a directory), then use write_file/edit_file directly. Do not use run_bash unless "
-        "explicitly asked for `python3 -m py_compile <single .py file>`. "
+        "explicitly asked for `python3 -m py_compile <relative .py path> [...]`. "
         "Return only after at least one successful write_file or edit_file."
     )
     return f"{original_question}\\n\\nFailure reason from previous attempt: {reason}\\n{constraints}"

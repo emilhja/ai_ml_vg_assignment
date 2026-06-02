@@ -100,6 +100,53 @@ def test_all_traces_dirs_includes_workspace_and_repo(tmp_path: Path, monkeypatch
     assert any(d.endswith("/traces") and not d.endswith("/workspace/traces") for d in dirs)
 
 
+def test_resolve_sqlite_prefers_richer_db_over_nested(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nested workspace/workspace/traces must not beat a richer primary traces DB."""
+    import sqlite3
+
+    schema = """
+        CREATE TABLE sessions (session_id TEXT PRIMARY KEY, first_seen_at TEXT, last_seen_at TEXT,
+            run_count INTEGER, total_turns INTEGER, total_tokens INTEGER, total_cost_usd REAL,
+            status TEXT, redaction_enabled INTEGER);
+        CREATE TABLE runs (run_id TEXT PRIMARY KEY, session_id TEXT, started_at TEXT,
+            total_tokens INTEGER, total_cost_usd REAL);
+        """
+
+    primary = tmp_path / "workspace" / "traces"
+    primary.mkdir(parents=True)
+    primary_db = primary / "vg_agent.sqlite3"
+    conn = sqlite3.connect(primary_db)
+    conn.executescript(schema)
+    conn.execute(
+        "INSERT INTO sessions VALUES ('big', '2020-01-01', '2020-01-01', 1, 1, 1000, 1.0, 'ok', 1)"
+    )
+    conn.execute(
+        "INSERT INTO runs VALUES ('r1', 'big', '2020-01-01', 50000, 1.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    nested = tmp_path / "workspace" / "workspace" / "traces"
+    nested.mkdir(parents=True)
+    nested_db = nested / "vg_agent.sqlite3"
+    conn = sqlite3.connect(nested_db)
+    conn.executescript(schema)
+    conn.execute(
+        "INSERT INTO sessions VALUES ('small', '2020-01-01', '2020-01-01', 1, 1, 100, 0.1, 'ok', 1)"
+    )
+    conn.execute(
+        "INSERT INTO runs VALUES ('r2', 'small', '2020-01-01', 952, 0.0001)"
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("VG_WORKSPACE_ROOT", "workspace")
+    monkeypatch.delenv("VG_SQLITE_PATH", raising=False)
+    clear_path_cache()
+    assert resolve_sqlite_path() == primary_db.resolve()
+
+
 def test_all_traces_dirs_includes_nested_workspace_traces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     nested = tmp_path / "workspace" / "workspace" / "traces"
     nested.mkdir(parents=True)

@@ -10,6 +10,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import schema_ready, sqlite_path
+from .paths import _sqlite_connect_ro
 
 _engine = None
 _SessionLocal: sessionmaker[Session] | None = None
@@ -33,7 +34,7 @@ def sqlite_usable() -> bool:
     if not path.is_file():
         return False
     try:
-        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        conn = _sqlite_connect_ro(path)
         try:
             conn.execute("SELECT 1 FROM sessions LIMIT 1").fetchone()
             check = conn.execute("PRAGMA quick_check").fetchone()

@@ -4,19 +4,19 @@ overview: Allow `python3 -m py_compile` with multiple workspace-relative `.py` p
 todos:
   - id: spec-multi-py-compile
     content: "Update specs/20_tools.md: allow multiple .py targets + max file cap"
-    status: in_progress
+    status: completed
   - id: validator-multi-target
     content: Refactor py_compile helpers in scripts/generate_project.py for 1..N targets + workspace checks
-    status: pending
+    status: completed
   - id: prompts-align
     content: Update PROMPTS.md Coder/Reviewer py_compile wording for multiple paths
-    status: pending
+    status: completed
   - id: tests-multi-file
     content: Extend test_run_bash_py_compile_strict_allowlist for 2-file ok and over-cap blocked
-    status: pending
+    status: completed
   - id: regen-verify
     content: Run generate_project.py --clean and full pytest
-    status: pending
+    status: completed
 isProject: false
 ---
 

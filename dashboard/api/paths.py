@@ -25,11 +25,27 @@ def workspace_root() -> Path:
     return path.resolve()
 
 
+def _sqlite_connect_ro(path: Path) -> sqlite3.Connection:
+    """Open observability SQLite read-only.
+
+    Prefer a normal WAL-aware read; fall back to immutable when bind mounts
+    cannot open the WAL sidecar (common for Docker on Windows).
+    """
+    ro_uri = f"file:{path.as_posix()}?mode=ro"
+    try:
+        conn = sqlite3.connect(ro_uri, uri=True, timeout=2.0)
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        return conn
+    except sqlite3.Error:
+        immutable_uri = f"file:{path.as_posix()}?mode=ro&immutable=1"
+        return sqlite3.connect(immutable_uri, uri=True, timeout=2.0)
+
+
 def _sqlite_has_sessions(path: Path) -> bool:
     if not path.is_file() or path.stat().st_size < 512:
         return False
     try:
-        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        conn = _sqlite_connect_ro(path)
         try:
             row = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions' LIMIT 1"
@@ -41,18 +57,33 @@ def _sqlite_has_sessions(path: Path) -> bool:
         return False
 
 
-def _sqlite_session_count(path: Path) -> int:
+def _sqlite_db_metrics(path: Path) -> tuple[int, int]:
+    """Return (session_count, run_token_total); (0, 0) when unreadable."""
     if not _sqlite_has_sessions(path):
-        return 0
+        return 0, 0
     try:
-        conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        conn = _sqlite_connect_ro(path)
         try:
-            row = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
-            return int(row[0]) if row else 0
+            sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
+            session_count = int(sessions[0]) if sessions else 0
+            tokens = 0
+            has_runs = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs' LIMIT 1"
+            ).fetchone()
+            if has_runs:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(total_tokens), 0) FROM runs"
+                ).fetchone()
+                tokens = int(row[0]) if row else 0
+            return session_count, tokens
         finally:
             conn.close()
     except sqlite3.Error:
-        return 0
+        return 0, 0
+
+
+def _sqlite_session_count(path: Path) -> int:
+    return _sqlite_db_metrics(path)[0]
 
 
 @lru_cache(maxsize=1)
@@ -104,7 +135,6 @@ def find_jsonl_path(session_id: str) -> Path | None:
     return None
 
 
-@lru_cache(maxsize=1)
 def resolve_sqlite_path() -> Path:
     """Pick the observability DB with the richest session mirror."""
     explicit = os.environ.get("VG_SQLITE_PATH", "").strip()
@@ -128,20 +158,31 @@ def resolve_sqlite_path() -> Path:
     workspace_db = workspace_root() / agent_config.SQLITE_TRACE_DB
 
     best: Path | None = None
-    best_count = -1
-    for path in candidates:
-        count = _sqlite_session_count(path)
-        if count > best_count:
-            best = path
-            best_count = count
-        elif (
-            count == best_count
-            and count > 0
-            and path.resolve() == workspace_db.resolve()
+    best_sessions = -1
+    best_tokens = -1
+    best_priority = len(candidates) + 1
+    for priority, path in enumerate(candidates):
+        sessions, tokens = _sqlite_db_metrics(path)
+        if sessions > best_sessions or (
+            sessions == best_sessions and tokens > best_tokens
         ):
             best = path
+            best_sessions = sessions
+            best_tokens = tokens
+            best_priority = priority
+        elif (
+            sessions == best_sessions
+            and tokens == best_tokens
+            and sessions > 0
+            and (
+                priority < best_priority
+                or path.resolve() == workspace_db.resolve()
+            )
+        ):
+            best = path
+            best_priority = priority
 
-    if best is not None and best_count > 0:
+    if best is not None and best_sessions > 0:
         return best
 
     for path in candidates:
@@ -221,5 +262,4 @@ def mtime_iso(path: Path) -> str:
 
 def clear_path_cache() -> None:
     all_traces_dirs.cache_clear()
-    resolve_sqlite_path.cache_clear()
     resolve_traces_dir.cache_clear()

@@ -661,6 +661,8 @@ def test_run_bash_rejects_dangerous_commands(tmp_path: Path) -> None:
 def test_run_bash_py_compile_strict_allowlist(tmp_path: Path) -> None:
     target = tmp_path / "module_ok.py"
     target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    another = tmp_path / "another.py"
+    another.write_text("def sub(a, b):\n    return a - b\n", encoding="utf-8")
 
     allowed = "python3 -m py_compile module_ok.py"
     assert validate_shell_command(allowed) is None
@@ -669,13 +671,33 @@ def test_run_bash_py_compile_strict_allowlist(tmp_path: Path) -> None:
     assert ok["status"] == "ok"
     assert "__pycache__" not in str(ok["result_full"])
 
+    multi = "python3 -m py_compile module_ok.py another.py"
+    assert validate_shell_command(multi) is None
+    assert validate_shell_command_for_workspace(tmp_path, multi) is None
+    multi_ok = run_bash(tmp_path, multi, "py-compile-multi")
+    assert multi_ok["status"] == "ok"
+
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "main.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+    pkg_multi = "python3 -m py_compile pkg/__init__.py pkg/main.py"
+    assert validate_shell_command(pkg_multi) is None
+    assert validate_shell_command_for_workspace(tmp_path, pkg_multi) is None
+
     assert validate_shell_command("python3 module_ok.py") is not None
+    assert "py_compile" in (validate_shell_command("python3 module_ok.py") or "")
     assert validate_shell_command("python3 -c 'print(1)'") is not None
     assert validate_shell_command("python3 -m pytest module_ok.py") is not None
-    assert validate_shell_command("python3 -m py_compile module_ok.py another.py") is not None
     assert validate_shell_command("python3 -m py_compile module_ok.py && ls") is not None
     assert validate_shell_command("python3 -m py_compile ../outside.py") is not None
     assert validate_shell_command("python3 -m py_compile /tmp/abs.py") is not None
+    assert validate_shell_command("python3 -m py_compile module_ok.py not_py.txt") is not None
+
+    over_cap = "python3 -m py_compile " + " ".join(f"f{i}.py" for i in range(9))
+    over_cap_err = validate_shell_command(over_cap)
+    assert over_cap_err is not None
+    assert "at most 8" in over_cap_err
 
     missing = validate_shell_command_for_workspace(tmp_path, "python3 -m py_compile missing.py")
     assert missing is not None
