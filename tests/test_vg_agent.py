@@ -2976,7 +2976,7 @@ def test_chat_ui_non_tty_skips_rich(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert cli._chat_loop(tmp_path, args) == 0
 
 
-def test_chat_ui_turn_output_framed_on_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_chat_ui_turn_output_plain_on_tty(monkeypatch: pytest.MonkeyPatch) -> None:
     import io
 
     from vg_agent import chat_ui
@@ -2988,8 +2988,8 @@ def test_chat_ui_turn_output_framed_on_tty(monkeypatch: pytest.MonkeyPatch) -> N
     out = buffer.getvalue()
     assert "Hello" in out
     assert "./auth" in out
-    assert out.index("\u2500") < out.index("Hello")
-    assert out.index("Hello") < out.rindex("\u2500")
+    assert "\u2500" not in out
+    assert "Response" not in out
 
 
 def test_chat_ui_turn_output_plain_when_non_tty(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3096,6 +3096,75 @@ def test_collect_file_changes_edit_and_write(tmp_path: Path) -> None:
     assert edit.old == "before" and edit.new == "after"
 
 
+def test_chat_ui_status_bar_throttled_while_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vg_agent import chat_ui
+
+    printed: list[object] = []
+
+    class FakeConsole:
+        def print(self, *args: object, **kwargs: object) -> None:
+            printed.append(args)
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    monkeypatch.setattr(chat_ui, "_STATUS_THROTTLE_S", 10.0)
+    monkeypatch.setattr(chat_ui, "_console", lambda: FakeConsole())
+    monkeypatch.setattr(chat_ui, "_last_status_bar_refresh", 1e9)
+    from vg_agent.budget import BudgetGuard
+    from vg_agent.trace import TraceRecorder
+
+    recorder = TraceRecorder(tmp_path)
+    guard = BudgetGuard.for_workspace(tmp_path)
+    kwargs = {
+        "root": tmp_path,
+        "recorder": recorder,
+        "guard": guard,
+        "live_model": True,
+        "since_event_idx": 0,
+        "force_state": "running",
+    }
+    chat_ui.refresh_chat_status_bar(**kwargs)
+    assert not printed
+    chat_ui.refresh_chat_status_bar(**kwargs, force=True)
+    assert printed
+
+
+def test_chat_ui_turn_output_skips_progress_shown_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import io
+
+    from vg_agent import chat_ui
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    buffer = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+    events = [
+        {
+            "kind": "tool_call",
+            "tool_use_id": "e1",
+            "tool": "edit_file",
+            "args": {"path": "app.py", "old": "foo", "new": "bar"},
+        },
+        {"kind": "tool_result", "tool_use_id": "e1", "tool": "edit_file", "status": "ok"},
+    ]
+    assert (
+        chat_ui.print_turn_output(
+            answer="done",
+            literal_outputs=[],
+            events=events,
+            start_idx=0,
+            workspace_root=tmp_path,
+            skip_change_paths={"app.py"},
+        )
+        is True
+    )
+    out = buffer.getvalue()
+    assert "done" in out
+    assert "Changes:" not in out
+
+
 def test_chat_ui_turn_output_includes_edit_diff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import io
 
@@ -3130,19 +3199,14 @@ def test_chat_ui_turn_output_includes_edit_diff(tmp_path: Path, monkeypatch: pyt
 
 
 def test_progress_sink_prints_edit_diff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from io import StringIO
+
     from vg_agent import __main__ as cli
 
-    captured: list[str] = []
-
-    class FakeConsole:
-        def print(self, *args: object, **kwargs: object) -> None:
-            captured.append(str(args))
-
-    from vg_agent import chat_ui
-
+    buffer = StringIO()
+    turn_state: dict[str, object] = {}
     monkeypatch.setattr(cli, "use_rich_ui", lambda: True)
-    monkeypatch.setattr(cli, "_console", lambda: FakeConsole())
-    sink = cli._make_progress_sink(turn_state={}, workspace_root=tmp_path)
+    sink = cli._make_progress_sink(stream=buffer, turn_state=turn_state, workspace_root=tmp_path)
     sink(
         {
             "kind": "tool_call",
@@ -3152,7 +3216,56 @@ def test_progress_sink_prints_edit_diff(tmp_path: Path, monkeypatch: pytest.Monk
         }
     )
     sink({"kind": "tool_result", "tool_use_id": "e1", "tool": "edit_file", "status": "ok"})
-    assert captured
+    out = buffer.getvalue()
+    assert "--- a/x.py" in out
+    assert "+b" in out
+    assert turn_state.get("progress_diff_paths") == {"x.py"}
+
+
+def test_progress_sink_spawn_subagents_parallel_summary(tmp_path: Path) -> None:
+    from io import StringIO
+
+    from vg_agent import __main__ as cli
+    from vg_agent.trace import TraceRecorder
+
+    spawn_payload = json.dumps(
+        [
+            {"agent_id": "explorer.0", "status": "ok"},
+            {"agent_id": "explorer.1", "status": "ok"},
+        ]
+    )
+    buffer = StringIO()
+    recorder = TraceRecorder(tmp_path, event_sink=None)
+    recorder.event_sink = cli._make_progress_sink(
+        stream=buffer,
+        turn_state={},
+        workspace_root=tmp_path,
+        recorder=recorder,
+    )
+    recorder.emit(
+        "subagent_return",
+        child_agent_id="explorer.0",
+        agent_type="explorer",
+        started_at="2026-05-10T12:00:00+00:00",
+        ended_at="2026-05-10T12:00:03+00:00",
+    )
+    recorder.emit(
+        "subagent_return",
+        child_agent_id="explorer.1",
+        agent_type="explorer",
+        started_at="2026-05-10T12:00:01+00:00",
+        ended_at="2026-05-10T12:00:04+00:00",
+    )
+    recorder.emit(
+        "tool_result",
+        tool="spawn_subagents",
+        agent_id="parent",
+        status="ok",
+        result_full=spawn_payload,
+    )
+    out = buffer.getvalue()
+    assert "[parallel]" in out
+    assert "2 explorer finished" in out
 
 
 def test_chat_slash_new_starts_fresh_trace_and_live_history(

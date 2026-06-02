@@ -47,10 +47,9 @@ from .chat_ui import (
     refresh_chat_status_bar,
     render_input_bottom_and_footer,
     render_input_top_rule,
-    render_progress_file_diff,
     reset_dashboard_mode,
     use_rich_ui,
-    _console,
+    write_progress_diff_lines,
 )
 from .agent import (
     BUDGET_CAP_TOOL,
@@ -81,6 +80,7 @@ from .trace import (
     format_turn_review,
     parallel_finops_batch_lines,
     parallel_subagent_summary,
+    parallel_subagent_summary_for_tool_result,
     render_tree,
     show_context,
 )
@@ -744,6 +744,7 @@ def _make_progress_sink(
             if recorder is not None:
                 state["turn_list_start"] = len(recorder.events) - 1
             pending_calls.clear()
+            state["progress_diff_paths"] = set()
             if use_color:
                 fh.write(f"\n\x1b[90m── turn {state['turn']} ──\x1b[0m\n")
             else:
@@ -795,14 +796,11 @@ def _make_progress_sink(
                 call = pending_calls.pop(tool_use_id, None)
                 if call is not None:
                     prior = write_priors.get(tool_use_id)
-                    if use_rich_ui():
-                        render_progress_file_diff(
-                            _console(), call_event=call, prior_content=prior
-                        )
-                    else:
-                        for diff_line in progress_diff_lines(call, prior):
-                            fh.write(f"  {diff_line}\n")
-                        fh.flush()
+                    diff_path = write_progress_diff_lines(
+                        fh, call, prior, use_color=use_color
+                    )
+                    if diff_path:
+                        state.setdefault("progress_diff_paths", set()).add(diff_path)
         if kind == "assistant_step" and event.get("agent_id") == "parent" and on_parent_status:
             on_parent_status()
         elif kind == "run_end" and on_parent_status:
@@ -1000,6 +998,7 @@ def _report_parent_session_status(
             live_model=bool(args.live_model),
             since_event_idx=since_event_idx,
             force_state=force_state,
+            force=force_state != "running",
         )
     elif bool(getattr(sys.stderr, "isatty", lambda: False)()):
         line = _chat_statusline_color(
@@ -1191,10 +1190,14 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
             if prompt == "/help":
                 sys.stdout.write(SLASH_COMMAND_HELP + "\n")
                 continue
-            render_input_bottom_and_footer(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since))
+            render_input_bottom_and_footer(
+                **_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=ui_since),
+                show_status=False,
+            )
             start_idx = len(recorder.events)
             turn_state["since_event_idx"] = start_idx
             turn_state["write_priors"] = {}
+            turn_state["progress_diff_paths"] = set()
             turn_state["force_state"] = "running"
             _report_parent_session_status(
                 root, recorder, guard, args, since_event_idx=start_idx, force_state="running"
@@ -1239,11 +1242,15 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 start_idx=start_idx,
                 workspace_root=root,
                 pending_priors=turn_state.get("write_priors"),
+                skip_change_paths=turn_state.get("progress_diff_paths"),
             )
             for notice in _turn_subagent_failure_notices(recorder.events, start_idx):
                 sys.stderr.write(notice + "\n")
             mark_turn_completed()
-            refresh_chat_status_bar(**_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=start_idx))
+            refresh_chat_status_bar(
+                **_chat_ui_kwargs(root, recorder, guard, args, since_event_idx=start_idx),
+                force=True,
+            )
             if not _is_ack_prompt(prompt):
                 last_intent_prompt = prompt
     finally:

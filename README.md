@@ -27,6 +27,18 @@ New-Item -ItemType Directory -Force workspace,traces
 docker compose build
 ```
 
+The image bakes in `src/vg_agent/` at **build** time (see [`Dockerfile`](Dockerfile)).
+After editing `chat_ui.py`, `scripts/generate_project.py`, or regenerating agent
+code, rebuild before chat or demo runs in Docker:
+
+```powershell
+docker compose build vg-agent
+```
+
+Use `docker compose build --no-cache vg-agent` if the terminal UI still looks
+stale. Local `uv run -m vg_agent --chat` uses the working tree instead; see
+[`docs/demo/chat_ui_and_docker.md`](docs/demo/chat_ui_and_docker.md).
+
 ### 2. Seed The Fixture Workspace
 
 ```powershell
@@ -90,6 +102,9 @@ demo runs.
 ```powershell
 python scripts/generate_project.py --clean
 ```
+
+If you use Docker for demos, run `docker compose build vg-agent` after
+regenerating so the container matches the tree.
 
 That command regenerates:
 

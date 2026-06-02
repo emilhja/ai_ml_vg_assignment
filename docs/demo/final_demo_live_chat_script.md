@@ -10,7 +10,9 @@ Wait for both Explorer returns, then spawn one Coder to create or update only:
 Match the existing engine/UI modules; do not spawn Reviewer unless a file write fails.
 Keep the Coder spawn question short (paths + constraints); Explorers already returned summaries.
 
-
+alt
+spawn_subagents: 2× Explorer (read-only) — engine.py + ui.py APIs in calc_haiku_4/.
+Then one Coder: main.py + __init__.py only, after both return. No Reviewer. Short Coder brief.
 
 
 # Final Demo Live Chat Script
@@ -71,6 +73,11 @@ New-Item -ItemType Directory -Force workspace,traces
 docker compose build
 docker compose run --rm vg-agent --seed-fixture
 ```
+
+Rebuild the agent image after any change to `src/vg_agent/chat_ui.py` or
+`scripts/generate_project.py` (`docker compose build vg-agent`). Otherwise chat
+may show an older terminal layout than your local tree. See
+[`chat_ui_and_docker.md`](chat_ui_and_docker.md).
 
 Trace-safety scan before sharing or copying trace evidence:
 

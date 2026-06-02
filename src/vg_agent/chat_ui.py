@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,8 @@ _WELCOME_BORDER = "rgb(224,122,95)"
 _PRODUCT_LABEL = "vg-agent"
 
 _compact_dashboard = False
+_STATUS_THROTTLE_S = float(os.environ.get("VG_CHAT_STATUS_THROTTLE_S", "0.75"))
+_last_status_bar_refresh = 0.0
 
 try:
     from prompt_toolkit import PromptSession
@@ -761,6 +764,7 @@ def render_input_bottom_and_footer(
     guard: BudgetGuard,
     live_model: bool,
     since_event_idx: int = 0,
+    show_status: bool = True,
 ) -> None:
     if not use_rich_ui():
         return
@@ -768,16 +772,17 @@ def render_input_bottom_and_footer(
 
     console = _console()
     console.print(Rule(style="dim"))
-    _write_status_bar(
-        console,
-        root=root,
-        recorder=recorder,
-        guard=guard,
-        live_model=live_model,
-        since_event_idx=since_event_idx,
-    )
-    _write_hint(console)
-    _write_secondary(console, recorder.events, since_event_idx=since_event_idx)
+    if show_status:
+        _write_status_bar(
+            console,
+            root=root,
+            recorder=recorder,
+            guard=guard,
+            live_model=live_model,
+            since_event_idx=since_event_idx,
+        )
+        _write_hint(console)
+        _write_secondary(console, recorder.events, since_event_idx=since_event_idx)
 
 
 def _lines_already_in_answer(answer: str, content: str) -> bool:
@@ -1003,6 +1008,36 @@ def progress_diff_lines(call_event: dict[str, object], prior_content: str | None
     return lines
 
 
+def write_progress_diff_lines(
+    fh: Any,
+    call_event: dict[str, object],
+    prior_content: str | None,
+    *,
+    use_color: bool = True,
+) -> str | None:
+    """Write unified-diff hunks inline on the progress stream (returns path if written)."""
+    path = _path_from_call(call_event)
+    lines = progress_diff_lines(call_event, prior_content)
+    if not lines:
+        return None
+    reset = "\x1b[0m" if use_color else ""
+    for raw in lines:
+        line = f"  {raw}"
+        if not use_color:
+            fh.write(line + "\n")
+            continue
+        if raw.startswith("+") and not raw.startswith("+++"):
+            fh.write(f"\x1b[32m{line}{reset}\n")
+        elif raw.startswith("-") and not raw.startswith("---"):
+            fh.write(f"\x1b[31m{line}{reset}\n")
+        elif raw.startswith(("---", "+++", "@@")):
+            fh.write(f"\x1b[90m{line}{reset}\n")
+        else:
+            fh.write(line + "\n")
+    fh.flush()
+    return path or None
+
+
 def render_progress_file_diff(
     console: Any,
     *,
@@ -1048,8 +1083,9 @@ def print_turn_output(
     start_idx: int = 0,
     workspace_root: Path | None = None,
     pending_priors: dict[str, str] | None = None,
+    skip_change_paths: set[str] | frozenset[str] | None = None,
 ) -> bool:
-    """Frame agent answer + literal tool outputs + optional Changes diffs. Returns True if anything printed."""
+    """Print agent answer + literal tool outputs + optional Changes diffs. Returns True if anything printed."""
     answer_text = answer.strip()
     filtered_outputs: list[str] = []
     for output in literal_outputs:
@@ -1064,20 +1100,18 @@ def print_turn_output(
         changes = collect_file_changes(
             events, start_idx, workspace_root=workspace_root, pending_priors=pending_priors
         )
+        if skip_change_paths:
+            changes = [change for change in changes if change.path not in skip_change_paths]
     if not answer_text and not filtered_outputs and not changes:
         return False
     if use_rich_ui():
         from rich.console import Console
         from rich.panel import Panel
-        from rich.rule import Rule
         from rich.syntax import Syntax
 
         console = Console(file=sys.stdout, highlight=False)
-        console.print(Rule(style="dim"))
         if answer_text:
-            console.print(
-                Panel(format_response_bullets(answer_text), title="Response", border_style="dim")
-            )
+            console.print(format_response_bullets(answer_text))
         for output in filtered_outputs:
             if "\n" in output:
                 title, _, body = output.partition(":\n")
@@ -1087,12 +1121,22 @@ def print_turn_output(
                 elif len(body) > 80 and "\n" in body:
                     console.print(Panel(Syntax(body, "text", word_wrap=True), title=title or "Tool output", border_style="dim"))
                 else:
-                    console.print(Panel(body, title=title or "Tool output", border_style="dim"))
+                    console.print(f"{title or 'Tool output'}:\n{body}")
             else:
                 console.print(output)
         if changes:
-            _render_changes_to_console(console, changes)
-        console.print(Rule(style="dim"))
+            console.print("[dim]Changes:[/dim]")
+            for change in changes:
+                lines, _ = format_unified_diff(change.old, change.new, path=change.path)
+                if lines:
+                    console.print(f"[dim]--- {change.path} ---[/dim]")
+                    for raw in lines:
+                        if raw.startswith("+") and not raw.startswith("+++"):
+                            console.print(f"[green]{raw}[/green]")
+                        elif raw.startswith("-") and not raw.startswith("---"):
+                            console.print(f"[red]{raw}[/red]")
+                        else:
+                            console.print(f"[dim]{raw}[/dim]")
     else:
         parts: list[str] = []
         if answer_text:
@@ -1117,9 +1161,18 @@ def refresh_chat_status_bar(
     live_model: bool,
     since_event_idx: int = 0,
     force_state: str | None = None,
+    force: bool = False,
 ) -> None:
+    global _last_status_bar_refresh
     if not use_rich_ui():
         return
+    if not force and force_state == "running":
+        now = time.monotonic()
+        if now - _last_status_bar_refresh < _STATUS_THROTTLE_S:
+            return
+        _last_status_bar_refresh = now
+    elif force_state != "running":
+        _last_status_bar_refresh = 0.0
     console = _console()
     _write_status_bar(
         console,

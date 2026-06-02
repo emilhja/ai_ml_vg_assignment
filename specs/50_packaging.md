@@ -21,6 +21,9 @@ approval policy) holds regardless of Docker.
 - Copy `src/` last so source edits invalidate fewer cache layers.
 - Default entrypoint: `python -m vg_agent`. `CMD` left empty so the user
   passes the task on the command line.
+- **Rebuild required for UI changes:** `docker compose run` does not mount
+  `src/` from the host. After editing `chat_ui.py` or regenerating agent code,
+  run `docker compose build vg-agent` (see `docs/demo/chat_ui_and_docker.md`).
 
 ## Dockerfile.dashboard
 

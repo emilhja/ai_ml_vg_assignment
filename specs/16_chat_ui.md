@@ -62,7 +62,8 @@ unaffected.
 |---|---|
 | Session start | Full dashboard (welcome + status bar + hint) |
 | After first turn | Compact chrome (label + status bar + hint) on idle prompts |
-| During agent run | Status bar refresh (throttled) on progress events; `… running` state |
+| During agent run | Status bar refresh on progress events, **throttled** to at most once per `VG_CHAT_STATUS_THROTTLE_S` (default `0.75`) while `… running`; always refresh when idle or after `run_end` |
+| After user submits a prompt | Bottom input rule only (no duplicate idle status); then one `… running` status line |
 | After each agent turn | Status bar + hint (+ secondary if needed); `mark_turn_completed()` |
 | `/status` | Full dashboard (after screen clear) + `reset_dashboard_mode()`; stdout session summary (statusline, budget, trace, last run) |
 | `/reset`, `/new` | Full dashboard (after screen clear); `/new` also `reset_dashboard_mode()` |
@@ -99,20 +100,18 @@ compact statusline during runs (bottom bar is the live HUD).
 After each agent turn (not slash commands), when `use_rich_ui()` is true and
 the turn produces a parent answer and/or literal tool outputs:
 
-1. Top dim `Rule` on **stdout**.
-2. **Response** — Rich `Panel` when the parent answer is non-empty. When the
+1. **Response** — plain stdout text (no titled panel or framing rules). When the
    body has **more than one non-empty line**, each line is prefixed with `• `
    unless it already looks like a list item (`- `, `* `, `• `, or `N. `).
-   Single-line answers are unchanged. Tool output, Trees, Syntax, diffs, and
-   compaction banners are not bulletized.
-3. **Tool output** — optional `Panel` with `Tree` for directory listings or
-   `Syntax` for multi-line file content; skip a literal block when every line
-   already appears in the answer. Large reads use **File preview** (below).
-4. **Changes** (conditional) — when the turn includes a successful `edit_file` or
-   `write_file` (any agent), a `Changes` panel on **stdout** lists each touched
-   path once with a unified diff (see **File-edit diffs** below). Omitted when
-   there are no writes in the turn.
-5. Bottom dim `Rule` on **stdout**.
+   Single-line answers are unchanged.
+2. **Tool output** — optional `Panel` with `Tree` for directory listings or
+   `Syntax` for multi-line file content; simple single-block output uses a plain
+   `title:\nbody` line. Skip a literal block when every line already appears in
+   the answer. Large reads use **File preview** (below).
+3. **Changes** (conditional) — when the turn includes a successful `edit_file` or
+   `write_file` not already shown inline in the progress stream, a dim
+   `Changes:` header plus colored unified-diff lines on **stdout** (one block per
+   path). Omitted when there are no remaining writes in the turn.
 
 The status bar refresh on stderr follows immediately after the framed block.
 
@@ -153,9 +152,11 @@ before the write runs). `tool_result.result_full` stays a short status string.
    tool summary, show the diff. `edit_file`: `old` → `new` from args.
    `write_file`: prior workspace file content (if any) vs `content` from args.
 2. **Live progress** (Rich TTY `--chat`): on successful `tool_result` for
-   `edit_file` / `write_file` (any `agent_id`), print a dim-bordered diff panel
-   on **stderr** immediately after the `[tool]` line. For `write_file`, capture
-   prior content when the matching `tool_call` is emitted (before execution).
+   `edit_file` / `write_file` (any `agent_id`), print **inline** unified-diff
+   lines on **stderr** immediately after the `[tool]` line (indented, `-` red /
+   `+` green when color is enabled). For `write_file`, capture prior content when
+   the matching `tool_call` is emitted (before execution). Paths shown here are
+   omitted from end-of-turn **Changes**.
 3. **End-of-turn Changes** — panel on **stdout** after the Response / tool-output
    block when the turn has at least one successful write/edit; one diff per path
    (last successful change wins if the same path is touched twice).
@@ -241,6 +242,7 @@ Use `/show-context N` for the full JSON parent context at step `N`.
 | `NO_EMOJI` | ASCII status prefixes (`dir:`, `mdl:`, `usd:`, `stp:`) instead of emoji. |
 | `VG_CHAT_NO_CLEAR` | Disable TTY screen clear before dashboard refresh. |
 | `VG_CHAT_FILE_PREVIEW_LINES` | Max lines shown for large literal `read_file` bodies (default `30`). |
+| `VG_CHAT_STATUS_THROTTLE_S` | Minimum seconds between status-bar redraws while a turn is running (default `0.75`). |
 
 ## Non-TTY fallback
 
