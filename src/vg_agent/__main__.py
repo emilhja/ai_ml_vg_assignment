@@ -43,11 +43,13 @@ from .chat_ui import (
     print_chat_dashboard_cleared,
     print_turn_output,
     progress_diff_lines,
+    progress_stderr_lock,
     prompt_approval,
     refresh_chat_status_bar,
     render_input_bottom_and_footer,
     render_input_top_rule,
     reset_dashboard_mode,
+    sanitize_summary_text,
     use_rich_ui,
     write_progress_diff_lines,
 )
@@ -90,43 +92,7 @@ def _stdin_prompt(stream: object | None = None, *, workspace_root: Path | None =
     fh = stream if stream is not None else sys.stdin
 
     def ask(request: ApprovalRequest) -> ApprovalOutcome:
-        if use_rich_ui():
-            return prompt_approval(request, input_stream=fh, workspace_root=workspace_root)
-        if request.tool == BUDGET_CAP_TOOL and isinstance(request.args, dict):
-            sys.stderr.write(format_budget_cap_approval_text(request.path, request.args) + "\n")
-        elif request.tool == BUDGET_CAP_TOOL:
-            sys.stderr.write(f"[approval] budget {request.path}  {request.summary}\n")
-        else:
-            sys.stderr.write(f"[approval] {request.tool}  {request.summary}\n")
-        if request.tool == BUDGET_CAP_TOOL:
-            sys.stderr.write("  1) yes  2) yes (this cap)  3) yes (always)  4) no  5) abort\n> ")
-        else:
-            sys.stderr.write("  1) yes  2) yes (this folder)  3) yes (always)  4) no  5) abort\n> ")
-        sys.stderr.flush()
-        line = fh.readline().strip()
-        if not line:
-            return ApprovalOutcome(decision="denied", reason="no input")
-        choice = line.split()[0]
-        if choice in {"1", "y", "yes"}:
-            return ApprovalOutcome(decision="approved", reason="user yes")
-        if choice == "2":
-            path = request.path or ""
-            normalized = path.replace("\\", "/")
-            parent = "/".join(normalized.split("/")[:-1])
-            if request.tool == "run_bash" and not request.path:
-                command = str(request.args.get("command") or "")
-                head = command.strip().split()[0] if command.strip() else ""
-                scope = f"cmd:{head}" if head else "*"
-            elif request.tool in {"spawn_subagent", "spawn_subagents"}:
-                scope = "*"
-            else:
-                scope = parent
-            return ApprovalOutcome(decision="approved_scoped", scope_key=scope, reason="user yes-folder")
-        if choice in {"3", "a", "always"}:
-            return ApprovalOutcome(decision="approved_always", scope_key="*", reason="user yes-always")
-        if choice in {"5", "abort"}:
-            return ApprovalOutcome(decision="aborted", reason="user abort")
-        return ApprovalOutcome(decision="denied", reason="user no")
+        return prompt_approval(request, input_stream=fh, workspace_root=workspace_root)
 
     return ask
 
@@ -591,9 +557,9 @@ def _tool_summary(call: dict[str, Any]) -> str:
         return f"{name} {args.get('path') or args.get('rel_path') or ''}".strip()
     if name == "run_bash":
         command = str(args.get("command") or "")
-        return f"run_bash {command[:120]}"
+        return f"run_bash {sanitize_summary_text(command, limit=120)}"
     if name == "spawn_subagent":
-        return f"spawn_subagent {str(args.get('question') or '')[:120]}"
+        return f"spawn_subagent {sanitize_summary_text(str(args.get('question') or ''), limit=120)}"
     if name == "spawn_subagents":
         requests = args.get("requests") or []
         count = len(requests) if isinstance(requests, list) else "?"
@@ -736,77 +702,105 @@ def _make_progress_sink(
     write_priors: dict[str, str] = state.setdefault("write_priors", {})
 
     def sink(event: dict[str, object]) -> None:
-        kind = event.get("kind")
-        if kind == "statusline":
-            return
-        if kind == "user_prompt":
-            state["turn"] = int(state.get("turn", 0)) + 1
-            if recorder is not None:
-                state["turn_list_start"] = len(recorder.events) - 1
-            pending_calls.clear()
-            state["progress_diff_paths"] = set()
-            if use_color:
-                fh.write(f"\n\x1b[90m── turn {state['turn']} ──\x1b[0m\n")
-            else:
-                fh.write(f"\n── turn {state['turn']} ──\n")
-        if kind == "tool_call":
-            tool = str(event.get("tool") or "")
-            tool_use_id = str(event.get("tool_use_id") or "")
-            if tool in WRITE_EDIT_TOOLS and tool_use_id:
-                pending_calls[tool_use_id] = event
-                if tool == "write_file" and workspace_root is not None:
-                    prior = capture_write_prior(workspace_root, event)
-                    if prior is not None:
-                        write_priors[tool_use_id] = prior
-        banner = format_compaction_banner(event)
-        if banner:
-            fh.write(f"{banner}\n")
-        line = _format_progress_event(event)
-        if line is not None:
-            color = _progress_event_color(event, use_color=use_color)
-            prefix = "  " if kind in {"subagent_spawn", "subagent_return"} else ""
-            fh.write(f"{color}{prefix}{line}{reset}\n")
-            fh.flush()
-        if kind == "tool_result":
-            tool = str(event.get("tool") or "")
-            tool_use_id = str(event.get("tool_use_id") or "")
-            if (
-                tool == "spawn_subagents"
-                and event.get("status") == "ok"
-                and event.get("agent_id") == "parent"
-                and recorder is not None
-            ):
-                tool_result_idx = len(recorder.events) - 1
-                summary = parallel_subagent_summary_for_tool_result(
-                    recorder.events, tool_result_idx
-                )
-                if summary is not None:
-                    spawn_payload: list[dict[str, object]] | None = None
-                    try:
-                        parsed = json.loads(str(event.get("result_full") or ""))
-                    except json.JSONDecodeError:
-                        parsed = None
-                    if isinstance(parsed, list):
-                        spawn_payload = [item for item in parsed if isinstance(item, dict)]
-                    parallel_color = "\x1b[35m" if use_color else ""
-                    for parallel_line in format_parallel_progress_lines(summary, spawn_payload=spawn_payload):
-                        fh.write(f"{parallel_color}{parallel_line}{reset}\n")
-                    fh.flush()
-            if tool in WRITE_EDIT_TOOLS and event.get("status") == "ok":
-                call = pending_calls.pop(tool_use_id, None)
-                if call is not None:
-                    prior = write_priors.get(tool_use_id)
-                    diff_path = write_progress_diff_lines(
-                        fh, call, prior, use_color=use_color
-                    )
-                    if diff_path:
-                        state.setdefault("progress_diff_paths", set()).add(diff_path)
-        if kind == "assistant_step" and event.get("agent_id") == "parent" and on_parent_status:
-            on_parent_status()
-        elif kind == "run_end" and on_parent_status:
-            on_parent_status()
+        with progress_stderr_lock:
+            _progress_sink_event(
+                event,
+                fh=fh,
+                use_color=use_color,
+                reset=reset,
+                state=state,
+                pending_calls=pending_calls,
+                write_priors=write_priors,
+                on_parent_status=on_parent_status,
+                workspace_root=workspace_root,
+                recorder=recorder,
+            )
 
     return sink
+
+
+def _progress_sink_event(
+    event: dict[str, object],
+    *,
+    fh: object,
+    use_color: bool,
+    reset: str,
+    state: dict[str, Any],
+    pending_calls: dict[str, dict[str, object]],
+    write_priors: dict[str, str],
+    on_parent_status: Any,
+    workspace_root: Path | None,
+    recorder: TraceRecorder | None,
+) -> None:
+    kind = event.get("kind")
+    if kind == "statusline":
+        return
+    if kind == "user_prompt":
+        state["turn"] = int(state.get("turn", 0)) + 1
+        if recorder is not None:
+            state["turn_list_start"] = len(recorder.events) - 1
+        pending_calls.clear()
+        state["progress_diff_paths"] = set()
+        if use_color:
+            fh.write(f"\n\x1b[90m── turn {state['turn']} ──\x1b[0m\n")
+        else:
+            fh.write(f"\n── turn {state['turn']} ──\n")
+    if kind == "tool_call":
+        tool = str(event.get("tool") or "")
+        tool_use_id = str(event.get("tool_use_id") or "")
+        if tool in WRITE_EDIT_TOOLS and tool_use_id:
+            pending_calls[tool_use_id] = event
+            if tool == "write_file" and workspace_root is not None:
+                prior = capture_write_prior(workspace_root, event)
+                if prior is not None:
+                    write_priors[tool_use_id] = prior
+    banner = format_compaction_banner(event)
+    if banner:
+        fh.write(f"{banner}\n")
+    line = _format_progress_event(event)
+    if line is not None:
+        color = _progress_event_color(event, use_color=use_color)
+        prefix = "  " if kind in {"subagent_spawn", "subagent_return"} else ""
+        fh.write(f"{color}{prefix}{line}{reset}\n")
+        fh.flush()
+    if kind == "tool_result":
+        tool = str(event.get("tool") or "")
+        tool_use_id = str(event.get("tool_use_id") or "")
+        if (
+            tool == "spawn_subagents"
+            and event.get("status") == "ok"
+            and event.get("agent_id") == "parent"
+            and recorder is not None
+        ):
+            tool_result_idx = len(recorder.events) - 1
+            summary = parallel_subagent_summary_for_tool_result(
+                recorder.events, tool_result_idx
+            )
+            if summary is not None:
+                spawn_payload: list[dict[str, object]] | None = None
+                try:
+                    parsed = json.loads(str(event.get("result_full") or ""))
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    spawn_payload = [item for item in parsed if isinstance(item, dict)]
+                parallel_color = "\x1b[35m" if use_color else ""
+                for parallel_line in format_parallel_progress_lines(summary, spawn_payload=spawn_payload):
+                    fh.write(f"{parallel_color}{parallel_line}{reset}\n")
+                fh.flush()
+        if tool in WRITE_EDIT_TOOLS and event.get("status") == "ok":
+            call = pending_calls.pop(tool_use_id, None)
+            if call is not None:
+                prior = write_priors.get(tool_use_id)
+                diff_path = write_progress_diff_lines(
+                    fh, call, prior, use_color=use_color
+                )
+                if diff_path:
+                    state.setdefault("progress_diff_paths", set()).add(diff_path)
+    if kind == "assistant_step" and event.get("agent_id") == "parent" and on_parent_status:
+        on_parent_status()
+    elif kind == "run_end" and on_parent_status:
+        on_parent_status()
 
 
 def _latest_parent_answer(events: list[dict[str, object]], start_idx: int = 0) -> str:

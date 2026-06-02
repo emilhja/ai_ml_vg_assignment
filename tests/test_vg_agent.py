@@ -932,6 +932,90 @@ def test_budget_cap_choice_2_scoped_scope_key_is_reason() -> None:
     assert outcome.scope_key == "token_cap"
 
 
+def test_sanitize_summary_text_flattens_newlines() -> None:
+    from vg_agent.chat_ui import sanitize_summary_text
+
+    assert sanitize_summary_text("a\nb\r\nc") == "a ↵ b ↵ c"
+    assert sanitize_summary_text("hello", limit=3) == "hel"
+
+
+def test_args_summary_spawn_subagent_single_line() -> None:
+    from vg_agent.agent import _args_summary
+
+    summary = _args_summary("spawn_subagent", {"question": "Edit only\n\nEngine API"})
+    assert "\n" not in summary
+    assert "↵" in summary
+
+
+def test_use_rich_approval_ui_latched_when_stderr_not_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vg_agent import chat_ui
+
+    chat_ui.reset_rich_chat_latch()
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
+    def stdin_tty() -> bool:
+        return True
+
+    def stderr_tty() -> bool:
+        return False
+
+    monkeypatch.setattr(sys.stdin, "isatty", stdin_tty)
+    monkeypatch.setattr(sys.stderr, "isatty", stderr_tty)
+    assert chat_ui.use_rich_ui() is False
+
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    chat_ui.latch_rich_chat_session()
+    monkeypatch.setattr(sys.stderr, "isatty", stderr_tty)
+    assert chat_ui.use_rich_approval_ui() is True
+    chat_ui.reset_rich_chat_latch()
+
+
+def test_prompt_approval_rich_spawn_no_plain_pre_decision_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import io
+
+    from vg_agent import chat_ui
+    from vg_agent.agent import ApprovalRequest
+
+    chat_ui.reset_rich_chat_latch()
+    chat_ui.latch_rich_chat_session()
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(chat_ui, "use_rich_approval_ui", lambda: True)
+
+    stderr_buf = io.StringIO()
+
+    class FakeStderr(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    fake_stderr = FakeStderr()
+    monkeypatch.setattr(sys, "stderr", fake_stderr)
+
+    class FakeStdin:
+        def isatty(self) -> bool:
+            return True
+
+        def readline(self) -> str:
+            return "2\n"
+
+    monkeypatch.setattr(sys, "stdin", FakeStdin())
+
+    question = "Edit only `main.py`\n\nEngine API:\n- `Cal"
+    req = ApprovalRequest(
+        tool="spawn_subagent",
+        path=None,
+        args={"question": question},
+        summary=question,
+    )
+    outcome = chat_ui.prompt_approval(req, input_stream=FakeStdin(), workspace_root=tmp_path)
+    err = fake_stderr.getvalue()
+    assert outcome.decision == "approved_scoped"
+    assert "yes (this folder)" not in err
+    assert "[approval] spawn_subagent  Edit" not in err
+    assert "Approve spawn_subagent" in err or "yes (scoped)" in err
+
+
 def test_budget_cap_scope_cache_avoids_re_prompt_for_same_reason() -> None:
     prompt_calls = 0
 

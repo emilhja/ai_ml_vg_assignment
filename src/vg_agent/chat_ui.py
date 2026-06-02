@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,8 @@ _PRODUCT_LABEL = "vg-agent"
 _compact_dashboard = False
 _STATUS_THROTTLE_S = float(os.environ.get("VG_CHAT_STATUS_THROTTLE_S", "0.75"))
 _last_status_bar_refresh = 0.0
+_rich_chat_latched = False
+progress_stderr_lock = threading.RLock()
 
 try:
     from prompt_toolkit import PromptSession
@@ -44,6 +47,41 @@ def use_rich_ui() -> bool:
     stdin_tty = bool(getattr(sys.stdin, "isatty", lambda: False)())
     stderr_tty = bool(getattr(sys.stderr, "isatty", lambda: False)())
     return stdin_tty and stderr_tty
+
+
+def latch_rich_chat_session() -> None:
+    """Keep Rich approval panels for the rest of a --chat session once TTY UI started."""
+    global _rich_chat_latched
+    if use_rich_ui():
+        _rich_chat_latched = True
+
+
+def reset_rich_chat_latch() -> None:
+    global _rich_chat_latched
+    _rich_chat_latched = False
+
+
+def use_rich_approval_ui() -> bool:
+    """Rich approval chrome; latched chat sessions only require stdin TTY."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if _rich_chat_latched:
+        return bool(getattr(sys.stdin, "isatty", lambda: False)())
+    return use_rich_ui()
+
+
+def sanitize_summary_text(text: str, *, limit: int | None = None) -> str:
+    flat = str(text).replace("\r", "").replace("\n", " ↵ ")
+    if limit is not None:
+        return flat[:limit]
+    return flat
+
+
+def format_approval_panel_summary(request: Any) -> str:
+    summary = sanitize_summary_text(request.summary)
+    if request.tool in {"spawn_subagent", "spawn_subagents"} and len(summary) > 500:
+        return summary[:500] + "…"
+    return summary
 
 
 def use_emoji() -> bool:
@@ -60,6 +98,7 @@ def mark_turn_completed() -> None:
 def reset_dashboard_mode() -> None:
     global _compact_dashboard
     _compact_dashboard = False
+    reset_rich_chat_latch()
 
 
 def clear_chat_screen(*, scrollback: bool = True) -> None:
@@ -671,6 +710,7 @@ def print_chat_dashboard(
 ) -> None:
     if not use_rich_ui():
         return
+    latch_rich_chat_session()
     use_compact = _compact_dashboard if compact is None else compact
     console = _console()
     console.print(f"[dim]{_PRODUCT_LABEL}[/dim]")
@@ -1244,6 +1284,30 @@ def _parse_approval_choice(line: str, request: Any) -> Any:
     return ApprovalOutcome(decision="denied", reason="user no")
 
 
+def _read_approval_line(input_stream: object | None) -> str:
+    fh = input_stream if input_stream is not None else sys.stdin
+    if hasattr(fh, "readline"):
+        line = fh.readline()
+        return line.strip() if line else ""
+    return input("> ").strip()
+
+
+def _write_plain_approval_prompt(request: Any) -> None:
+    from .agent import BUDGET_CAP_TOOL
+
+    summary = format_approval_panel_summary(request)
+    if request.tool == BUDGET_CAP_TOOL and isinstance(request.args, dict):
+        sys.stderr.write(format_budget_cap_approval_text(str(request.path or "budget"), request.args) + "\n")
+        sys.stderr.write("  1) yes  2) yes (this cap)  3) yes (always)  4) no  5) abort\n> ")
+    elif request.tool == BUDGET_CAP_TOOL:
+        sys.stderr.write(f"[approval] budget {request.path}  {summary}\n")
+        sys.stderr.write("  1) yes  2) yes (this cap)  3) yes (always)  4) no  5) abort\n> ")
+    else:
+        sys.stderr.write(f"[approval] {request.tool}  {summary}\n")
+        sys.stderr.write("  1) yes  2) yes (scoped)  3) yes (always)  4) no  5) abort\n> ")
+    sys.stderr.flush()
+
+
 def prompt_approval(
     request: Any,
     *,
@@ -1252,70 +1316,67 @@ def prompt_approval(
 ) -> Any:
     from .agent import BUDGET_CAP_TOOL
 
-    if use_rich_ui():
+    if use_rich_approval_ui():
         from rich.console import Group
         from rich.panel import Panel
         from rich.text import Text
 
-        console = _console()
-        if request.tool == BUDGET_CAP_TOOL:
-            warn = _budget_warn_prefix().strip()
-            title = (
-                f"{warn} Budget cap — {request.path} (approval required)"
-                if warn
-                else f"Budget cap — {request.path} (approval required)"
-            )
-            options = "1/y yes  2 yes (this cap)  3/a always  4/n no  5 abort"
-            border_style = "red"
-        else:
-            title = f"Approve {request.tool}"
-            options = "1/y yes  2 yes (scoped)  3/a always  4/n no  5 abort"
-            border_style = "cyan"
-        panel_body: Any
-        if request.tool == BUDGET_CAP_TOOL and isinstance(request.args, dict):
-            body_text = format_budget_cap_approval_text(str(request.path or "budget"), request.args)
-            headline, _, remainder = body_text.partition("\n")
-            panel_body = Group(
-                Text(headline + "\n", style="bold red"),
-                Text(remainder, style="white"),
-                Text(options, style="dim"),
-            )
-        elif request.tool in WRITE_EDIT_TOOLS and isinstance(request.args, dict) and workspace_root is not None:
-            if request.tool == "edit_file":
-                old, new = old_new_for_edit_request(request.args)
+        with progress_stderr_lock:
+            console = _console()
+            console.print()
+            if request.tool == BUDGET_CAP_TOOL:
+                warn = _budget_warn_prefix().strip()
+                title = (
+                    f"{warn} Budget cap — {request.path} (approval required)"
+                    if warn
+                    else f"Budget cap — {request.path} (approval required)"
+                )
+                options = "1/y yes  2 yes (this cap)  3/a always  4/n no  5 abort"
+                border_style = "red"
             else:
-                old, new = old_new_for_write_request(workspace_root, request.args)
-            path = str(request.path or request.args.get("path") or "")
-            lines, _ = format_unified_diff(old, new, path=path)
-            if lines and not os.environ.get("NO_COLOR"):
-                from rich.panel import Panel
-
+                title = f"Approve {request.tool}"
+                options = "1/y yes  2 yes (scoped)  3/a always  4/n no  5 abort"
+                border_style = "cyan"
+            panel_summary = format_approval_panel_summary(request)
+            panel_body: Any
+            if request.tool == BUDGET_CAP_TOOL and isinstance(request.args, dict):
+                body_text = format_budget_cap_approval_text(str(request.path or "budget"), request.args)
+                headline, _, remainder = body_text.partition("\n")
                 panel_body = Group(
-                    Text(request.summary),
-                    Panel(_diff_syntax(lines), border_style="dim", style=_DIFF_PANEL_STYLE),
+                    Text(headline + "\n", style="bold red"),
+                    Text(remainder, style="white"),
                     Text(options, style="dim"),
                 )
-            elif lines:
-                panel_body = f"{request.summary}\n{_diff_lines_plain(lines)}\n{options}"
+            elif request.tool in WRITE_EDIT_TOOLS and isinstance(request.args, dict) and workspace_root is not None:
+                if request.tool == "edit_file":
+                    old, new = old_new_for_edit_request(request.args)
+                else:
+                    old, new = old_new_for_write_request(workspace_root, request.args)
+                path = str(request.path or request.args.get("path") or "")
+                lines, _ = format_unified_diff(old, new, path=path)
+                if lines and not os.environ.get("NO_COLOR"):
+                    panel_body = Group(
+                        Text(panel_summary),
+                        Panel(_diff_syntax(lines), border_style="dim", style=_DIFF_PANEL_STYLE),
+                        Text(options, style="dim"),
+                    )
+                elif lines:
+                    panel_body = Group(
+                        Text(panel_summary),
+                        Text(_diff_lines_plain(lines)),
+                        Text(options, style="dim"),
+                    )
+                else:
+                    panel_body = Group(Text(panel_summary), Text(options, style="dim"))
             else:
-                panel_body = f"{request.summary}\n[dim]{options}[/dim]"
-        else:
-            panel_body = f"{request.summary}\n[dim]{options}[/dim]"
-        console.print(Panel(panel_body, title=title, border_style=border_style))
-        if PromptSession is not None:
-            session = PromptSession()
-            line = session.prompt("> ")
+                panel_body = Group(Text(panel_summary), Text(options, style="dim"))
+            console.print(Panel(panel_body, title=title, border_style=border_style))
+            sys.stderr.write("> ")
+            sys.stderr.flush()
+            line = _read_approval_line(input_stream)
             return _parse_approval_choice(line, request)
-    if request.tool == BUDGET_CAP_TOOL and isinstance(request.args, dict):
-        sys.stderr.write(format_budget_cap_approval_text(str(request.path or "budget"), request.args) + "\n")
-        sys.stderr.write("  1) yes  2) yes (this cap)  3) yes (always)  4) no  5) abort\n> ")
-    elif request.tool == BUDGET_CAP_TOOL:
-        sys.stderr.write(f"[approval] budget {request.path}  {request.summary}\n")
-        sys.stderr.write("  1) yes  2) yes (this cap)  3) yes (always)  4) no  5) abort\n> ")
-    else:
-        sys.stderr.write(f"[approval] {request.tool}  {request.summary}\n")
-        sys.stderr.write("  1) yes  2) yes (this folder)  3) yes (always)  4) no  5) abort\n> ")
-    sys.stderr.flush()
-    fh = input_stream if input_stream is not None else sys.stdin
-    line = fh.readline().strip()
-    return _parse_approval_choice(line, request)
+
+    with progress_stderr_lock:
+        _write_plain_approval_prompt(request)
+        line = _read_approval_line(input_stream)
+        return _parse_approval_choice(line, request)

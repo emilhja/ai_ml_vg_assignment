@@ -1,13 +1,12 @@
 import tkinter as tk
-from .calculator_engine import CalculatorEngine
-from .calculator_ui import CalculatorUI
+from . import CalculatorEngine, CalculatorApp
 
 
 def main():
     root = tk.Tk()
     engine = CalculatorEngine()
-    ui = CalculatorUI(root, engine)
-    ui.run()
+    app = CalculatorApp(root, engine)
+    app.run()
 
 
 if __name__ == "__main__":

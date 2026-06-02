@@ -187,26 +187,31 @@ class ApprovalPolicy:
         return outcome
 
 
+def _single_line_summary(text: str, *, limit: int = 160) -> str:
+    flat = str(text).replace("\r", "").replace("\n", " ↵ ")
+    return flat[:limit]
+
+
 def _args_summary(tool: str, args: dict[str, Any]) -> str:
     if tool in {"read_file", "read_file_range", "write_file", "edit_file"}:
         path = args.get("path") or args.get("rel_path") or ""
         if tool == "edit_file":
             old = str(args.get("old") or "")
             new = str(args.get("new") or "")
-            return f"{path}  - {old[:40]!r} -> + {new[:40]!r}"
+            return _single_line_summary(f"{path}  - {old[:40]!r} -> + {new[:40]!r}", limit=160)
         return str(path)
     if tool == "run_bash":
-        return str(args.get("command") or "")
+        return _single_line_summary(str(args.get("command") or ""), limit=160)
     if tool == "run_tests":
         return str(args.get("path") or "")
     if tool == "spawn_subagent":
-        return str(args.get("question") or "")[:120]
+        return _single_line_summary(str(args.get("question") or ""), limit=120)
     if tool == "spawn_subagents":
         requests = args.get("requests") or []
         if isinstance(requests, list):
             return f"{len(requests)} sub-agent requests"
         return "parallel sub-agent requests"
-    return json.dumps(args, sort_keys=True, ensure_ascii=False)[:160]
+    return _single_line_summary(json.dumps(args, sort_keys=True, ensure_ascii=False), limit=160)
 
 
 def _request_for(call: ToolCall) -> ApprovalRequest:

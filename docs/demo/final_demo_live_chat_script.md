@@ -10,8 +10,8 @@ Wait for both Explorer returns, then spawn one Coder to create or update only:
 Match the existing engine/UI modules; do not spawn Reviewer unless a file write fails.
 Keep the Coder spawn question short (paths + constraints); Explorers already returned summaries.
 
-alt
-spawn_subagents: 2× Explorer (read-only) — engine.py + ui.py APIs in calc_haiku_4/.
+alt (short — filenames on disk are `calculator_engine.py` / `calculator_ui.py`, not `engine.py` / `ui.py`)
+spawn_subagents: 2× Explorer (read-only) — calculator_engine.py + calculator_ui.py APIs in calc_haiku_4/.
 Then one Coder: main.py + __init__.py only, after both return. No Reviewer. Short Coder brief.
 
 
