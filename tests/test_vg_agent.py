@@ -3210,8 +3210,12 @@ def test_chat_ui_status_bar_throttled_while_running(
     }
     chat_ui.refresh_chat_status_bar(**kwargs)
     assert not printed
+    monkeypatch.setattr(chat_ui, "_last_status_bar_refresh", 0.0)
+    chat_ui.refresh_chat_status_bar(**kwargs)
+    assert len(printed) == 1
+    printed.clear()
     chat_ui.refresh_chat_status_bar(**kwargs, force=True)
-    assert printed
+    assert len(printed) > 1
 
 
 def test_chat_ui_turn_output_skips_progress_shown_changes(
@@ -3350,6 +3354,157 @@ def test_progress_sink_spawn_subagents_parallel_summary(tmp_path: Path) -> None:
     out = buffer.getvalue()
     assert "[parallel]" in out
     assert "2 explorer finished" in out
+
+
+def test_progress_sink_rich_chat_suppresses_child_noise_keeps_parallel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from io import StringIO
+
+    from vg_agent import __main__ as cli
+    from vg_agent.trace import TraceRecorder
+
+    spawn_payload = json.dumps(
+        [
+            {"agent_id": "explorer.0", "status": "ok"},
+            {"agent_id": "explorer.1", "status": "ok"},
+        ]
+    )
+    monkeypatch.delenv("VG_CHAT_VERBOSE_PROGRESS", raising=False)
+    buffer = StringIO()
+    recorder = TraceRecorder(tmp_path, event_sink=None)
+    recorder.event_sink = cli._make_progress_sink(
+        stream=buffer,
+        turn_state={},
+        workspace_root=tmp_path,
+        recorder=recorder,
+        rich_chat=True,
+    )
+    recorder.emit(
+        "llm_start",
+        agent_id="explorer.0",
+        agent_type="explorer",
+        step_idx=1,
+        model="openrouter/google/gemini",
+        tokens_in=100,
+        max_tokens=200,
+    )
+    recorder.emit(
+        "tool_result",
+        agent_id="explorer.0",
+        agent_type="explorer",
+        tool="read_file",
+        status="ok",
+        tokens=10,
+        latency_ms=1,
+    )
+    recorder.emit(
+        "subagent_return",
+        child_agent_id="explorer.0",
+        agent_type="explorer",
+        status="ok",
+        started_at="2026-05-10T12:00:00+00:00",
+        ended_at="2026-05-10T12:00:03+00:00",
+    )
+    recorder.emit(
+        "subagent_return",
+        child_agent_id="explorer.1",
+        agent_type="explorer",
+        status="ok",
+        started_at="2026-05-10T12:00:01+00:00",
+        ended_at="2026-05-10T12:00:04+00:00",
+    )
+    recorder.emit(
+        "tool_result",
+        tool="spawn_subagents",
+        agent_id="parent",
+        status="ok",
+        result_full=spawn_payload,
+    )
+    out = buffer.getvalue()
+    assert "[llm] explorer.0" not in out
+    assert "[tool] explorer.0 read_file ok" not in out
+    assert "[agent] return explorer.0" not in out
+    assert "[parallel]" in out
+    assert "2 explorer finished" in out
+
+
+def test_progress_sink_rich_chat_keeps_write_diffs_and_errors(tmp_path: Path) -> None:
+    from io import StringIO
+
+    from vg_agent import __main__ as cli
+
+    buffer = StringIO()
+    turn_state: dict[str, object] = {}
+    sink = cli._make_progress_sink(
+        stream=buffer,
+        turn_state=turn_state,
+        workspace_root=tmp_path,
+        rich_chat=True,
+    )
+    sink(
+        {
+            "kind": "tool_call",
+            "agent_id": "coder-1",
+            "agent_type": "coder",
+            "tool_use_id": "e1",
+            "tool": "edit_file",
+            "args": {"path": "x.py", "old": "a", "new": "b"},
+        }
+    )
+    sink(
+        {
+            "kind": "tool_result",
+            "agent_id": "coder-1",
+            "agent_type": "coder",
+            "tool_use_id": "e1",
+            "tool": "edit_file",
+            "status": "ok",
+            "tokens": 1,
+            "latency_ms": 1,
+        }
+    )
+    sink(
+        {
+            "kind": "tool_result",
+            "agent_id": "explorer-1",
+            "agent_type": "explorer",
+            "tool": "read_file",
+            "status": "error",
+            "result_full": "missing file",
+            "tokens": 1,
+            "latency_ms": 1,
+        }
+    )
+    out = buffer.getvalue()
+    assert "[tool] coder-1 edit_file ok" in out
+    assert "--- a/x.py" in out
+    assert "+b" in out
+    assert "[tool] explorer-1 read_file error" in out
+
+
+def test_progress_sink_verbose_env_restores_child_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from io import StringIO
+
+    from vg_agent import __main__ as cli
+
+    monkeypatch.setenv("VG_CHAT_VERBOSE_PROGRESS", "1")
+    buffer = StringIO()
+    sink = cli._make_progress_sink(stream=buffer, workspace_root=tmp_path, rich_chat=True)
+    sink(
+        {
+            "kind": "llm_start",
+            "agent_id": "explorer-1",
+            "agent_type": "explorer",
+            "step_idx": 1,
+            "model": "openrouter/google/gemini",
+            "tokens_in": 100,
+            "max_tokens": 200,
+        }
+    )
+    assert "[llm] explorer-1 step 1" in buffer.getvalue()
 
 
 def test_chat_slash_new_starts_fresh_trace_and_live_history(

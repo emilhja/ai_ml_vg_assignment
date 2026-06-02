@@ -32,6 +32,7 @@ def dashboard_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestCli
     from dashboard.api.paths import clear_path_cache
     from dashboard.api.runtime_config import ensure_runtime_config
     from dashboard.api.services import trace_backfill
+    from dashboard.api.services.sessions import clear_jsonl_aggregate_cache
 
     ensure_runtime_config()
     bootstrap = TraceRecorder(tmp_path)
@@ -39,6 +40,7 @@ def dashboard_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestCli
     clear_path_cache()
     db_module.reset_db_cache()
     trace_backfill._BACKFILLED.clear()
+    clear_jsonl_aggregate_cache()
 
     from dashboard.api.main import app
 
@@ -47,6 +49,7 @@ def dashboard_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestCli
     clear_path_cache()
     db_module.reset_db_cache()
     trace_backfill._BACKFILLED.clear()
+    clear_jsonl_aggregate_cache()
 
 
 def test_list_sessions_backfills_orphan_jsonl(
@@ -91,7 +94,18 @@ def test_active_session_with_corrupt_sqlite_and_no_backfill(
     traces.mkdir(parents=True, exist_ok=True)
     recorder = TraceRecorder(tmp_path)
     recorder.emit("user_prompt", prompt="from jsonl")
-    recorder.emit("run_end", final_status="ok")
+    recorder.emit(
+        "assistant_step",
+        tokens_in=100,
+        tokens_out=50,
+        cost_usd=0.01,
+    )
+    recorder.emit(
+        "run_end",
+        final_status="ok",
+        total_tokens=150,
+        total_cost_usd=0.01,
+    )
     session_id = str(recorder.session_id)
 
     db_path = traces / "vg_agent.sqlite3"
@@ -101,11 +115,21 @@ def test_active_session_with_corrupt_sqlite_and_no_backfill(
     clear_path_cache()
     db_module.reset_db_cache()
     trace_backfill._BACKFILLED.clear()
+    from dashboard.api.services.sessions import clear_jsonl_aggregate_cache
+
+    clear_jsonl_aggregate_cache()
 
     health = dashboard_client.get("/api/v1/health")
     assert health.status_code == 200
     assert health.json()["ok"] is False
     assert "sqlite file exists" in (health.json().get("hint") or "").lower()
+
+    listed = dashboard_client.get("/api/v1/sessions")
+    assert listed.status_code == 200
+    row = next(item for item in listed.json()["items"] if item["session_id"] == session_id)
+    assert row["total_turns"] >= 1
+    assert row["total_tokens"] >= 150
+    assert row["total_cost_usd"] >= 0.01
 
     active = dashboard_client.get("/api/v1/sessions/active")
     assert active.status_code == 200

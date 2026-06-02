@@ -665,6 +665,35 @@ def _format_progress_event(event: dict[str, object]) -> str | None:
     return None
 
 
+def _verbose_chat_progress_enabled() -> bool:
+    return os.environ.get("VG_CHAT_VERBOSE_PROGRESS") == "1"
+
+
+def _should_print_compact_progress_event(event: dict[str, object]) -> bool:
+    kind = event.get("kind")
+    agent_id = str(event.get("agent_id") or "parent")
+    agent_type = str(event.get("agent_type") or "")
+    is_parent = agent_id == "parent"
+
+    if kind in {"llm_start", "assistant_step"}:
+        return is_parent
+    if kind in {"approval", "budget_event", "model_error", "egress_blocked", "run_end"}:
+        return True
+    if kind in {"compaction", "context_compaction"}:
+        return True
+    if kind == "tool_result":
+        if event.get("status") != "ok":
+            return True
+        tool = str(event.get("tool") or "")
+        return tool in WRITE_EDIT_TOOLS
+    if kind == "subagent_spawn":
+        return agent_type in {"coder", "reviewer"}
+    if kind == "subagent_return":
+        child_status = str(event.get("status") or "ok")
+        return child_status != "ok" or agent_type in {"coder", "reviewer"}
+    return False
+
+
 def _progress_event_color(event: dict[str, object], *, use_color: bool) -> str:
     if not use_color:
         return ""
@@ -693,9 +722,11 @@ def _make_progress_sink(
     turn_state: dict[str, Any] | None = None,
     workspace_root: Path | None = None,
     recorder: TraceRecorder | None = None,
+    rich_chat: bool = False,
 ) -> "callable":
     fh = stream if stream is not None else sys.stderr
     use_color = bool(getattr(fh, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
+    compact_progress = rich_chat and not _verbose_chat_progress_enabled()
     reset = "\x1b[0m" if use_color else ""
     state = turn_state if turn_state is not None else {}
     pending_calls: dict[str, dict[str, object]] = {}
@@ -714,6 +745,7 @@ def _make_progress_sink(
                 on_parent_status=on_parent_status,
                 workspace_root=workspace_root,
                 recorder=recorder,
+                compact_progress=compact_progress,
             )
 
     return sink
@@ -731,6 +763,7 @@ def _progress_sink_event(
     on_parent_status: Any,
     workspace_root: Path | None,
     recorder: TraceRecorder | None,
+    compact_progress: bool,
 ) -> None:
     kind = event.get("kind")
     if kind == "statusline":
@@ -758,7 +791,10 @@ def _progress_sink_event(
     if banner:
         fh.write(f"{banner}\n")
     line = _format_progress_event(event)
-    if line is not None:
+    should_print_line = line is not None and (
+        not compact_progress or _should_print_compact_progress_event(event)
+    )
+    if should_print_line:
         color = _progress_event_color(event, use_color=use_color)
         prefix = "  " if kind in {"subagent_spawn", "subagent_return"} else ""
         fh.write(f"{color}{prefix}{line}{reset}\n")
@@ -1038,6 +1074,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
         turn_state=turn_state,
         workspace_root=root,
         recorder=recorder,
+        rich_chat=use_rich_ui(),
     )
     policy = _make_policy(args, workspace_root=root)
     history_path = root / ".vg_chat_history"
@@ -1101,6 +1138,7 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                     turn_state=turn_state,
                     workspace_root=root,
                     recorder=recorder,
+                    rich_chat=use_rich_ui(),
                 )
                 recorder.emit("session_new")
                 if use_rich_ui():

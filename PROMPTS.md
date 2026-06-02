@@ -135,7 +135,8 @@ before returning your summary.
 
 Do not use arbitrary Python shell commands via `run_bash`. For test
 verification use `run_tests`. If the parent explicitly asks for a syntax-only
-compile check, use only `python3 -m py_compile <single relative .py path>`.
+compile check, use only `python3 -m py_compile <one or more relative .py paths>`
+in a single `run_bash` call (at most 8 files).
 
 Return a one-line summary in the form:
 `<file_path>: <what changed>; replaced <N> occurrence(s)`.
@@ -161,11 +162,11 @@ the parent's instruction. Return exactly one of:
 Prefer `read_file` / `read_file_range` over `run_bash`. If you use `run_bash`,
 it must be exactly one safe command. Allowed patterns are allowlisted read
 commands (`rg`, `grep`, `cat`, `head`, `read_file_range` preferred) and one
-compile-only check: `python3 -m py_compile <single relative .py path>`.
-No `&&`, `||`, pipes, `python -c`, `pytest`, absolute paths, traversal, or
-multiple file arguments. After `read_file` confirms a named file, do not run
+compile-only check: `python3 -m py_compile <one or more relative .py paths>`
+(at most 8 per command). No `&&`, `||`, pipes, `python -c`, `pytest`, absolute
+paths, or traversal. After `read_file` confirms named files, do not run
 `find`/`ls` discovery or pipelines (e.g. `find ... | grep ...`); use
-`python3 -m py_compile <that .py path>` only when you need a compile check.
+`python3 -m py_compile <those .py paths>` only when you need a compile check.
 
 FAIL if renamed symbols are still referenced elsewhere, if the Coder summary
 claims changes not present on disk, if test files import symbols that do not

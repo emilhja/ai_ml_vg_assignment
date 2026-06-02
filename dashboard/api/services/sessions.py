@@ -62,22 +62,107 @@ def session_to_summary(
     )
 
 
-def _quick_jsonl_summary(
-    session_id: str,
-    path: Path,
-    *,
-    display_names: dict[str, str] | None = None,
-) -> SessionSummary:
-    """Fast index row for history lists — does not read the whole file."""
-    last_seen = mtime_iso(path)
-    first_seen = last_seen
-    last_prompt: str | None = None
+def _prompt_snippet_from_text(prompt: str | None) -> str | None:
+    if not prompt:
+        return None
+    return prompt[:120] + ("…" if len(prompt) > 120 else "")
+
+
+class _JsonlSessionAggregate:
+    __slots__ = (
+        "first_seen_at",
+        "last_seen_at",
+        "last_prompt",
+        "status",
+        "total_turns",
+        "total_tokens",
+        "total_cost_usd",
+        "run_end_count",
+        "_assistant_tokens",
+        "_assistant_cost",
+        "_run_end_tokens",
+        "_run_end_cost",
+    )
+
+    def __init__(self) -> None:
+        self.first_seen_at: str | None = None
+        self.last_seen_at: str | None = None
+        self.last_prompt: str | None = None
+        self.status: str = "jsonl_only"
+        self.total_turns: int = 0
+        self.total_tokens: int = 0
+        self.total_cost_usd: float = 0.0
+        self.run_end_count: int = 0
+        self._assistant_tokens: int = 0
+        self._assistant_cost: float = 0.0
+        self._run_end_tokens: int = 0
+        self._run_end_cost: float = 0.0
+
+    def observe(self, event: dict) -> None:
+        ts = event.get("timestamp_iso")
+        if isinstance(ts, str):
+            if self.first_seen_at is None:
+                self.first_seen_at = ts
+            self.last_seen_at = ts
+        kind = event.get("kind")
+        if kind == "user_prompt":
+            self.total_turns += 1
+            prompt = str(event.get("prompt") or "")
+            if prompt:
+                self.last_prompt = prompt
+        elif kind == "run_end":
+            self.run_end_count += 1
+            self.status = str(event.get("final_status") or self.status)
+            self._run_end_tokens += int(event.get("total_tokens") or 0)
+            self._run_end_cost += float(event.get("total_cost_usd") or 0.0)
+        elif kind == "assistant_step":
+            self._assistant_tokens += int(event.get("tokens_in") or 0) + int(
+                event.get("tokens_out") or 0
+            )
+            self._assistant_cost += float(event.get("cost_usd") or event.get("usd") or 0.0)
+
+    def finalize(self, path: Path) -> None:
+        if self.run_end_count > 0:
+            self.total_tokens = self._run_end_tokens
+            self.total_cost_usd = round(self._run_end_cost, 6)
+        else:
+            self.total_tokens = self._assistant_tokens
+            self.total_cost_usd = round(self._assistant_cost, 6)
+        if self.first_seen_at is None:
+            try:
+                from datetime import datetime, timezone
+
+                iso = datetime.fromtimestamp(
+                    path.stat().st_mtime, tz=timezone.utc
+                ).isoformat()
+                self.first_seen_at = self.last_seen_at = iso
+            except OSError:
+                pass
+        elif self.last_seen_at is None:
+            self.last_seen_at = self.first_seen_at
+
+
+_JSONL_AGGREGATE_CACHE: dict[tuple[str, int], _JsonlSessionAggregate] = {}
+_JSONL_AGGREGATE_CACHE_MAX = 256
+
+
+def clear_jsonl_aggregate_cache() -> None:
+    """Clear cached JSONL rollups (tests)."""
+    _JSONL_AGGREGATE_CACHE.clear()
+
+
+def _aggregate_jsonl_path(path: Path) -> _JsonlSessionAggregate | None:
+    try:
+        cache_key = (str(path.resolve()), path.stat().st_mtime_ns)
+    except OSError:
+        return None
+    cached = _JSONL_AGGREGATE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    agg = _JsonlSessionAggregate()
     try:
         with path.open(encoding="utf-8") as handle:
-            for _ in range(30):
-                line = handle.readline()
-                if not line:
-                    break
+            for line in handle:
                 line = line.strip()
                 if not line:
                     continue
@@ -85,32 +170,61 @@ def _quick_jsonl_summary(
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(event, dict):
-                    continue
-                ts = event.get("timestamp_iso")
-                if isinstance(ts, str):
-                    first_seen = ts
-                if event.get("kind") == "user_prompt":
-                    prompt = str(event.get("prompt") or "")
-                    if prompt:
-                        last_prompt = prompt
-                break
+                if isinstance(event, dict):
+                    agg.observe(event)
     except OSError:
-        pass
-    snippet = None
-    if last_prompt:
-        snippet = last_prompt[:120] + ("…" if len(last_prompt) > 120 else "")
+        return None
+    agg.finalize(path)
+    if len(_JSONL_AGGREGATE_CACHE) >= _JSONL_AGGREGATE_CACHE_MAX:
+        _JSONL_AGGREGATE_CACHE.clear()
+    _JSONL_AGGREGATE_CACHE[cache_key] = agg
+    return agg
+
+
+def _jsonl_summary_from_path(
+    session_id: str,
+    path: Path,
+    *,
+    display_names: dict[str, str] | None = None,
+) -> SessionSummary | None:
+    agg = _aggregate_jsonl_path(path)
+    if agg is None:
+        return None
     return SessionSummary(
         session_id=session_id,
         display_name=display_names.get(session_id) if display_names else None,
-        first_seen_at=first_seen,
-        last_seen_at=last_seen,
+        first_seen_at=agg.first_seen_at,
+        last_seen_at=agg.last_seen_at or mtime_iso(path),
+        status=agg.status,
+        run_count=max(agg.run_end_count, 1),
+        total_turns=agg.total_turns,
+        total_tokens=agg.total_tokens,
+        total_cost_usd=agg.total_cost_usd,
+        last_prompt_snippet=_prompt_snippet_from_text(agg.last_prompt),
+    )
+
+
+def _quick_jsonl_summary(
+    session_id: str,
+    path: Path,
+    *,
+    display_names: dict[str, str] | None = None,
+) -> SessionSummary:
+    """History list row from JSONL when SQLite is missing or backfill is disabled."""
+    summary = _jsonl_summary_from_path(session_id, path, display_names=display_names)
+    if summary is not None:
+        return summary
+    return SessionSummary(
+        session_id=session_id,
+        display_name=display_names.get(session_id) if display_names else None,
+        first_seen_at=mtime_iso(path),
+        last_seen_at=mtime_iso(path),
         status="jsonl_only",
         run_count=1,
         total_turns=0,
         total_tokens=0,
         total_cost_usd=0.0,
-        last_prompt_snippet=snippet,
+        last_prompt_snippet=None,
     )
 
 
@@ -119,70 +233,11 @@ def _summarize_jsonl_session(
     *,
     display_names: dict[str, str] | None = None,
 ) -> SessionSummary | None:
-    """Full parse of JSONL for session detail (can be slow on large traces)."""
+    """Session summary from JSONL (streaming aggregate, cached by path mtime)."""
     path = find_jsonl_path(session_id)
     if path is None:
         return None
-    first_seen: str | None = None
-    last_seen: str | None = None
-    last_prompt: str | None = None
-    turns = 0
-    status = "jsonl_only"
-    total_tokens = 0
-    total_cost = 0.0
-    try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            ts = event.get("timestamp_iso")
-            if isinstance(ts, str):
-                if first_seen is None:
-                    first_seen = ts
-                last_seen = ts
-            kind = event.get("kind")
-            if kind == "user_prompt":
-                turns += 1
-                prompt = str(event.get("prompt") or "")
-                if prompt:
-                    last_prompt = prompt
-            elif kind == "run_end":
-                status = str(event.get("final_status") or status)
-            elif kind == "assistant_step":
-                total_tokens += int(event.get("tokens_in") or 0) + int(event.get("tokens_out") or 0)
-                total_cost += float(event.get("cost_usd") or event.get("usd") or 0.0)
-    except OSError:
-        return None
-    if first_seen is None:
-        try:
-            mtime = path.stat().st_mtime
-            from datetime import datetime, timezone
-
-            iso = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
-            first_seen = last_seen = iso
-        except OSError:
-            first_seen = last_seen = None
-    snippet = None
-    if last_prompt:
-        snippet = last_prompt[:120] + ("…" if len(last_prompt) > 120 else "")
-    return SessionSummary(
-        session_id=session_id,
-        display_name=display_names.get(session_id) if display_names else None,
-        first_seen_at=first_seen,
-        last_seen_at=last_seen,
-        status=status,
-        run_count=1,
-        total_turns=turns,
-        total_tokens=total_tokens,
-        total_cost_usd=round(total_cost, 6),
-        last_prompt_snippet=snippet,
-    )
+    return _jsonl_summary_from_path(session_id, path, display_names=display_names)
 
 
 def _engine_optional():

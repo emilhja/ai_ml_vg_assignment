@@ -61,9 +61,9 @@ Windows/Git Bash rules:
   `grep`, `rg`, `find`, `ls`, `pwd`, `cat`, `head`, `tail`, and `wc`. `sed` is
   intentionally excluded because `sed -i` mutates files in place.
 - One narrow Python exception is allowed for syntax checks only:
-  `python3 -m py_compile <relative .py path>` where `<relative .py path>` is a
-  single workspace-relative target. No additional flags, no absolute paths, no
-  traversal, no multiple targets.
+  `python3 -m py_compile <relative .py path> [<relative .py path> ...]` where
+  each path is workspace-relative. At most **8** targets per command. No
+  additional flags, no absolute paths, no traversal, no non-`.py` paths.
 - `run_bash` also accepts narrowly scoped workspace mutations:
   - `mkdir [-p] <dir> [<dir> ...]` — creates directories only under the
     workspace root. Only the `-p` flag is allowed. Targets must be relative,
@@ -81,7 +81,7 @@ Windows/Git Bash rules:
   including `del`, `erase`, `rmdir`, `Remove-Item`, `mv`, `move`, `cp`,
   `copy`, `chmod`, `chown`, `mkfs`, `dd`, package installers (`pip`, `npm`,
   `pnpm`, `yarn`, `uv`), foreign code runners (`python`, `powershell`, `pwsh`,
-  `cmd`) except for the narrow `python3 -m py_compile <relative .py>` form,
+  `cmd`) except for the narrow `python3 -m py_compile <relative .py> [...]` form,
   and any egress utility (`curl`, `wget`, `nc`, `ncat`, `netcat`, `ssh`, `scp`,
   `sftp`, `rsync`, `ftp`, `telnet`, `socat`, `git`).
 - `run_bash` rejects forbidden argument tokens anywhere in the parsed

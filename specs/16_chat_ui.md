@@ -62,7 +62,7 @@ unaffected.
 |---|---|
 | Session start | Full dashboard (welcome + status bar + hint) |
 | After first turn | Compact chrome (label + status bar + hint) on idle prompts |
-| During agent run | Status bar refresh on progress events, **throttled** to at most once per `VG_CHAT_STATUS_THROTTLE_S` (default `0.75`) while `… running`; always refresh when idle or after `run_end` |
+| During agent run | Status bar refresh only (no repeated hint/secondary lines) on progress events, **throttled** to at most once per `VG_CHAT_STATUS_THROTTLE_S` (default `0.75`) while `… running`; always refresh when idle or after `run_end` |
 | After user submits a prompt | Bottom input rule only (no duplicate idle status); then one `… running` status line |
 | After each agent turn | Status bar + hint (+ secondary if needed); `mark_turn_completed()` |
 | `/status` | Full dashboard (after screen clear) + `reset_dashboard_mode()`; stdout session summary (statusline, budget, trace, last run) |
@@ -189,7 +189,17 @@ When `--require-approval` is not `off` and Rich chat UI is active:
 ## Progress stream
 
 - Optional dim header `── turn N ──` at the start of each user dispatch.
-- `[agent]` lines indented under the header when grouping is enabled.
+- In Rich TTY chat, progress is **compact by default**. Print parent model-step
+  summaries, approval decisions, budget/model/network errors, failed tool
+  results, compaction banners, successful edit/write diffs, final `[run]`
+  summaries, and the parent `spawn_subagents` `[parallel]` rollup. Routine
+  sub-agent model/tool chatter (Explorer/Coder `[llm]`, read-only `[tool]`,
+  and per-child spawn/return lines) stays in the JSONL trace and is visible via
+  `/review` or trace inspection.
+- `VG_CHAT_VERBOSE_PROGRESS=1` restores the full legacy progress stream in
+  Rich TTY chat. `--task` and non-TTY chat keep the full stream unchanged.
+- `[agent]` lines are only printed in compact Rich chat for a single
+  `spawn_subagent` Coder/Reviewer lifecycle summary or sub-agent failures.
 - `compaction` and `context_compaction` events may print an extra dim banner
   (`format_compaction_banner`).
 - On successful parent `spawn_subagents` `tool_result`, print one **`[parallel]`**
@@ -254,6 +264,7 @@ Use `/show-context N` for the full JSON parent context at step `N`.
 | `VG_CHAT_NO_CLEAR` | Disable TTY screen clear before dashboard refresh. |
 | `VG_CHAT_FILE_PREVIEW_LINES` | Max lines shown for large literal `read_file` bodies (default `30`). |
 | `VG_CHAT_STATUS_THROTTLE_S` | Minimum seconds between status-bar redraws while a turn is running (default `0.75`). |
+| `VG_CHAT_VERBOSE_PROGRESS` | `1` restores the full `[llm]` / `[tool]` / `[agent]` progress stream in Rich TTY chat. |
 
 ## Non-TTY fallback
 

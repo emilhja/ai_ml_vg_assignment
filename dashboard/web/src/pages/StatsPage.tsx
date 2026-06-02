@@ -5,6 +5,7 @@ import {
   Bar,
   BarChart,
   CartesianGrid,
+  Legend,
   Line,
   LineChart,
   ResponsiveContainer,
@@ -60,6 +61,7 @@ const costChartTooltipProps = {
 } as const;
 
 type CostBarDatum = { label: string; cost_usd: number };
+type DayActivityDatum = { date: string; tokens: number; cost_usd: number; runs: number };
 
 function CostBarChart({
   data,
@@ -98,6 +100,66 @@ function CostBarChart({
       <Tooltip {...costChartTooltipProps} />
       <Bar dataKey="cost_usd" fill={fill} radius={[0, 4, 4, 0]} />
     </BarChart>
+  );
+}
+
+/** Tokens use the left axis; cost and runs share the right (same order of magnitude). */
+function ActivityDayChart({
+  data,
+  width,
+  height,
+}: {
+  data: DayActivityDatum[];
+  width?: number;
+  height?: number;
+}) {
+  if (!width || !height || data.length === 0) return null;
+  const sparse = data.length < 2;
+  const dot = sparse ? { r: 5, strokeWidth: 2 } : false;
+  return (
+    <LineChart width={width} height={height} data={data} margin={{ left: 4, right: 8 }}>
+      <CartesianGrid stroke="#334155" strokeDasharray="3 3" />
+      <XAxis dataKey="date" tick={{ fill: "#8b9cb3", fontSize: 11 }} />
+      <YAxis yAxisId="left" tick={{ fill: "#8b9cb3", fontSize: 11 }} />
+      <YAxis
+        yAxisId="right"
+        orientation="right"
+        tick={{ fill: "#8b9cb3", fontSize: 11 }}
+        tickFormatter={formatCostAxisTick}
+      />
+      <Tooltip contentStyle={{ background: "#1a2332", border: "1px solid #334155" }} />
+      <Legend />
+      <Line
+        yAxisId="left"
+        type="monotone"
+        dataKey="tokens"
+        stroke="#e07a5f"
+        strokeWidth={2}
+        dot={dot}
+        activeDot={{ r: 6 }}
+        name="Tokens"
+      />
+      <Line
+        yAxisId="right"
+        type="monotone"
+        dataKey="cost_usd"
+        stroke="#34d399"
+        strokeWidth={2}
+        dot={dot}
+        activeDot={{ r: 6 }}
+        name="Cost USD"
+      />
+      <Line
+        yAxisId="right"
+        type="monotone"
+        dataKey="runs"
+        stroke="#818cf8"
+        strokeWidth={2}
+        dot={dot}
+        activeDot={{ r: 6 }}
+        name="Runs"
+      />
+    </LineChart>
   );
 }
 
@@ -220,17 +282,15 @@ export default function StatsPage() {
       <section>
         <h3 className="text-sm text-muted mb-3">Activity by day</h3>
         <div className="h-64 bg-panel/50 rounded-lg p-2">
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={stats.by_day}>
-              <CartesianGrid stroke="#334155" strokeDasharray="3 3" />
-              <XAxis dataKey="date" tick={{ fill: "#8b9cb3", fontSize: 11 }} />
-              <YAxis tick={{ fill: "#8b9cb3", fontSize: 11 }} />
-              <Tooltip contentStyle={{ background: "#1a2332", border: "1px solid #334155" }} />
-              <Line type="monotone" dataKey="tokens" stroke="#e07a5f" dot={false} name="Tokens" />
-              <Line type="monotone" dataKey="cost_usd" stroke="#34d399" dot={false} name="Cost USD" />
-              <Line type="monotone" dataKey="runs" stroke="#818cf8" dot={false} name="Runs" />
-            </LineChart>
-          </ResponsiveContainer>
+          {stats.by_day.length === 0 ? (
+            <p className="text-sm text-muted h-full flex items-center justify-center">
+              No activity in this range.
+            </p>
+          ) : (
+            <ResponsiveContainer width="100%" height="100%">
+              <ActivityDayChart data={stats.by_day} />
+            </ResponsiveContainer>
+          )}
         </div>
       </section>
 

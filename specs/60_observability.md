@@ -33,6 +33,12 @@ Concrete example:
   plain text. Rich TTY `--chat` may also print unified-diff panels for successful
   `edit_file` / `write_file` tools (`specs/16_chat_ui.md`); this is presentation
   only and does not add JSONL event kinds.
+- Rich TTY `--chat` may collapse the terminal presentation of progress events
+  to parent summaries, approvals, errors, compaction notices, edit/write diffs,
+  and parallel batch rollups (`specs/16_chat_ui.md`). The JSONL trace still
+  records every event, and setting `VG_CHAT_VERBOSE_PROGRESS=1` restores the
+  full `[llm]` / `[tool]` / `[agent]` stream. `--task` and non-TTY chat keep the
+  full stream.
 - Idle TTY chat (`specs/16_chat_ui.md`) does **not** repeat the compact
   statusline before every prompt. Instead a bottom status bar below the input
   shows session counters (updated during runs via throttled progress callbacks);

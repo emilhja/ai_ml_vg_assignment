@@ -1223,6 +1223,8 @@ def refresh_chat_status_bar(
         since_event_idx=since_event_idx,
         force_state=force_state,
     )
+    if force_state == "running" and not force:
+        return
     _write_hint(console)
     _write_secondary(console, recorder.events, since_event_idx=since_event_idx)
 
