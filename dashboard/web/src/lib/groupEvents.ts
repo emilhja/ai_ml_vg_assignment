@@ -51,9 +51,11 @@ export function saveEventViewMode(mode: EventViewMode): void {
 
 export function loadParallelColumns(): boolean {
   try {
-    return localStorage.getItem(STORAGE_PARALLEL) === "1";
+    const stored = localStorage.getItem(STORAGE_PARALLEL);
+    if (stored === null) return true;
+    return stored === "1";
   } catch {
-    return false;
+    return true;
   }
 }
 

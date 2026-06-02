@@ -33,17 +33,21 @@ export default function ParallelTurnLayout({
 
   const batchLaneIds = useMemo(() => parallelBatchLaneIds(turnEvents), [turnEvents]);
 
-  const subEntries = useMemo(() => {
+  const { batchEntries, otherEntries } = useMemo(() => {
     const entries = [...lanes.subagents.entries()].sort((a, b) => {
       const ai = a[1][0]?.event_idx ?? 0;
       const bi = b[1][0]?.event_idx ?? 0;
       return ai - bi;
     });
-    if (!parallelColumns || !batchLaneIds) return entries;
+    if (!batchLaneIds) {
+      return { batchEntries: [] as [string, EventItem[]][], otherEntries: entries };
+    }
     const batch = entries.filter(([laneId]) => batchLaneIds.has(laneId));
     const rest = entries.filter(([laneId]) => !batchLaneIds.has(laneId));
-    return [...batch, ...rest];
-  }, [lanes.subagents, parallelColumns, batchLaneIds]);
+    return { batchEntries: batch, otherEntries: rest };
+  }, [lanes.subagents, batchLaneIds]);
+
+  const showParallelRow = parallelColumns && batchEntries.length >= 2;
 
   return (
     <div className="space-y-3">
@@ -73,21 +77,51 @@ export default function ParallelTurnLayout({
           })}
         </ul>
       )}
-      {subEntries.length > 0 && (
-        <div
-          className={
-            parallelColumns
-              ? "flex flex-wrap gap-3 overflow-x-auto pb-1"
-              : "space-y-3"
-          }
-        >
-          {subEntries.map(([laneId, evs]) => (
+      {showParallelRow && (
+        <div className="rounded-md border border-violet-500/35 bg-violet-950/20 p-3">
+          <p className="text-[10px] uppercase tracking-wide text-violet-300 mb-2">
+            Parallel explorers ({batchEntries.length}) · overlapping wall-clock
+          </p>
+          <div className="flex flex-wrap gap-3 overflow-x-auto pb-1 items-start">
+            {batchEntries.map(([laneId, evs]) => (
+              <AgentLane
+                key={laneId}
+                laneId={laneId}
+                events={evs}
+                anchors={anchors}
+                column
+                highlightEventIdx={highlightEventIdx}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+      {!showParallelRow && batchEntries.length > 0 && (
+        <div className="space-y-3">
+          {batchEntries.map(([laneId, evs]) => (
             <AgentLane
               key={laneId}
               laneId={laneId}
               events={evs}
               anchors={anchors}
-              column={parallelColumns && (batchLaneIds?.has(laneId) ?? false)}
+              column={false}
+              highlightEventIdx={highlightEventIdx}
+            />
+          ))}
+        </div>
+      )}
+      {otherEntries.length > 0 && (
+        <div className={showParallelRow ? "space-y-3 pt-1 border-t border-slate-700/40" : "space-y-3"}>
+          {showParallelRow && otherEntries.length > 0 && (
+            <p className="text-[10px] uppercase tracking-wide text-muted">Later sub-agents</p>
+          )}
+          {otherEntries.map(([laneId, evs]) => (
+            <AgentLane
+              key={laneId}
+              laneId={laneId}
+              events={evs}
+              anchors={anchors}
+              column={false}
               highlightEventIdx={highlightEventIdx}
             />
           ))}

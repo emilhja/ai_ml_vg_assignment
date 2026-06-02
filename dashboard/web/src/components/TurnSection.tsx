@@ -43,6 +43,9 @@ export default function TurnSection({
     }
   }, [highlightEventIdx, group.events]);
   const overlap = turnHasParallelOverlap(group.turnIndex, group.events, parallel);
+  const batchCount =
+    parallel?.turns?.find((t) => t.turn_index === group.turnIndex)?.returns.length ??
+    null;
   const timeRange = formatTurnTimeRange(group.startedAt, group.endedAt);
   const statsLine = formatTurnStatsLine(summarizeTurnStats(group.events, turnRollup));
   const turnAnchors: TimeAnchors = {
@@ -61,7 +64,7 @@ export default function TurnSection({
           <span className="text-sm font-semibold text-white">{group.label}</span>
           {overlap && (
             <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-violet-500/25 text-violet-300">
-              parallel
+              parallel{batchCount != null && batchCount >= 2 ? ` · ${batchCount}` : ""}
             </span>
           )}
           <span className="text-xs text-muted">{group.events.length} events</span>

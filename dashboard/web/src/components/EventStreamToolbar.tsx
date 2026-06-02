@@ -41,7 +41,7 @@ export default function EventStreamToolbar({
           </button>
         ))}
       </div>
-      {showParallelToggle && viewMode === "turn-agents" && (
+      {showParallelToggle && (viewMode === "turn-agents" || viewMode === "by-turn") && (
         <button
           type="button"
           onClick={() => onParallelColumnsChange(!parallelColumns)}

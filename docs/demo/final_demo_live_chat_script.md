@@ -1,3 +1,18 @@
+# parallel test?
+Use one spawn_subagents call with two Explorer requests (read-only):
+- Summarize public API of calc_haiku_4/calculator_engine.py (classes, methods, how UI should call it).
+- Summarize public API of calc_haiku_4/calculator_ui.py (constructor args, run/mainloop).
+
+Wait for both Explorer returns, then spawn one Coder to create or update only:
+- calc_haiku_4/main.py — runnable entrypoint importing the package correctly
+- calc_haiku_4/__init__.py — package exports
+
+Match the existing engine/UI modules; do not spawn Reviewer unless a file write fails.
+Keep the Coder spawn question short (paths + constraints); Explorers already returned summaries.
+
+
+
+
 # Final Demo Live Chat Script
 
 Goal: pass the VG live-demo requirement by proving every hard gate and all nine

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { EventItem, ParallelResponse, SessionDetail } from "../api";
 import type { TurnRollup } from "../lib/laneStats";
 import {
@@ -57,6 +57,25 @@ export default function EventFeed({
     () => sessionShowsParallelToggle(events, parallel),
     [events, parallel],
   );
+
+  const sessionKey = events[0]?.session_id ?? events[0]?.run_id ?? "";
+  const autoParallelApplied = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!anyOverlap || !sessionKey || autoParallelApplied.current === sessionKey) {
+      return;
+    }
+    autoParallelApplied.current = sessionKey;
+    setParallelColumns(true);
+    saveParallelColumns(true);
+    setViewMode((mode) => {
+      if (mode === "by-turn") {
+        saveEventViewMode("turn-agents");
+        return "turn-agents";
+      }
+      return mode;
+    });
+  }, [anyOverlap, sessionKey]);
 
   const handleViewMode = (mode: EventViewMode) => {
     setViewMode(mode);
