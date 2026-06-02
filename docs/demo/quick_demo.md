@@ -401,8 +401,8 @@ If asked where the hard cap is enforced:
 
 > `BudgetGuard.before_model_call` checks step, token, USD, and daily budget
 > before each model call. If the cap would be crossed and approval is denied or
-> unavailable, the run emits a budget event, aborts, and exits 3 before the model
-> call is made.
+> unavailable, the run emits a budget event and aborts before the model call is
+> made.
 
 If asked about the weakest part:
 
@@ -427,6 +427,6 @@ If asked about the weakest part:
 - [ ] Parent integrates Explorer results.
 - [ ] Compaction visible in `/review`, `/finops`, `/show-context`, or JSONL.
 - [ ] Warning budget event shown.
-- [ ] Hard cap abort shown with exit code 3.
+- [ ] Hard cap abort shown after denying `usd_cap`.
 - [ ] Ambiguous prompt yields clarification.
 - [ ] Trace evidence can back every claim.
