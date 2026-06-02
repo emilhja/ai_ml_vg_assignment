@@ -52,6 +52,8 @@ Compared traces:
 
 - `traces/293ed45ebd6f.jsonl` (Haiku coder/reviewer path)
 - `traces/322e77cad165.jsonl` (Gemini coder path)
+- `traces/45bb5b875143.jsonl` (Gemini coder rerun, completed)
+- `traces/7b633ed594d3.jsonl` (Haiku coder rerun, completed)
 
 | Dimension | `293ed45ebd6f` (Haiku) | `322e77cad165` (Gemini) |
 | --- | --- | --- |
@@ -71,6 +73,34 @@ Neutral reading of this sample:
   pure inference latency.
 - Re-validate with repeated tasks before making policy changes; these two runs
   are informative but not statistically representative.
+
+### Follow-up rerun (user-reported quality issue)
+
+The newer pair (`45bb5b875143` vs `7b633ed594d3`) adds an important quality
+signal:
+
+| Dimension | `45bb5b875143` (Gemini coder) | `7b633ed594d3` (Haiku coder) |
+| --- | --- | --- |
+| Completion signal | `run_end` present, `final_status: ok` | `run_end` present, `final_status: ok` |
+| End-to-end timing | `duration_s = 87.22` | `duration_s = 71.179` |
+| Tokens / cost | 44,045 tokens, `$0.073463` | 42,266 tokens, `$0.086262` |
+| Reviewer verdict | `PASS` | `PASS` |
+| Observed implementation quality | Produced a calculator file that appears to contain runtime-risk UI code patterns | Produced a cleaner single-file implementation that aligns better with the requested behavior |
+
+Critical assessment of the Gemini "finished but not working" finding:
+
+- This finding is credible. The Gemini-generated calculator in
+  `workspace/calc_gemini/calculator.py` includes likely runtime-breaking
+  Tkinter usage (mixed geometry manager calls on the same widget and
+  non-standard cursor value), even though syntax checks pass.
+- The trace shows reviewer checks relied on `py_compile` + file reads, which
+  validates syntax/static structure but can miss GUI runtime failures.
+- Because both reruns were marked `PASS`, "run completed" and "artifact works"
+  must be treated as separate quality axes in evaluations.
+- In this specific task family (Tkinter GUI coding), Haiku coder appears more
+  reliable despite higher cost in the rerun pair.
+- This is still a small sample; keep cost/latency/quality comparisons tied to
+  repeated task suites rather than single traces.
 
 ## Pricelist
 
