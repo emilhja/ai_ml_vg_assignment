@@ -46,7 +46,14 @@ def use_rich_ui() -> bool:
         return False
     stdin_tty = bool(getattr(sys.stdin, "isatty", lambda: False)())
     stderr_tty = bool(getattr(sys.stderr, "isatty", lambda: False)())
-    return stdin_tty and stderr_tty
+    return (stdin_tty and stderr_tty) or use_latched_rich_ui()
+
+
+def use_latched_rich_ui() -> bool:
+    """Keep chat Rich UI stable after the session starts, even during stream wrappers."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    return _rich_chat_latched and bool(getattr(sys.stdin, "isatty", lambda: False)())
 
 
 def latch_rich_chat_session() -> None:

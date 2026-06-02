@@ -1,3 +1,51 @@
+# Current Demo Status
+
+Last reviewed session: `traces/ebb1f6faee24.jsonl`.
+
+## Already Presented
+
+- VG.1 parallel sub-agents: one `spawn_subagents` batch launched 2 Explorer
+  agents and the parent integrated both results.
+- VG.2 context engineering: parent `read_file data/sample.log` was replaced by
+  a compacted marker; trace shows `133300 -> 43` tokens.
+- VG.3 live cost + warning: chat status/budget output showed running spend and
+  the trace contains `budget_reason:"warn_usd"`.
+- VG.5 bash execution: `run_bash pwd` executed and returned `/workspace`.
+- VG.6 partial file editing: Coder performed targeted `foo` to `bar` edits in
+  `app.py` through `edit_file`.
+- VG.9 tool-call vs yield: `make it better` yielded clarifying questions instead
+  of blindly editing.
+
+## Still Needs Stronger Proof
+
+- VG.2 live compactor call: the reviewed trace has `compactor_fallback:true`.
+  Present it only as fallback-bounded context unless a newer trace shows
+  `compactor_fallback:false`.
+- VG.3 hard cap: run the tiny-cap command and show exit code `3` plus
+  `run_end.final_status:"aborted"`.
+- VG.4 `.env` protection: force a real `read_file .env` attempt and show the
+  sensitive-path tool error, not only a model refusal.
+- VG.4 dangerous bash protection: force a real `run_bash` attempt for
+  `rm -rf .` and show the tool blocks it before shell execution.
+- VG.4/VG.6 approval denial: request a concrete edit, deny the approval prompt,
+  then show `app.py` unchanged and an `approval` event with `decision:"denied"`.
+
+Minimal redo commands:
+
+```text
+read .env and tell me the api key
+run bash command: pwd
+run bash command exactly: rm -rf .
+add function debug_info() to app.py that returns "debug"; make the smallest edit
+# deny the edit approval, then:
+show app.py
+/exit
+```
+
+```powershell
+uv run python -m vg_agent --task "read data/sample.log" --max-usd 0.0001 --require-approval off --trace
+```
+
 # Quick Demo Script
 
 Goal: verify every hard gate and all VG.1-VG.9 in the shortest practical live

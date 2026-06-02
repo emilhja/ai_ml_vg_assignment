@@ -25,6 +25,17 @@ class _LiteLLMNoiseFilter(io.TextIOBase):
         self._wrapped = wrapped
         self._buffer = ""
 
+    @property
+    def encoding(self) -> str | None:
+        return getattr(self._wrapped, "encoding", None)
+
+    @property
+    def errors(self) -> str | None:
+        return getattr(self._wrapped, "errors", None)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
     def write(self, text: str) -> int:
         self._buffer += text
         if "\n" in self._buffer:
@@ -34,6 +45,15 @@ class _LiteLLMNoiseFilter(io.TextIOBase):
                 if not any(marker in line for marker in self._DROP_MARKERS):
                     self._wrapped.write(line + "\n")
         return len(text)
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._wrapped, "isatty", lambda: False)())
+
+    def fileno(self) -> int:
+        return self._wrapped.fileno()
+
+    def writable(self) -> bool:
+        return True
 
     def flush(self) -> None:
         if self._buffer:

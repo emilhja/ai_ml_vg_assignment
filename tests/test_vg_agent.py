@@ -1003,6 +1003,51 @@ def test_use_rich_approval_ui_latched_when_stderr_not_tty(monkeypatch: pytest.Mo
     chat_ui.reset_rich_chat_latch()
 
 
+def test_use_rich_ui_latched_when_stderr_temporarily_wrapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vg_agent import chat_ui
+
+    chat_ui.reset_rich_chat_latch()
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+
+    chat_ui.latch_rich_chat_session()
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False)
+
+    assert chat_ui.use_latched_rich_ui() is True
+    assert chat_ui.use_rich_ui() is True
+    chat_ui.reset_rich_chat_latch()
+
+
+def test_litellm_noise_filter_delegates_tty_stream_attributes() -> None:
+    import io
+
+    from vg_agent.live_model_client import _LiteLLMNoiseFilter
+
+    class FakeTTY(io.StringIO):
+        encoding = "utf-8"
+        errors = "strict"
+
+        def isatty(self) -> bool:
+            return True
+
+        def fileno(self) -> int:
+            return 42
+
+        def custom_attr(self) -> str:
+            return "delegated"
+
+    wrapped = FakeTTY()
+    filtered = _LiteLLMNoiseFilter(wrapped)
+
+    assert filtered.isatty() is True
+    assert filtered.fileno() == 42
+    assert filtered.encoding == "utf-8"
+    assert filtered.errors == "strict"
+    assert filtered.writable() is True
+    assert filtered.custom_attr() == "delegated"
+
+
 def test_prompt_approval_rich_spawn_no_plain_pre_decision_line(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
