@@ -246,9 +246,19 @@ def list_sessions(
         reverse=True,
     )
     session_ids = [item.session_id for item in merged]
-    flags_by_id = bulk_subagent_flags(db, session_ids)
-    compaction_by_id = bulk_compaction_flags(db, session_ids)
-    agent_types_by_id = bulk_agent_types(db, session_ids)
+    try:
+        flags_by_id = bulk_subagent_flags(db, session_ids)
+        compaction_by_id = bulk_compaction_flags(db, session_ids)
+        agent_types_by_id = bulk_agent_types(db, session_ids)
+    except Exception:
+        from ..db import mark_sqlite_unusable
+        from .session_compaction_tags import CompactionFlags
+        from .session_tags import SubagentFlags
+
+        mark_sqlite_unusable()
+        flags_by_id = {sid: SubagentFlags() for sid in session_ids}
+        compaction_by_id = {sid: CompactionFlags() for sid in session_ids}
+        agent_types_by_id = {sid: [] for sid in session_ids}
     enriched: list[SessionSummary] = []
     for item in merged:
         flags = flags_by_id.get(item.session_id)

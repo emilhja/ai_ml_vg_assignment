@@ -2010,21 +2010,21 @@ def _spawn_questions_by_child(events: list[dict[str, object]]) -> dict[str, str]
     return questions
 
 
-def parallel_subagent_summary(
+def _collect_subagent_return_infos(
     events: list[dict[str, object]],
     *,
-    since_event_idx: int = 0,
-    before_event_idx: int | None = None,
-) -> ParallelSubagentSummary | None:
-    """Summarise subagent_return rows in an event slice; overlap from started_at/ended_at."""
-    end = before_event_idx if before_event_idx is not None else len(events)
-    slice_events = events[since_event_idx:end]
-    questions = _spawn_questions_by_child(events[:end])
+    since_event_idx: int,
+    before_event_idx: int,
+    child_ids: set[str] | None = None,
+) -> list[SubagentReturnInfo]:
+    questions = _spawn_questions_by_child(events[:before_event_idx])
     returns: list[SubagentReturnInfo] = []
-    for event in slice_events:
+    for event in events[since_event_idx:before_event_idx]:
         if event.get("kind") != "subagent_return":
             continue
         child = str(event.get("child_agent_id") or "")
+        if child_ids is not None and child not in child_ids:
+            continue
         payload = str(event.get("summary") or "")
         returns.append(
             SubagentReturnInfo(
@@ -2038,6 +2038,10 @@ def parallel_subagent_summary(
                 duration_sec=_duration_seconds(event.get("started_at"), event.get("ended_at")),
             )
         )
+    return returns
+
+
+def _summary_from_return_infos(returns: list[SubagentReturnInfo]) -> ParallelSubagentSummary | None:
     if len(returns) < 2:
         return None
     intervals: list[tuple[datetime, datetime]] = []
@@ -2055,6 +2059,101 @@ def parallel_subagent_summary(
         if overlap:
             break
     return ParallelSubagentSummary(returns=tuple(returns), overlap=overlap)
+
+
+def parallel_subagent_summary(
+    events: list[dict[str, object]],
+    *,
+    since_event_idx: int = 0,
+    before_event_idx: int | None = None,
+) -> ParallelSubagentSummary | None:
+    """Summarise subagent_return rows in an event slice; overlap from started_at/ended_at."""
+    end = before_event_idx if before_event_idx is not None else len(events)
+    returns = _collect_subagent_return_infos(
+        events,
+        since_event_idx=since_event_idx,
+        before_event_idx=end,
+        child_ids=None,
+    )
+    return _summary_from_return_infos(returns)
+
+
+def spawn_subagents_child_ids(event: dict[str, object]) -> set[str]:
+    """Child agent_id values from one parent spawn_subagents tool_result."""
+    return _child_ids_from_spawn_subagents_result(event)
+
+
+def _child_ids_from_spawn_subagents_result(event: dict[str, object]) -> set[str]:
+    try:
+        parsed = json.loads(str(event.get("result_full") or ""))
+    except json.JSONDecodeError:
+        return set()
+    if not isinstance(parsed, list):
+        return set()
+    child_ids: set[str] = set()
+    for entry in parsed:
+        if isinstance(entry, dict):
+            agent_id = str(entry.get("agent_id") or "").strip()
+            if agent_id:
+                child_ids.add(agent_id)
+    return child_ids
+
+
+def parallel_subagent_summary_for_tool_result(
+    events: list[dict[str, object]],
+    tool_result_idx: int,
+) -> ParallelSubagentSummary | None:
+    """Summarise only sub-agents listed in one parent spawn_subagents tool_result."""
+    if tool_result_idx < 0 or tool_result_idx >= len(events):
+        return None
+    event = events[tool_result_idx]
+    if (
+        event.get("kind") != "tool_result"
+        or event.get("tool") != "spawn_subagents"
+        or event.get("status") != "ok"
+        or event.get("agent_id") != "parent"
+    ):
+        return None
+    child_ids = _child_ids_from_spawn_subagents_result(event)
+    if len(child_ids) < 2:
+        return None
+    returns = _collect_subagent_return_infos(
+        events,
+        since_event_idx=0,
+        before_event_idx=tool_result_idx,
+        child_ids=child_ids,
+    )
+    return _summary_from_return_infos(returns)
+
+
+def iter_spawn_subagents_batch_summaries(
+    events: list[dict[str, object]],
+    *,
+    since_event_idx: int = 0,
+    before_event_idx: int | None = None,
+) -> list[ParallelSubagentSummary]:
+    """One summary per successful spawn_subagents tool_result in the slice."""
+    end = before_event_idx if before_event_idx is not None else len(events)
+    summaries: list[ParallelSubagentSummary] = []
+    for idx in range(since_event_idx, end):
+        summary = parallel_subagent_summary_for_tool_result(events, idx)
+        if summary is not None:
+            summaries.append(summary)
+    return summaries
+
+
+def latest_spawn_subagents_batch_summary(
+    events: list[dict[str, object]],
+    *,
+    since_event_idx: int = 0,
+    before_event_idx: int | None = None,
+) -> ParallelSubagentSummary | None:
+    batches = iter_spawn_subagents_batch_summaries(
+        events,
+        since_event_idx=since_event_idx,
+        before_event_idx=before_event_idx,
+    )
+    return batches[-1] if batches else None
 
 
 def format_parallel_progress_lines(
@@ -2101,24 +2200,14 @@ def parallel_finops_batch_lines(events: list[dict[str, object]]) -> list[str]:
     batch_num = 0
     for turn_num, start in enumerate(prompt_positions, start=1):
         end = prompt_positions[turn_num] if turn_num < len(prompt_positions) else len(events)
-        turn_events = events[start:end]
-        has_spawn = any(
-            event.get("kind") == "tool_result"
-            and event.get("tool") == "spawn_subagents"
-            and event.get("status") == "ok"
-            and event.get("agent_id") == "parent"
-            for event in turn_events
-        )
-        if not has_spawn:
-            continue
-        summary = parallel_subagent_summary(events, since_event_idx=start, before_event_idx=end)
-        if summary is None:
-            continue
-        batch_num += 1
-        overlap_label = "overlapping wall-clock" if summary.overlap else "no overlap detected"
-        batches.append(
-            f"  turn {turn_num}: spawn_subagents · {len(summary.returns)} sub-agents · {overlap_label}"
-        )
+        for summary in iter_spawn_subagents_batch_summaries(
+            events, since_event_idx=start, before_event_idx=end
+        ):
+            batch_num += 1
+            overlap_label = "overlapping wall-clock" if summary.overlap else "no overlap detected"
+            batches.append(
+                f"  turn {turn_num}: spawn_subagents · {len(summary.returns)} sub-agents · {overlap_label}"
+            )
     if not batches:
         return []
     return [f"Parallel batches this session: {batch_num}", *batches]
@@ -2181,20 +2270,25 @@ def format_turn_review(
     if not plan_found:
         lines.append("  (no tool calls)")
     lines.append("")
-    summary = parallel_subagent_summary(events, since_event_idx=start, before_event_idx=end)
+    batch_summaries = iter_spawn_subagents_batch_summaries(
+        events, since_event_idx=start, before_event_idx=end
+    )
     lines.append("Parallel:")
-    if summary is None:
+    if not batch_summaries:
         lines.append("  (no parallel sub-agent batch)")
     else:
-        lines.append(
-            f"  {len(summary.returns)} sub-agents · overlap {'yes' if summary.overlap else 'no'}"
-        )
-        for item in summary.returns:
-            dur = f"{item.duration_sec:.1f}s" if item.duration_sec is not None else "?"
+        for batch_index, summary in enumerate(batch_summaries, start=1):
+            prefix = f"  batch {batch_index}: " if len(batch_summaries) > 1 else "  "
             lines.append(
-                f"  · {item.child_agent_id} ({item.agent_type}, {dur}): "
-                f"{item.payload_snippet or item.question}"
+                f"{prefix}{len(summary.returns)} sub-agents · overlap "
+                f"{'yes' if summary.overlap else 'no'}"
             )
+            for item in summary.returns:
+                dur = f"{item.duration_sec:.1f}s" if item.duration_sec is not None else "?"
+                lines.append(
+                    f"  · {item.child_agent_id} ({item.agent_type}, {dur}): "
+                    f"{item.payload_snippet or item.question}"
+                )
     lines.append("")
     compactions = [event for event in turn_events if event.get("kind") == "compaction"]
     context_compactions = [event for event in turn_events if event.get("kind") == "context_compaction"]
@@ -5105,8 +5199,10 @@ def _make_progress_sink(
                 and event.get("agent_id") == "parent"
                 and recorder is not None
             ):
-                since = int(state.get("turn_list_start", 0))
-                summary = parallel_subagent_summary(recorder.events, since_event_idx=since)
+                tool_result_idx = len(recorder.events) - 1
+                summary = parallel_subagent_summary_for_tool_result(
+                    recorder.events, tool_result_idx
+                )
                 if summary is not None:
                     spawn_payload: list[dict[str, object]] | None = None
                     try:

@@ -9,7 +9,10 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from vg_agent.trace import parallel_subagent_summary
+from vg_agent.trace import (
+    iter_spawn_subagents_batch_summaries,
+    spawn_subagents_child_ids,
+)
 
 from ..models import SubagentRow, ToolCallRow
 from ..paths import find_jsonl_path
@@ -40,24 +43,6 @@ def _intervals_overlap(
     return a_start < b_end and b_start < a_end
 
 
-def _turn_overlap_from_subagent_rows(rows: list[SubagentRow]) -> bool:
-    if len(rows) < 2:
-        return False
-    intervals: list[tuple[datetime, datetime]] = []
-    for row in rows:
-        start = _parse_iso(row.started_at)
-        end = _parse_iso(row.ended_at)
-        if start is not None and end is not None:
-            intervals.append((start, end))
-    if len(intervals) < 2:
-        return False
-    for i, (a_start, a_end) in enumerate(intervals):
-        for b_start, b_end in intervals[i + 1 :]:
-            if _intervals_overlap(a_start, a_end, b_start, b_end):
-                return True
-    return False
-
-
 def _lane_key(event: dict) -> str:
     agent_id = str(event.get("agent_id") or "")
     if agent_id == "parent":
@@ -67,12 +52,48 @@ def _lane_key(event: dict) -> str:
     return agent_id or "unknown"
 
 
-def _lane_timestamp_overlap(turn_events: list[dict]) -> bool:
-    """2+ non-parent lanes with overlapping timestamp_iso ranges."""
+def _batch_child_ids_from_turn(turn_events: list[dict]) -> set[str] | None:
+    """Child ids from the latest spawn_subagents tool_result in a turn, if any."""
+    for event in reversed(turn_events):
+        if (
+            event.get("kind") == "tool_result"
+            and event.get("tool") == "spawn_subagents"
+            and event.get("status") == "ok"
+            and event.get("agent_id") == "parent"
+        ):
+            child_ids = spawn_subagents_child_ids(event)
+            if len(child_ids) >= 2:
+                return child_ids
+            return None
+    return None
+
+
+def _inflight_spawn_batch_lane_ids(turn_events: list[dict]) -> set[str]:
+    """Lane ids for an in-flight spawn_subagents batch (tool_result not landed yet)."""
+    has_spawn_tool = any(
+        event.get("kind") == "tool_call" and event.get("tool") == "spawn_subagents"
+        for event in turn_events
+    )
+    if not has_spawn_tool or _batch_child_ids_from_turn(turn_events):
+        return set()
+    lane_ids: set[str] = set()
+    for event in turn_events:
+        if event.get("kind") != "subagent_spawn":
+            continue
+        lane = _lane_key(event)
+        if lane != "parent":
+            lane_ids.add(lane)
+    return lane_ids
+
+
+def _lane_timestamp_overlap(turn_events: list[dict], lane_ids: set[str] | None = None) -> bool:
+    """2+ lanes (optionally filtered) with overlapping timestamp_iso ranges."""
     lanes: dict[str, list[dict]] = {}
     for event in turn_events:
         key = _lane_key(event)
         if key == "parent":
+            continue
+        if lane_ids is not None and key not in lane_ids:
             continue
         lanes.setdefault(key, []).append(event)
     if len(lanes) < 2:
@@ -101,17 +122,10 @@ def _lane_timestamp_overlap(turn_events: list[dict]) -> bool:
 
 
 def _turn_has_parallel_spawn_batch(turn_events: list[dict]) -> bool:
-    has_spawn_tool = any(
-        event.get("kind") == "tool_call" and event.get("tool") == "spawn_subagents"
-        for event in turn_events
-    )
-    if not has_spawn_tool:
-        return False
-    if sum(1 for event in turn_events if event.get("kind") == "subagent_spawn") >= 2:
+    batch_ids = _batch_child_ids_from_turn(turn_events)
+    if batch_ids is not None:
         return True
-    lane_keys = {_lane_key(event) for event in turn_events}
-    lane_keys.discard("parent")
-    return len(lane_keys) >= 2
+    return len(_inflight_spawn_batch_lane_ids(turn_events)) >= 2
 
 
 def _turn_has_subagent_activity(turn_events: list[dict]) -> bool:
@@ -127,20 +141,28 @@ def _classify_turn(turn_events: list[dict]) -> tuple[bool, bool]:
     if not _turn_has_subagent_activity(turn_events):
         return False, False
 
-    summary = parallel_subagent_summary(
+    batch_summaries = iter_spawn_subagents_batch_summaries(
         turn_events,
         since_event_idx=0,
         before_event_idx=len(turn_events),
     )
-    if summary is not None:
-        if summary.overlap:
+    if batch_summaries:
+        if any(summary.overlap for summary in batch_summaries):
             return True, False
         return False, True
 
-    if _turn_has_parallel_spawn_batch(turn_events) and _lane_timestamp_overlap(turn_events):
+    batch_child_ids = _batch_child_ids_from_turn(turn_events)
+    if batch_child_ids and _lane_timestamp_overlap(turn_events, batch_child_ids):
         return True, False
 
-    return False, True
+    inflight = _inflight_spawn_batch_lane_ids(turn_events)
+    if len(inflight) >= 2 and _lane_timestamp_overlap(turn_events, inflight):
+        return True, False
+
+    if _turn_has_subagent_activity(turn_events):
+        return False, True
+
+    return False, False
 
 
 def _turn_boundaries(events: list[dict]) -> list[tuple[int, int]]:
@@ -179,6 +201,18 @@ def _flags_from_turn_events(events: list[dict]) -> SubagentFlags:
 
 
 def subagent_flags_from_db(db: Session, session_id: str) -> SubagentFlags:
+    try:
+        return _subagent_flags_from_db(db, session_id)
+    except Exception:
+        if find_jsonl_path(session_id) is not None:
+            return subagent_flags_from_jsonl(session_id)
+        return SubagentFlags()
+
+
+def _subagent_flags_from_db(db: Session, session_id: str) -> SubagentFlags:
+    if find_jsonl_path(session_id) is not None:
+        return subagent_flags_from_jsonl(session_id)
+
     sub_rows = db.scalars(
         select(SubagentRow).where(SubagentRow.session_id == session_id)
     ).all()
@@ -204,13 +238,34 @@ def subagent_flags_from_db(db: Session, session_id: str) -> SubagentFlags:
         key = row.turn_id
         by_turn.setdefault(key, []).append(row)
 
-    has_parallel = any(
-        _turn_overlap_from_subagent_rows(rows) for rows in by_turn.values() if len(rows) >= 2
-    )
-    has_sequential = any(
-        len(rows) >= 2 and not _turn_overlap_from_subagent_rows(rows)
-        for rows in by_turn.values()
-    )
+    has_parallel = False
+    has_sequential = False
+    for rows in by_turn.values():
+        if not rows:
+            continue
+        started_ends = [
+            (_parse_iso(row.started_at), _parse_iso(row.ended_at))
+            for row in rows
+        ]
+        intervals = [(s, e) for s, e in started_ends if s is not None and e is not None]
+        if len(intervals) >= 2:
+            overlap = False
+            for i, (a_start, a_end) in enumerate(intervals):
+                for b_start, b_end in intervals[i + 1 :]:
+                    if _intervals_overlap(a_start, a_end, b_start, b_end):
+                        overlap = True
+                        break
+                if overlap:
+                    break
+            if overlap and len(rows) == 2:
+                has_parallel = True
+            elif len(rows) >= 2:
+                has_sequential = True
+            else:
+                has_sequential = True
+        elif rows:
+            has_sequential = True
+
     if not has_sequential:
         single_spawn = db.scalars(
             select(ToolCallRow.tool)

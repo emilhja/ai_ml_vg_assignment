@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from vg_agent.trace import parallel_subagent_summary, show_context
+from vg_agent.trace import iter_spawn_subagents_batch_summaries, show_context
 
 from ..schemas import (
     ContextMessage,
@@ -71,26 +71,27 @@ def build_parallel_response(run_id: str, events: list[dict]) -> ParallelResponse
     bounds = _turn_bounds(events)
     turns: list[ParallelTurnItem] = []
     for turn_index, (start, end) in enumerate(bounds, start=1):
-        summary = parallel_subagent_summary(events, since_event_idx=start, before_event_idx=end)
-        if summary is None:
-            continue
-        turns.append(
-            ParallelTurnItem(
-                turn_index=turn_index,
-                overlap=summary.overlap,
-                returns=[
-                    ParallelReturnItem(
-                        child_agent_id=item.child_agent_id,
-                        agent_type=item.agent_type,
-                        question=item.question,
-                        duration_sec=item.duration_sec,
-                        status=item.status,
-                        payload_snippet=item.payload_snippet,
-                    )
-                    for item in summary.returns
-                ],
-            )
+        batch_summaries = iter_spawn_subagents_batch_summaries(
+            events, since_event_idx=start, before_event_idx=end
         )
+        for summary in batch_summaries:
+            turns.append(
+                ParallelTurnItem(
+                    turn_index=turn_index,
+                    overlap=summary.overlap,
+                    returns=[
+                        ParallelReturnItem(
+                            child_agent_id=item.child_agent_id,
+                            agent_type=item.agent_type,
+                            question=item.question,
+                            duration_sec=item.duration_sec,
+                            status=item.status,
+                            payload_snippet=item.payload_snippet,
+                        )
+                        for item in summary.returns
+                    ],
+                )
+            )
     return ParallelResponse(run_id=run_id, turns=turns)
 
 

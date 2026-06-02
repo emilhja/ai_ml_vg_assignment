@@ -16,6 +16,14 @@ _SessionLocal: sessionmaker[Session] | None = None
 _sqlite_unusable: bool = False
 
 
+def mark_sqlite_unusable() -> None:
+    """Drop cached engine after a runtime SQLite failure (e.g. corrupt pages)."""
+    global _engine, _SessionLocal, _sqlite_unusable
+    _sqlite_unusable = True
+    _engine = None
+    _SessionLocal = None
+
+
 def sqlite_usable() -> bool:
     """False when the observability DB is missing, corrupt, or unreadable."""
     global _sqlite_unusable
@@ -28,6 +36,11 @@ def sqlite_usable() -> bool:
         conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
         try:
             conn.execute("SELECT 1 FROM sessions LIMIT 1").fetchone()
+            check = conn.execute("PRAGMA quick_check").fetchone()
+            if check is None or str(check[0]).lower() != "ok":
+                _sqlite_unusable = True
+                return False
+            conn.execute("SELECT 1 FROM tool_calls LIMIT 1").fetchone()
             return True
         finally:
             conn.close()
@@ -73,7 +86,6 @@ def db_exists() -> bool:
 
 def reset_db_cache() -> None:
     """Clear cached engine state (tests)."""
-    global _engine, _SessionLocal, _sqlite_unusable
-    _engine = None
-    _SessionLocal = None
+    mark_sqlite_unusable()
+    global _sqlite_unusable
     _sqlite_unusable = False

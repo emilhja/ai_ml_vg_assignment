@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import type { EventItem } from "../api";
 import { prepareTurnAgentLanes } from "../lib/compactionUnits";
-import type { TimeAnchors } from "../lib/groupEvents";
+import { parallelBatchLaneIds, type TimeAnchors } from "../lib/groupEvents";
 import AgentLane from "./AgentLane";
 import CompactionUnitCard from "./CompactionUnitCard";
 import EventRow from "./EventRow";
@@ -31,15 +31,19 @@ export default function ParallelTurnLayout({
     [lanes.parent],
   );
 
-  const subEntries = useMemo(
-    () =>
-      [...lanes.subagents.entries()].sort((a, b) => {
-        const ai = a[1][0]?.event_idx ?? 0;
-        const bi = b[1][0]?.event_idx ?? 0;
-        return ai - bi;
-      }),
-    [lanes.subagents],
-  );
+  const batchLaneIds = useMemo(() => parallelBatchLaneIds(turnEvents), [turnEvents]);
+
+  const subEntries = useMemo(() => {
+    const entries = [...lanes.subagents.entries()].sort((a, b) => {
+      const ai = a[1][0]?.event_idx ?? 0;
+      const bi = b[1][0]?.event_idx ?? 0;
+      return ai - bi;
+    });
+    if (!parallelColumns || !batchLaneIds) return entries;
+    const batch = entries.filter(([laneId]) => batchLaneIds.has(laneId));
+    const rest = entries.filter(([laneId]) => !batchLaneIds.has(laneId));
+    return [...batch, ...rest];
+  }, [lanes.subagents, parallelColumns, batchLaneIds]);
 
   return (
     <div className="space-y-3">
@@ -83,7 +87,7 @@ export default function ParallelTurnLayout({
               laneId={laneId}
               events={evs}
               anchors={anchors}
-              column={parallelColumns}
+              column={parallelColumns && (batchLaneIds?.has(laneId) ?? false)}
               highlightEventIdx={highlightEventIdx}
             />
           ))}

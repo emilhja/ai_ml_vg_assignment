@@ -23,7 +23,7 @@ Do not show or export `.env`.
 
 | Rubric proof | Curated trace | Key events |
 |---|---|---|
-| VG.1 parallel sub-agents + integrated result | `evidence/traces/af9b76f58b41.jsonl` | Parent calls `spawn_subagents` with 2 Explorer requests; two `subagent_spawn` rows overlap; two `subagent_return` rows are merged into the final parent answer. |
+| VG.1 parallel sub-agents + integrated result | `evidence/traces/af9b76f58b41.jsonl` | Parent calls `spawn_subagents` with 2 Explorer requests; two `subagent_spawn` rows overlap; two `subagent_return` rows are merged into the final parent answer. `/finops` and chat status count only the `agent_id` entries in that `spawn_subagents` `tool_result` (not later Coder/Reviewer returns in the same turn). Unit test: `test_parallel_finops_batch_lines_ignore_later_spawns_in_turn`. |
 | VG.2 parent tool-result compaction | `evidence/traces/af9b76f58b41.jsonl` and `evidence/traces/a13d4de3f4c8.jsonl` | `compaction` rows compact `data/sample.log` from `133300` tokens to short summaries with `compactor_fallback:false`. |
 | VG.3 live cost / normal run | `evidence/traces/af9b76f58b41.jsonl` | `run_end` records non-zero `total_cost_usd` and `total_tokens`; model calls include per-agent cost fields. |
 | VG.3 soft USD warning | `evidence/traces/ac27d651d787.jsonl` | `budget_event` has `budget_reason:"warn_usd"` and run ends `final_status:"ok"`. |

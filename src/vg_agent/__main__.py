@@ -775,8 +775,10 @@ def _make_progress_sink(
                 and event.get("agent_id") == "parent"
                 and recorder is not None
             ):
-                since = int(state.get("turn_list_start", 0))
-                summary = parallel_subagent_summary(recorder.events, since_event_idx=since)
+                tool_result_idx = len(recorder.events) - 1
+                summary = parallel_subagent_summary_for_tool_result(
+                    recorder.events, tool_result_idx
+                )
                 if summary is not None:
                     spawn_payload: list[dict[str, object]] | None = None
                     try:

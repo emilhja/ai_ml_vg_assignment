@@ -5,9 +5,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .config import dashboard_host, dashboard_port
@@ -100,7 +100,23 @@ if not _serve_built_ui():
 else:
     _dist = _ui_dist_dir()
     assert _dist is not None
-    app.mount("/", StaticFiles(directory=str(_dist), html=True), name="ui")
+    _index = _dist / "index.html"
+    _assets = _dist / "assets"
+    if _assets.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(_assets)), name="ui-assets")
+
+    @app.get("/", include_in_schema=False)
+    def spa_root() -> FileResponse:
+        return FileResponse(_index)
+
+    @app.get("/{spa_path:path}", include_in_schema=False)
+    def spa_fallback(spa_path: str) -> FileResponse:
+        if spa_path.startswith("api"):
+            raise HTTPException(status_code=404)
+        candidate = _dist / spa_path
+        if spa_path and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(_index)
 
 
 def run() -> None:

@@ -1752,15 +1752,14 @@ def test_parallel_subagent_summary_overlap() -> None:
 def test_parallel_finops_batch_lines(tmp_path: Path) -> None:
     from vg_agent.trace import parallel_finops_batch_lines
 
+    spawn_payload = json.dumps(
+        [
+            {"agent_id": "explorer.0", "agent_type": "explorer", "status": "ok", "payload": "a"},
+            {"agent_id": "explorer.1", "agent_type": "explorer", "status": "ok", "payload": "b"},
+        ]
+    )
     recorder = TraceRecorder(tmp_path)
     recorder.emit("user_prompt", prompt="parallel task")
-    recorder.emit(
-        "tool_result",
-        tool="spawn_subagents",
-        agent_id="parent",
-        status="ok",
-        result_full="[]",
-    )
     recorder.emit(
         "subagent_return",
         child_agent_id="explorer.0",
@@ -1775,10 +1774,116 @@ def test_parallel_finops_batch_lines(tmp_path: Path) -> None:
         started_at="2026-05-10T12:00:01+00:00",
         ended_at="2026-05-10T12:00:03+00:00",
     )
+    recorder.emit(
+        "tool_result",
+        tool="spawn_subagents",
+        agent_id="parent",
+        status="ok",
+        result_full=spawn_payload,
+    )
     lines = parallel_finops_batch_lines(recorder.events)
     assert lines
     assert "Parallel batches this session: 1" in lines[0]
+    assert "2 sub-agents" in lines[1]
     assert "overlapping wall-clock" in lines[1]
+
+
+def test_parallel_finops_batch_lines_ignore_later_spawns_in_turn(tmp_path: Path) -> None:
+    """VG.1 / FinOps: Coder+Reviewer returns in the same turn must not inflate batch count."""
+    from vg_agent.trace import parallel_finops_batch_lines
+
+    spawn_payload = json.dumps(
+        [
+            {"agent_id": "explorer-1.0", "agent_type": "explorer", "status": "ok", "payload": "engine"},
+            {"agent_id": "explorer-1.1", "agent_type": "explorer", "status": "ok", "payload": "ui"},
+        ]
+    )
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="calc_haiku_4 parallel inspect then coder")
+    recorder.emit(
+        "subagent_return",
+        child_agent_id="explorer-1.0",
+        agent_type="explorer",
+        started_at="2026-05-10T12:00:00+00:00",
+        ended_at="2026-05-10T12:00:03+00:00",
+    )
+    recorder.emit(
+        "subagent_return",
+        child_agent_id="explorer-1.1",
+        agent_type="explorer",
+        started_at="2026-05-10T12:00:01+00:00",
+        ended_at="2026-05-10T12:00:04+00:00",
+    )
+    recorder.emit(
+        "tool_result",
+        tool="spawn_subagents",
+        agent_id="parent",
+        status="ok",
+        result_full=spawn_payload,
+    )
+    recorder.emit(
+        "subagent_return",
+        child_agent_id="coder-3",
+        agent_type="coder",
+        started_at="2026-05-10T12:00:10+00:00",
+        ended_at="2026-05-10T12:00:20+00:00",
+    )
+    recorder.emit(
+        "subagent_return",
+        child_agent_id="reviewer-4",
+        agent_type="reviewer",
+        started_at="2026-05-10T12:00:21+00:00",
+        ended_at="2026-05-10T12:00:30+00:00",
+    )
+    lines = parallel_finops_batch_lines(recorder.events)
+    assert any("2 sub-agents" in line for line in lines)
+    assert not any("4 sub-agents" in line for line in lines)
+
+
+def test_parallel_subagent_summary_for_tool_result_scopes_batch() -> None:
+    from vg_agent.trace import parallel_subagent_summary_for_tool_result
+
+    spawn_payload = json.dumps(
+        [
+            {"agent_id": "explorer.0", "status": "ok"},
+            {"agent_id": "explorer.1", "status": "ok"},
+        ]
+    )
+    events = [
+        {
+            "kind": "subagent_return",
+            "child_agent_id": "explorer.0",
+            "agent_type": "explorer",
+            "started_at": "2026-05-10T12:00:00+00:00",
+            "ended_at": "2026-05-10T12:00:03+00:00",
+        },
+        {
+            "kind": "subagent_return",
+            "child_agent_id": "explorer.1",
+            "agent_type": "explorer",
+            "started_at": "2026-05-10T12:00:01+00:00",
+            "ended_at": "2026-05-10T12:00:04+00:00",
+        },
+        {
+            "kind": "tool_result",
+            "tool": "spawn_subagents",
+            "agent_id": "parent",
+            "status": "ok",
+            "result_full": spawn_payload,
+        },
+        {
+            "kind": "subagent_return",
+            "child_agent_id": "coder-1",
+            "agent_type": "coder",
+            "started_at": "2026-05-10T12:00:10+00:00",
+            "ended_at": "2026-05-10T12:00:20+00:00",
+        },
+    ]
+    summary = parallel_subagent_summary_for_tool_result(events, 2)
+    assert summary is not None
+    assert len(summary.returns) == 2
+    assert summary.overlap is True
+    assert {item.child_agent_id for item in summary.returns} == {"explorer.0", "explorer.1"}
 
 
 def test_show_context_overview_lists_steps_and_parallel() -> None:
@@ -1856,6 +1961,18 @@ def test_format_turn_review_includes_parallel_section(tmp_path: Path) -> None:
         started_at="2026-05-10T12:00:01+00:00",
         ended_at="2026-05-10T12:00:03+00:00",
         summary="UTILS_SENTINEL",
+    )
+    recorder.emit(
+        "tool_result",
+        tool="spawn_subagents",
+        agent_id="parent",
+        status="ok",
+        result_full=json.dumps(
+            [
+                {"agent_id": "explorer.0", "status": "ok", "payload": "AUTH_SENTINEL"},
+                {"agent_id": "explorer.1", "status": "ok", "payload": "UTILS_SENTINEL"},
+            ]
+        ),
     )
     recorder.emit(
         "assistant_step",

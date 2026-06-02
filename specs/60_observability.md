@@ -101,9 +101,10 @@ Surfaced via:
 - `--budget` CLI flag (one-shot summary at the end of a run, machine-readable
   JSON to stdout).
 - `/budget` slash command in `--chat`.
-- `/finops` in `--chat` may append a short **parallel batches** block (count of
-  `spawn_subagents` turns with overlapping `subagent_return` intervals) without
-  adding JSONL fields.
+- `/finops` in `--chat` may append a short **parallel batches** block (one line
+  per successful `spawn_subagents` `tool_result`, counting only child agents
+  listed in that tool payload, with overlap from their `subagent_return`
+  intervals) without adding JSONL fields.
 
 ## FinOps data contract
 

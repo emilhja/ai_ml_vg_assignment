@@ -20,7 +20,7 @@ WRITE_EDIT_TOOLS = _WRITE_EDIT_TOOLS
 from . import config, tools
 from .budget import BudgetGuard, format_usd_display
 from .runtime_settings import models_missing_local_pricing
-from .trace import TraceRecorder, parallel_subagent_summary, show_context
+from .trace import TraceRecorder, latest_spawn_subagents_batch_summary, show_context
 
 CHAT_PLACEHOLDER = 'Try "read data/sample.log and summarise auth/"'
 
@@ -271,10 +271,13 @@ def _latest_turn_parallel_hint(events: list[dict[str, object]]) -> str | None:
     if not prompt_positions:
         return None
     start = prompt_positions[-1]
-    summary = parallel_subagent_summary(events, since_event_idx=start)
+    summary = latest_spawn_subagents_batch_summary(events, since_event_idx=start)
     if summary is None or not summary.overlap:
         return None
-    return f"last turn: {len(summary.returns)} parallel explorers (overlap confirmed)"
+    explorer_count = sum(1 for item in summary.returns if item.agent_type == "explorer")
+    count = explorer_count if explorer_count >= 2 else len(summary.returns)
+    label = "parallel explorers" if explorer_count == len(summary.returns) else "parallel sub-agents"
+    return f"last turn: {count} {label} (overlap confirmed)"
 
 
 def _secondary_notice(events: list[dict[str, object]], *, since_event_idx: int) -> str | None:

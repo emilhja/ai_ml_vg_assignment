@@ -300,31 +300,62 @@ function intervalsOverlap(
   return aStart < bEnd && bStart < aEnd;
 }
 
-/** Turn used spawn_subagents with 2+ sub-agent lanes (even before returns). */
-export function turnHasParallelSpawnBatch(turnEvents: EventItem[]): boolean {
+/** Parse spawn_subagents tool_result JSON for batch child agent ids. */
+export function spawnSubagentsBatchChildIds(turnEvents: EventItem[]): Set<string> | null {
+  for (let i = turnEvents.length - 1; i >= 0; i--) {
+    const e = turnEvents[i];
+    if (e.kind !== "tool_result" || e.tool !== "spawn_subagents" || e.status !== "ok") {
+      continue;
+    }
+    const raw = e.payload.result_full;
+    if (typeof raw !== "string") continue;
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) continue;
+      const ids = new Set<string>();
+      for (const entry of parsed) {
+        if (!entry || typeof entry !== "object") continue;
+        const agentId = String((entry as { agent_id?: unknown }).agent_id ?? "").trim();
+        if (agentId) ids.add(agentId);
+      }
+      return ids.size >= 2 ? ids : null;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+/** In-flight spawn_subagents: spawn tool seen, batch result not landed yet. */
+function inflightSpawnBatchLaneIds(turnEvents: EventItem[]): Set<string> {
   const hasSpawnTool = turnEvents.some(
     (e) => e.kind === "tool_call" && e.tool === "spawn_subagents",
   );
-  if (!hasSpawnTool) return false;
-  const { subagents } = splitAgentLanes(turnEvents);
-  if (subagents.size >= 2) return true;
-  return turnEvents.filter((e) => e.kind === "subagent_spawn").length >= 2;
+  if (!hasSpawnTool || spawnSubagentsBatchChildIds(turnEvents)) {
+    return new Set();
+  }
+  const ids = new Set<string>();
+  for (const e of turnEvents) {
+    if (e.kind !== "subagent_spawn") continue;
+    const lane = laneKeyForEvent(e);
+    if (lane !== "parent") ids.add(lane);
+  }
+  return ids;
 }
 
-/** Client heuristic: 2+ sub-agent lanes with overlapping timestamps. */
-export function detectParallelOverlapHeuristic(turnEvents: EventItem[]): boolean {
+function laneOverlapAmongIds(turnEvents: EventItem[], laneIds: Set<string>): boolean {
+  if (laneIds.size < 2) return false;
   const { subagents } = splitAgentLanes(turnEvents);
-  if (subagents.size < 2) return false;
-
   const ranges: { start: number; end: number }[] = [];
-  for (const lane of subagents.values()) {
+  for (const laneId of laneIds) {
+    const lane = subagents.get(laneId);
+    if (!lane) continue;
     const bounds = turnBoundsFromEvents(lane);
     const start = parseIsoMs(bounds.startedAt);
     const end = parseIsoMs(bounds.endedAt);
     if (start != null && end != null) ranges.push({ start, end });
   }
   if (ranges.length < 2) return false;
-
   for (let i = 0; i < ranges.length; i++) {
     for (let j = i + 1; j < ranges.length; j++) {
       if (intervalsOverlap(ranges[i].start, ranges[i].end, ranges[j].start, ranges[j].end)) {
@@ -332,6 +363,22 @@ export function detectParallelOverlapHeuristic(turnEvents: EventItem[]): boolean
       }
     }
   }
+  return false;
+}
+
+/** Turn has a spawn_subagents batch (completed or in-flight). */
+export function turnHasParallelSpawnBatch(turnEvents: EventItem[]): boolean {
+  const batchIds = spawnSubagentsBatchChildIds(turnEvents);
+  if (batchIds && batchIds.size >= 2) return true;
+  return inflightSpawnBatchLaneIds(turnEvents).size >= 2;
+}
+
+/** Overlap among spawn_subagents batch lanes only (not Coder/Reviewer). */
+export function detectParallelOverlapHeuristic(turnEvents: EventItem[]): boolean {
+  const batchIds = spawnSubagentsBatchChildIds(turnEvents);
+  if (batchIds) return laneOverlapAmongIds(turnEvents, batchIds);
+  const inflight = inflightSpawnBatchLaneIds(turnEvents);
+  if (inflight.size >= 2) return laneOverlapAmongIds(turnEvents, inflight);
   return false;
 }
 
@@ -344,9 +391,7 @@ export function turnHasParallelOverlap(
     const pt = parallel.turns.find((t) => t.turn_index === turnIndex);
     if (pt) return pt.overlap;
   }
-  return (
-    detectParallelOverlapHeuristic(turnEvents) || turnHasParallelSpawnBatch(turnEvents)
-  );
+  return detectParallelOverlapHeuristic(turnEvents);
 }
 
 /** Whether the Events toolbar should offer parallel column layout. */
@@ -355,10 +400,15 @@ export function sessionShowsParallelToggle(
   parallel: ParallelResponse | null | undefined,
 ): boolean {
   if (parallel?.turns?.some((t) => t.overlap)) return true;
-  return groupByTurn(events).some(
-    (g) =>
-      detectParallelOverlapHeuristic(g.events) || turnHasParallelSpawnBatch(g.events),
-  );
+  return groupByTurn(events).some((g) => detectParallelOverlapHeuristic(g.events));
+}
+
+/** Lane ids that belong to the latest spawn_subagents batch (for column layout). */
+export function parallelBatchLaneIds(turnEvents: EventItem[]): Set<string> | null {
+  const batchIds = spawnSubagentsBatchChildIds(turnEvents);
+  if (batchIds && batchIds.size >= 2) return batchIds;
+  const inflight = inflightSpawnBatchLaneIds(turnEvents);
+  return inflight.size >= 2 ? inflight : null;
 }
 
 export function sessionStartIso(events: EventItem[]): string | null {

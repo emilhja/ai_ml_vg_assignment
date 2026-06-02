@@ -50,8 +50,11 @@ unaffected.
    - When `final_status ∉ {ok, ready}` or `tool_errors > 0`: `!! {reason} — see
      progress above` in yellow accent.
    - When the latest completed turn had **overlapping** parallel explorers (from
-     `subagent_return` intervals): dim `last turn: N parallel explorers (overlap
-     confirmed)` (at most one line; no full `/review` dump).
+     the most recent `spawn_subagents` batch only, via
+     `latest_spawn_subagents_batch_summary`): dim
+     `last turn: N parallel explorers (overlap confirmed)` (at most one line; no
+     full `/review` dump). Count **N** from that batch's `agent_id` entries, not
+     later `spawn_subagent` Coder/Reviewer returns in the same turn.
 
 ## Refresh rules
 

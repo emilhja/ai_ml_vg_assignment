@@ -172,8 +172,8 @@ Per user-prompt turn:
 
 | Badge | When |
 |-------|------|
-| **parallel** (turn) | `parallel_subagent_summary` reports overlapping `subagent_return` intervals, **or** `spawn_subagents` with 2+ overlapping sub-agent lanes (timestamp overlap on lane events, including before returns land). |
-| **sequential** (turn) | `parallel_subagent_summary` with 2+ returns but no overlap, single `spawn_subagent`, or other sub-agent activity without parallel overlap. |
+| **parallel** (turn) | `iter_spawn_subagents_batch_summaries` reports overlap for a `spawn_subagents` batch (child ids from that tool_result only), **or** in-flight `spawn_subagents` with 2+ overlapping explorer lanes before the tool_result lands. |
+| **sequential** (turn) | Sub-agent activity without a parallel `spawn_subagents` batch, or batch with no overlap; single `spawn_subagent` spawns. Later Coder/Reviewer returns in the same user turn do **not** count toward parallel batch size. |
 
 Session flags OR across turns. A session may show **both** badges (e.g. one turn with
 `spawn_subagent`, another with parallel `spawn_subagents`).

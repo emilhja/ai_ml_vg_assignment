@@ -4,16 +4,16 @@ overview: Your session log shows genuine parallel execution for the two Explorer
 todos:
   - id: confirm-vg1
     content: Treat [parallel] 2 explorer · overlap yes + interleaved step logs as VG.1 MET for this session
-    status: in_progress
+    status: completed
   - id: optional-trace
     content: "Optional: verify two explorer subagent_return intervals in JSONL if archiving demo evidence"
-    status: pending
+    status: completed
   - id: optional-ui-fix
     content: "Optional follow-up: fix parallel_subagent_summary scoping in _latest_turn_parallel_hint and parallel_finops_batch_lines (count only spawn_subagents batch, not whole-turn returns)"
-    status: pending
+    status: completed
   - id: optional-prompt-dedup
     content: "Optional: PROMPTS.md nudge — parent should reference explorer findings briefly in Coder spawn question, not paste full module text twice"
-    status: pending
+    status: completed
 isProject: false
 ---
 

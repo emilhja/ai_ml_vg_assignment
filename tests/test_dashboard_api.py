@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -584,6 +585,73 @@ def test_subagent_flags_overlapping_spawns_without_returns() -> None:
     assert flags.has_subagents is True
     assert flags.has_parallel_subagents is True
     assert flags.has_sequential_subagents is False
+
+
+def test_subagent_flags_parallel_batch_ignores_later_coder_reviewer() -> None:
+    from dashboard.api.services.session_tags import _flags_from_turn_events
+
+    spawn_payload = json.dumps(
+        [
+            {"agent_id": "explorer-1.0", "agent_type": "explorer", "status": "ok"},
+            {"agent_id": "explorer-1.1", "agent_type": "explorer", "status": "ok"},
+        ]
+    )
+    events = [
+        {"kind": "user_prompt", "event_idx": 0},
+        {
+            "kind": "subagent_return",
+            "child_agent_id": "explorer-1.0",
+            "agent_type": "explorer",
+            "started_at": "2026-05-10T12:00:00+00:00",
+            "ended_at": "2026-05-10T12:00:03+00:00",
+            "event_idx": 1,
+        },
+        {
+            "kind": "subagent_return",
+            "child_agent_id": "explorer-1.1",
+            "agent_type": "explorer",
+            "started_at": "2026-05-10T12:00:01+00:00",
+            "ended_at": "2026-05-10T12:00:04+00:00",
+            "event_idx": 2,
+        },
+        {
+            "kind": "tool_result",
+            "tool": "spawn_subagents",
+            "agent_id": "parent",
+            "status": "ok",
+            "result_full": spawn_payload,
+            "event_idx": 3,
+        },
+        {
+            "kind": "subagent_return",
+            "child_agent_id": "coder-3",
+            "agent_type": "coder",
+            "started_at": "2026-05-10T12:00:10+00:00",
+            "ended_at": "2026-05-10T12:00:20+00:00",
+            "event_idx": 4,
+        },
+        {
+            "kind": "subagent_return",
+            "child_agent_id": "reviewer-4",
+            "agent_type": "reviewer",
+            "started_at": "2026-05-10T12:00:21+00:00",
+            "ended_at": "2026-05-10T12:00:30+00:00",
+            "event_idx": 5,
+        },
+    ]
+    flags = _flags_from_turn_events(events)
+    assert flags.has_parallel_subagents is True
+
+    from dashboard.api.services.context import build_parallel_response
+
+    parallel = build_parallel_response("run-mixed", events)
+    assert len(parallel.turns) == 1
+    assert parallel.turns[0].overlap is True
+    assert len(parallel.turns[0].returns) == 2
+    assert {item.child_agent_id for item in parallel.turns[0].returns} == {
+        "explorer-1.0",
+        "explorer-1.1",
+    }
 
 
 def test_subagent_flags_serial_spawn_subagents_returns() -> None:

@@ -23,6 +23,10 @@ Pipeline guidance (you decide each transition; this is not a fixed script):
 - For file mutations, spawn a Coder sub-agent with the file path and exact
   requested change. Do not call `write_file` or `edit_file` directly; those
   tools are only available inside Coder.
+- When spawning Coder after Explorer returns, reference prior findings briefly
+  (paths, APIs, constraints). Do not paste full Explorer summaries again in the
+  `spawn_subagent` question — the Coder reads files itself and the parent
+  context already holds the `spawn_subagents` tool result.
 - For fix/review tasks: Explorer (inspect) → one Coder (fix, include "update
   all references after renames") → **mandatory Reviewer** after Coder returns
   `ok`. Do not spawn Reviewer before Coder.
