@@ -36,17 +36,43 @@ def _redact(content: str) -> tuple[str, list[tuple[str, int]]]:
     return redacted, summary
 
 
+def _redact_value(value: Any) -> tuple[Any, list[tuple[str, int]]]:
+    summary: list[tuple[str, int]] = []
+    if isinstance(value, str):
+        new_value, hits = _redact(value)
+        if hits:
+            summary.extend(hits)
+        return new_value, summary
+    if isinstance(value, list):
+        redacted_items: list[Any] = []
+        for item in value:
+            redacted_item, hits = _redact_value(item)
+            if hits:
+                summary.extend(hits)
+            redacted_items.append(redacted_item)
+        return redacted_items, summary
+    if isinstance(value, dict):
+        redacted_dict: dict[Any, Any] = {}
+        for key, item in value.items():
+            new_key, key_hits = _redact_value(key) if isinstance(key, str) else (key, [])
+            if key_hits:
+                summary.extend(key_hits)
+            redacted_item, item_hits = _redact_value(item)
+            if item_hits:
+                summary.extend(item_hits)
+            redacted_dict[new_key] = redacted_item
+        return redacted_dict, summary
+    return value, summary
+
+
 def _redact_event_fields(event: dict[str, Any]) -> tuple[dict[str, Any], list[tuple[str, int]]]:
     summary: list[tuple[str, int]] = []
     redacted: dict[str, Any] = {}
     for key, value in event.items():
-        if isinstance(value, str):
-            new_value, hits = _redact(value)
-            if hits:
-                summary.extend(hits)
-            redacted[key] = new_value
-        else:
-            redacted[key] = value
+        redacted_value, hits = _redact_value(value)
+        if hits:
+            summary.extend(hits)
+        redacted[key] = redacted_value
     return redacted, summary
 
 

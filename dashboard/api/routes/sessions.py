@@ -107,14 +107,15 @@ def get_session_events(
 
 
 @router.get("/{session_id}/stream")
-async def stream_session(session_id: str, request: Request) -> StreamingResponse:
-    from_event_idx = int(request.query_params.get("from_event_idx", -1))
+async def stream_session(
+    session_id: str,
+    request: Request,
+    from_event_idx: int = Query(-1),
+    max_ticks: int | None = Query(None, ge=1),
+) -> StreamingResponse:
     last_event_id = request.headers.get("Last-Event-ID")
     if last_event_id and last_event_id.isdigit():
         from_event_idx = max(from_event_idx, int(last_event_id))
-
-    max_ticks_param = request.query_params.get("max_ticks")
-    max_ticks = int(max_ticks_param) if max_ticks_param and max_ticks_param.isdigit() else None
 
     async def event_generator():
         from ..db import get_db as db_ctx

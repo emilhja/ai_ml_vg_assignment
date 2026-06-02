@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from vg_agent.agent import run_live_task
@@ -884,6 +885,92 @@ def test_events_merge_jsonl_when_sqlite_lags(dashboard_client: TestClient, tmp_p
 
     parallel = dashboard_client.get(f"/api/v1/runs/{run_id}/parallel")
     assert parallel.status_code == 200
+
+
+def test_built_ui_response_blocks_traversal_and_serves_spa(tmp_path: Path) -> None:
+    from dashboard.api.main import _built_ui_response
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    index = dist / "index.html"
+    index.write_text("<div id='root'></div>", encoding="utf-8")
+    asset = dist / "app.js"
+    asset.write_text("console.log('ok')", encoding="utf-8")
+    outside = tmp_path / "secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    spa = _built_ui_response(dist, index, "sessions/abc")
+    assert Path(spa.path) == index
+
+    static = _built_ui_response(dist, index, "app.js")
+    assert Path(static.path) == asset
+
+    for path in ("api/v1/health", "../secret.txt", "..\\secret.txt"):
+        with pytest.raises(HTTPException) as exc_info:
+            _built_ui_response(dist, index, path)
+        assert exc_info.value.status_code == 404
+
+
+def test_sse_stream_invalid_from_event_idx_returns_client_error(
+    dashboard_client: TestClient,
+    tmp_path: Path,
+) -> None:
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="sse invalid cursor")
+
+    response = dashboard_client.get(
+        f"/api/v1/sessions/{recorder.session_id}/stream",
+        params={"from_event_idx": "abc"},
+    )
+    assert response.status_code == 422
+
+
+def test_sse_stream_skips_jsonl_event_with_invalid_numeric_fields(
+    dashboard_client: TestClient,
+    tmp_path: Path,
+) -> None:
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="sse malformed jsonl")
+    session_id = str(recorder.session_id)
+    run_id = str(recorder.run_id)
+    jsonl_path = tmp_path / "traces" / f"{session_id}.jsonl"
+    malformed_idx = {
+        "run_id": run_id,
+        "session_id": session_id,
+        "event_idx": "bad",
+        "kind": "assistant_step",
+        "tokens_in": 1,
+    }
+    malformed_numeric = {
+        "run_id": run_id,
+        "session_id": session_id,
+        "event_idx": 1,
+        "kind": "assistant_step",
+        "tokens_in": "not-an-int",
+    }
+    valid = {
+        "run_id": run_id,
+        "session_id": session_id,
+        "event_idx": 2,
+        "kind": "assistant_step",
+        "tokens_in": 3,
+    }
+    with jsonl_path.open("a", encoding="utf-8") as handle:
+        for row in (malformed_idx, malformed_numeric, valid):
+            handle.write(json.dumps(row) + "\n")
+
+    with dashboard_client.stream(
+        "GET",
+        f"/api/v1/sessions/{session_id}/stream",
+        params={"from_event_idx": 0, "max_ticks": "1"},
+        timeout=5.0,
+    ) as response:
+        assert response.status_code == 200
+        text = "\n".join(response.iter_lines())
+
+    assert '"event_idx": 2' in text
+    assert '"event_idx": 1' not in text
+    assert "not-an-int" not in text
 
 
 def test_sse_stream_yields_events(dashboard_client: TestClient, tmp_path: Path) -> None:

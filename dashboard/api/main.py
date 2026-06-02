@@ -48,7 +48,7 @@ def _log_resolved_paths() -> None:
     if schema_ready():
         try:
             ensure_metadata_table(get_engine())
-        except RuntimeError:
+        except (RuntimeError, OSError):
             pass
 
     sys.stderr.write(
@@ -69,6 +69,20 @@ def _ui_dist_dir() -> Path | None:
 def _serve_built_ui() -> bool:
     flag = os.environ.get("VG_DASHBOARD_SERVE_UI", "").strip().lower()
     return flag in ("1", "true", "yes") and _ui_dist_dir() is not None
+
+
+def _built_ui_response(dist: Path, index: Path, spa_path: str) -> FileResponse:
+    if spa_path.startswith("api"):
+        raise HTTPException(status_code=404)
+    dist_resolved = dist.resolve()
+    candidate = (dist_resolved / spa_path).resolve()
+    try:
+        candidate.relative_to(dist_resolved)
+    except ValueError as exc:
+        raise HTTPException(status_code=404) from exc
+    if spa_path and candidate.is_file():
+        return FileResponse(candidate)
+    return FileResponse(index)
 
 
 @app.get("/api", include_in_schema=False)
@@ -100,7 +114,8 @@ if not _serve_built_ui():
 else:
     _dist = _ui_dist_dir()
     assert _dist is not None
-    _index = _dist / "index.html"
+    _dist = _dist.resolve()
+    _index = (_dist / "index.html").resolve()
     _assets = _dist / "assets"
     if _assets.is_dir():
         app.mount("/assets", StaticFiles(directory=str(_assets)), name="ui-assets")
@@ -111,12 +126,7 @@ else:
 
     @app.get("/{spa_path:path}", include_in_schema=False)
     def spa_fallback(spa_path: str) -> FileResponse:
-        if spa_path.startswith("api"):
-            raise HTTPException(status_code=404)
-        candidate = _dist / spa_path
-        if spa_path and candidate.is_file():
-            return FileResponse(candidate)
-        return FileResponse(_index)
+        return _built_ui_response(_dist, _index, spa_path)
 
 
 def run() -> None:

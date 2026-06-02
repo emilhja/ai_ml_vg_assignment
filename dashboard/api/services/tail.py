@@ -33,7 +33,10 @@ def tail_jsonl_new_events(path: Path, *, from_event_idx: int) -> list[dict]:
             continue
         if not isinstance(event, dict):
             continue
-        idx = int(event.get("event_idx", -1))
+        try:
+            idx = int(event.get("event_idx", -1))
+        except (TypeError, ValueError):
+            continue
         if idx > from_event_idx:
             events.append(event)
     return events
@@ -101,8 +104,13 @@ async def sse_session_stream(
         if jsonl_new:
             all_cached.extend(jsonl_new)
             for event in jsonl_new:
-                new_items.append(dict_to_event_item(event))
-                cursor = max(cursor, int(event.get("event_idx", cursor)))
+                try:
+                    item = dict_to_event_item(event)
+                    event_idx = int(event.get("event_idx", cursor))
+                except (TypeError, ValueError):
+                    continue
+                new_items.append(item)
+                cursor = max(cursor, event_idx)
         else:
             from ..config import schema_ready
 

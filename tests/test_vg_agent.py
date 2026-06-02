@@ -613,6 +613,17 @@ def test_run_bash_rejects_dangerous_commands(tmp_path: Path) -> None:
     assert validate_shell_command("find . -maxdepth 1 -type d") is None
     assert validate_shell_command("git fetch origin") is not None
     assert validate_shell_command("ssh user@host ls") is not None
+    assert validate_shell_command("cat README.md") is None
+    assert validate_shell_command("head README.md") is None
+    assert validate_shell_command("rg keep README.md") is None
+    assert validate_shell_command("cat .env") is not None
+    assert validate_shell_command("head .env") is not None
+    assert validate_shell_command("rg OPENROUTER_API_KEY .env") is not None
+    assert validate_shell_command("cat foo/.env") is not None
+    assert validate_shell_command("cat .ssh/id_ed25519") is not None
+    assert validate_shell_command("cat .aws/credentials") is not None
+    assert validate_shell_command("cat .vg_daily_spend.json") is not None
+    assert validate_shell_command("cat secrets/private.key") is not None
 
     result = run_bash(tmp_path, "rm -rf .", "unsafe-rm")
     assert result["status"] == "error"
@@ -2424,6 +2435,30 @@ def test_trace_redacts_secrets(tmp_path: Path) -> None:
 
     recorder = TraceRecorder(tmp_path)
     recorder.emit("tool_result", tool="read_file", tool_use_id="t1", result_full="leaked sk-or-v1-DEADBEEF-9")
+    nested = recorder.emit(
+        "tool_call",
+        tool="run_bash",
+        tool_use_id="t2",
+        args={
+            "command": "rg sk-or-v1-NESTED-123 .env",
+            "metadata": [
+                {"auth": "Bearer abc.def"},
+                {"aws": "AKIA0123456789ABCDEF", "unchanged": 7},
+            ],
+        },
+        tool_calls=[
+            {
+                "name": "read_file",
+                "args": {"path": ".env", "token": "sk-or-v1-TOOLCALL-123"},
+            }
+        ],
+    )
+    serialized_nested = json.dumps(nested)
+    assert "sk-or-v1-NESTED" not in serialized_nested
+    assert "Bearer abc.def" not in serialized_nested
+    assert "AKIA0123456789ABCDEF" not in serialized_nested
+    assert "sk-or-v1-TOOLCALL" not in serialized_nested
+    assert nested["args"]["metadata"][1]["unchanged"] == 7  # type: ignore[index]
     events = recorder.events
     assert not any("sk-or-v1-DEAD" in str(e.get("result_full", "")) for e in events)
     redaction_events = [e for e in events if e["kind"] == "redaction"]
@@ -2431,6 +2466,10 @@ def test_trace_redacts_secrets(tmp_path: Path) -> None:
     with sqlite3.connect(tmp_path / config.SQLITE_TRACE_DB) as conn:
         payloads = "\n".join(row[0] for row in conn.execute("SELECT payload_json FROM events"))
         assert "sk-or-v1-DEAD" not in payloads
+        assert "sk-or-v1-NESTED" not in payloads
+        assert "Bearer abc.def" not in payloads
+        assert "AKIA0123456789ABCDEF" not in payloads
+        assert "sk-or-v1-TOOLCALL" not in payloads
         assert conn.execute("SELECT COUNT(*) FROM redactions").fetchone()[0] == len(redaction_events)
 
 

@@ -10,7 +10,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import schema_ready, sqlite_path
-from .paths import _sqlite_connect_ro
+from .paths import _sqlite_connect_ro, sqlite_is_writable
 
 _engine = None
 _SessionLocal: sessionmaker[Session] | None = None
@@ -60,12 +60,24 @@ def get_engine():
         )
     if _engine is None:
         db_file = sqlite_path()
-        url = f"sqlite:///{db_file.as_posix()}"
-        _engine = create_engine(
-            url,
-            connect_args={"check_same_thread": False},
-            pool_pre_ping=True,
-        )
+        if sqlite_is_writable(db_file):
+            url = f"sqlite:///{db_file.as_posix()}"
+            _engine = create_engine(
+                url,
+                connect_args={"check_same_thread": False},
+                pool_pre_ping=True,
+            )
+        else:
+
+            def _connect() -> sqlite3.Connection:
+                return _sqlite_connect_ro(db_file)
+
+            _engine = create_engine(
+                "sqlite://",
+                creator=_connect,
+                connect_args={"check_same_thread": False},
+                pool_pre_ping=True,
+            )
         _SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False)
     return _engine
 

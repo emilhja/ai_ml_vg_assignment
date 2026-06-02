@@ -113,6 +113,17 @@ def _path_token_error(token: str) -> str | None:
     return None
 
 
+def _validate_read_command_operand(token: str) -> str | None:
+    if token.startswith("-"):
+        return None
+    if token in {".", "./"}:
+        return None
+    sensitive = validate_sensitive_path(token)
+    if sensitive:
+        return sensitive
+    return _path_token_error(token)
+
+
 def rm_delete_target(command: str) -> str | None:
     try:
         tokens = shlex.split(command, posix=True)
@@ -280,7 +291,7 @@ def validate_shell_command(command: str) -> str | None:
         if lower_token in FORBIDDEN_ARG_TOKENS or lower_token.startswith("--exec"):
             return f"forbidden argument token {token!r} is not allowed"
     for token in tokens[1:]:
-        path_error = _path_token_error(token)
+        path_error = _validate_read_command_operand(token)
         if path_error:
             return path_error
     return None

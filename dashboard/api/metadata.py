@@ -10,6 +10,7 @@ from pathlib import Path
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError as SAOperationalError
 
 from .paths import all_traces_dirs, find_jsonl_path, resolve_traces_dir
 
@@ -34,18 +35,22 @@ def metadata_json_paths() -> list[Path]:
 
 
 def ensure_metadata_table(engine: Engine) -> None:
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS session_metadata (
-                    session_id TEXT PRIMARY KEY,
-                    display_name TEXT,
-                    updated_at TEXT
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS session_metadata (
+                        session_id TEXT PRIMARY KEY,
+                        display_name TEXT,
+                        updated_at TEXT
+                    )
+                    """
                 )
-                """
             )
-        )
+    except (sqlite3.OperationalError, SAOperationalError):
+        # Read-only observability DB (Docker bind mount / WAL); JSON sidecar still works.
+        return
 
 
 def _normalize_display_name(value: str | None) -> str | None:

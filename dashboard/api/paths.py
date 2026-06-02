@@ -86,6 +86,23 @@ def _sqlite_session_count(path: Path) -> int:
     return _sqlite_db_metrics(path)[0]
 
 
+def sqlite_is_writable(path: Path) -> bool:
+    """True when the dashboard can open the observability DB for writes."""
+    if not path.is_file():
+        return False
+    try:
+        conn = sqlite3.connect(path, timeout=2.0)
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS __vg_write_probe__(x INTEGER)")
+            conn.execute("DROP TABLE IF EXISTS __vg_write_probe__")
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+
+
 @lru_cache(maxsize=1)
 def all_traces_dirs() -> tuple[Path, ...]:
     """Every traces/ folder to scan (workspace + repo root are both common)."""
