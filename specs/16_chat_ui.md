@@ -13,7 +13,7 @@ unaffected.
 
 1. **Product label** — `vg-agent` in dim text, left-aligned.
 2. **Welcome panel** — Rich `Panel` with thin accent border (full dashboard only):
-   - Line 1: `* Welcome to VG Agent!` (accent asterisk, bold title).
+   - Line 1: `* Welcome to CodeSaver!` (accent asterisk, bold title).
    - Line 2: `cwd: {short_cwd}` where `short_cwd` tilde-expands `$HOME`.
    - After the first completed agent turn, the welcome panel is **not** shown
      again until `/status`, `/reset`, or `/new` (compact idle chrome).

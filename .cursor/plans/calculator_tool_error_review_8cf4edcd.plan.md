@@ -81,7 +81,7 @@ The **Reviewer system prompt** also forbids pipes ([`PROMPTS.md`](PROMPTS.md) li
 |--------|---------|-----|
 | **Loosen `run_bash` (allow `\|`)** | **Do not** | Pipes are the main way to chain a allowlisted first command with a destructive second. That is exactly what [`specs/20_tools.md`](specs/20_tools.md) and the VG demo story guard against. `find \| grep` adds no capability here — `read_file` already proved the file exists. |
 | **Accept current behavior** | **Yes** | Block → tool error in trace → sub-agent retries with a single command → run `ok`. One extra Reviewer step and one approval prompt; ~$0.01 noise, not a failure mode. |
-| **Prompt-only nudge** | **Optional** | If demo polish matters, add one Reviewer negative example in [`PROMPTS.md`](PROMPTS.md) only (no spec/runtime change): “Do not use `find \| grep`; after `read_file`, use `py_compile` if you need a compile check.” Reduces repeat mistakes; does not change the safety contract. |
+| **Prompt-only nudge** | **Done** | Added to [`PROMPTS.md`](PROMPTS.md) Reviewer section; regenerated via `generate_project.py --clean`. |
 | **UX: `partial` / softer `!!`** | **Optional, separate** | Does not fix the pipe question; only makes recovered errors less alarming in chat. |
 
 **Bottom line:** This session is the intended contract — conservative shell gate, model learns from refusal, task still completes. Changing rules to allow pipelines would trade a core safety invariant for convenience the Reviewer did not need.

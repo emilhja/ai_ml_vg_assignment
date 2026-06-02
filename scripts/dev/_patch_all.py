@@ -201,7 +201,7 @@ def print_chat_dashboard(
 
     welcome = Text()
     welcome.append("* ", style=f"bold {_WELCOME_BORDER}")
-    welcome.append("Welcome to VG Agent!", style="bold white")
+    welcome.append("Welcome to CodeSaver!", style="bold white")
     welcome.append("\n")
     welcome.append("/help for commands \u00b7 /status for your current setup", style="italic dim")
     welcome.append("\n")

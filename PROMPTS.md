@@ -163,7 +163,9 @@ it must be exactly one safe command. Allowed patterns are allowlisted read
 commands (`rg`, `grep`, `cat`, `head`, `read_file_range` preferred) and one
 compile-only check: `python3 -m py_compile <single relative .py path>`.
 No `&&`, `||`, pipes, `python -c`, `pytest`, absolute paths, traversal, or
-multiple file arguments.
+multiple file arguments. After `read_file` confirms a named file, do not run
+`find`/`ls` discovery or pipelines (e.g. `find ... | grep ...`); use
+`python3 -m py_compile <that .py path>` only when you need a compile check.
 
 FAIL if renamed symbols are still referenced elsewhere, if the Coder summary
 claims changes not present on disk, if test files import symbols that do not

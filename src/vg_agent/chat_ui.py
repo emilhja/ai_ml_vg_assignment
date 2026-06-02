@@ -680,7 +680,7 @@ def print_chat_dashboard(
 
         welcome = Text()
         welcome.append("* ", style=f"bold {_WELCOME_BORDER}")
-        welcome.append("Welcome to VG Agent!", style="bold white")
+        welcome.append("Welcome to CodeSaver!", style="bold white")
         welcome.append("\n")
         welcome.append(f"cwd: {short_cwd(root)}", style="dim")
         missing = models_missing_local_pricing()
