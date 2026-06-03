@@ -38,6 +38,7 @@ from vg_agent.demo_fixture import write_fixture
 from vg_agent.tools import (
     edit_file,
     read_file,
+    read_file_range,
     run_bash,
     run_tests,
     validate_run_tests_path,
@@ -4717,3 +4718,88 @@ def test_clarify_tool_error_pytest_missing() -> None:
     msg = clarify_tool_error("run_tests", "No module named pytest")
     assert "pytest" in msg.lower()
     assert "venv" in msg.lower() or "runtime" in msg.lower()
+
+
+# --- Demo-gate + refactor-guard tests (quick_demo.md coverage) ---------------
+
+
+def test_read_file_range_out_of_bounds_returns_empty_ok(tmp_path: Path) -> None:
+    """Characterize current leniency: an out-of-range start yields empty 'ok',
+    not an error (Python slice semantics). Pins behavior so it can't drift
+    silently; flip the assertions if read_file_range is made strict."""
+    (tmp_path / "a.txt").write_text("l1\nl2\nl3\n", encoding="utf-8")
+    res = read_file_range(tmp_path, "a.txt", 100, 200, "r1")
+    assert res["status"] == "ok"
+    assert res["result_full"] == ""
+
+
+def test_run_bash_allowlisted_read_only_commands_succeed(tmp_path: Path) -> None:
+    """Positive complement to the run_bash denial tests (demo VG.5)."""
+    assert run_bash(tmp_path, "pwd", "b1")["status"] == "ok"
+    assert run_bash(tmp_path, "ls", "b2")["status"] == "ok"
+
+
+def test_denied_edit_leaves_app_py_unchanged_on_disk(tmp_path: Path) -> None:
+    """quick_demo.md §5: denying a Coder write must leave the file byte-for-byte
+    unchanged and surface as approval_denied, with no fallback write."""
+    write_fixture(tmp_path)
+    target = tmp_path / "app.py"
+    original = target.read_text(encoding="utf-8")
+    client = _rename_via_coder_client()
+
+    def deny_writes(request: ApprovalRequest) -> ApprovalOutcome:
+        if request.tool in {"edit_file", "write_file"}:
+            return ApprovalOutcome(decision="denied", reason="user no")
+        return ApprovalOutcome(decision="approved", reason="ok")
+
+    recorder = TraceRecorder(tmp_path)
+    policy = ApprovalPolicy(mode="writes", prompt=deny_writes)
+    run_live_task(tmp_path, "rename foo to bar in app.py", recorder, client=client, policy=policy)
+
+    assert target.read_text(encoding="utf-8") == original
+    events = read_events(recorder.path)
+    assert any(e.get("kind") == "approval" and e.get("decision") == "denied" for e in events)
+    assert not any(
+        e.get("kind") == "tool_result"
+        and e.get("tool") in {"edit_file", "write_file"}
+        and e.get("status") == "ok"
+        for e in events
+    )
+
+
+@pytest.mark.parametrize(
+    "rel_path,needle",
+    [
+        (".env", "Use '.env.example'"),
+        ("secrets/id_rsa", "SSH private keys"),
+        ("app.pem", "Cryptographic key files"),
+        (".aws/credentials", "Cloud credential files"),
+        (".ssh/credentials", "Cloud credential files"),  # precedence: credential before ssh-dir
+        (".ssh/config", "SSH credential directories"),
+        (".netrc", "Netrc credential files"),
+        (".vg_approvals.json", "Internal governance files"),
+    ],
+)
+def test_sensitive_path_hint_precedence(rel_path: str, needle: str) -> None:
+    """Guards the consolidated (pattern, hint) table in tools.py."""
+    message = validate_sensitive_path(rel_path)
+    assert message is not None
+    assert "sensitive path" in message
+    assert needle in message
+
+
+def test_sensitive_path_allows_env_example() -> None:
+    assert validate_sensitive_path(".env.example") is None
+
+
+def test_model_dicts_derive_from_catalog() -> None:
+    """Guards config._MODELS consolidation: the public per-field dicts must
+    stay in sync with the single catalog."""
+    catalog_ids = set(config._MODELS)
+    assert set(config.PRICING_USD_PER_MTOK) == catalog_ids
+    assert set(config.CONTEXT_WINDOW_TOKENS) == catalog_ids
+    assert set(config.AUTO_COMPACT_FRACTION) == catalog_ids
+    for model_id, spec in config._MODELS.items():
+        assert config.PRICING_USD_PER_MTOK[model_id] == spec["pricing"]
+        assert config.CONTEXT_WINDOW_TOKENS[model_id] == spec["context_window"]
+        assert config.AUTO_COMPACT_FRACTION[model_id] == spec["compact_fraction"]
