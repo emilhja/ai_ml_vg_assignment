@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from ..models import EventRow, SubagentRow
 from ..paths import find_jsonl_path
+from .jsonl_io import read_jsonl_events
 
 KNOWN_AGENT_TYPES: tuple[str, ...] = (
     "parent",
@@ -67,21 +68,7 @@ def agent_types_from_jsonl(session_id: str) -> list[str]:
     path = find_jsonl_path(session_id)
     if path is None:
         return []
-    try:
-        events: list[dict] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                raw = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(raw, dict):
-                events.append(raw)
-    except OSError:
-        return []
-    return _types_from_events(events)
+    return _types_from_events(read_jsonl_events(path))
 
 
 def agent_types_from_db(db: Session, session_id: str) -> list[str]:

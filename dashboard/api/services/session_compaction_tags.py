@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from ..models import CompactionRow, EventRow
 from ..paths import find_jsonl_path
+from .jsonl_io import read_jsonl_events
 
 
 @dataclass(frozen=True)
@@ -44,21 +45,7 @@ def compaction_flags_from_jsonl(session_id: str) -> CompactionFlags:
     path = find_jsonl_path(session_id)
     if path is None:
         return CompactionFlags()
-    try:
-        events: list[dict] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                raw = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(raw, dict):
-                events.append(raw)
-    except OSError:
-        return CompactionFlags()
-    return _flags_from_events(events)
+    return _flags_from_events(read_jsonl_events(path))
 
 
 def compaction_flags_from_db(db: Session, session_id: str) -> CompactionFlags:

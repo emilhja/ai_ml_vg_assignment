@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -16,6 +15,7 @@ from vg_agent.trace import (
 
 from ..models import SubagentRow, ToolCallRow
 from ..paths import find_jsonl_path
+from .jsonl_io import read_jsonl_events
 
 
 @dataclass(frozen=True)
@@ -287,21 +287,7 @@ def subagent_flags_from_jsonl(session_id: str) -> SubagentFlags:
     path = find_jsonl_path(session_id)
     if path is None:
         return SubagentFlags()
-    try:
-        events: list[dict] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                raw = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(raw, dict):
-                events.append(raw)
-    except OSError:
-        return SubagentFlags()
-    return _flags_from_turn_events(events)
+    return _flags_from_turn_events(read_jsonl_events(path))
 
 
 def bulk_subagent_flags(db: Session | None, session_ids: list[str]) -> dict[str, SubagentFlags]:

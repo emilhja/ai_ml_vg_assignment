@@ -15,6 +15,7 @@ from ..paths import all_traces_dirs, find_jsonl_path, mtime_iso
 from .session_agent_types import bulk_agent_types
 from .session_compaction_tags import bulk_compaction_flags
 from .session_tags import bulk_subagent_flags
+from .jsonl_io import read_jsonl_events
 from .trace_backfill import ensure_session_mirrored
 from ..models import EventRow, RunRow, SessionRow, TurnRow
 from ..schemas import (
@@ -663,15 +664,4 @@ def load_events_from_jsonl(session_id: str) -> list[dict]:
     path = jsonl_path_for_session(session_id)
     if not path.is_file():
         return []
-    events: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(item, dict):
-            events.append(item)
-    return events
+    return read_jsonl_events(path)
