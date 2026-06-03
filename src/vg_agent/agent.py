@@ -1276,7 +1276,7 @@ def _run_live_subagent(
                 break
             continue
         expected_in = _estimate_message_tokens(system_prompt, messages)
-        decision = guard.before_model_call(model, expected_in, 2048)
+        decision = guard.before_model_call(model, expected_in, config.SUBAGENT_MAX_OUTPUT_TOKENS)
         if not decision.allowed:
             if not _handle_budget_cap(
                 policy=policy,
@@ -1301,7 +1301,7 @@ def _run_live_subagent(
             model_id=model,
             step_idx=local_step,
             tokens_in=expected_in,
-            max_tokens=2048,
+            max_tokens=config.SUBAGENT_MAX_OUTPUT_TOKENS,
             endpoint_host=config.OPENROUTER_ENDPOINT_HOST,
             system_prompt_sha256=hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
             tool_schema_count=len(tool_schemas),
@@ -1313,7 +1313,7 @@ def _run_live_subagent(
                 system_prompt=system_prompt,
                 messages=messages,
                 tools=tool_schemas,
-                max_tokens=2048,
+                max_tokens=config.SUBAGENT_MAX_OUTPUT_TOKENS,
             )
         except LiveModelError as exc:
             _record_model_error(recorder, guard, exc, started, model=model, step_idx=local_step, agent_id=child_id, parent_id="parent", agent_type=agent_type)
@@ -1365,6 +1365,54 @@ def _run_live_subagent(
             cost_usd=cost,
         )
         messages.append({"role": "assistant", "content": _assistant_content(turn)})
+        # A tool call whose arguments JSON could not be parsed (the client
+        # marks it with `_raw_arguments`) was truncated mid-stream - usually
+        # the model hit the output cap while emitting a large file. Executing
+        # it would run the tool with empty args (an empty-path write); instead
+        # answer every tool_use with an error and ask for a complete retry.
+        truncated_tool_calls = [
+            c for c in turn.tool_calls
+            if isinstance(c.args, dict) and "_raw_arguments" in c.args
+        ]
+        if truncated_tool_calls:
+            empty_turn_retries += 1
+            recorder.emit(
+                "budget_event",
+                agent_id=child_id,
+                parent_id="parent",
+                agent_type=agent_type,
+                budget_reason="subagent_truncated_tool_call_retry",
+                details={
+                    "empty_turn_retries": empty_turn_retries,
+                    "max_empty_turn_retries": max_empty_turn_retries,
+                    "tool_names": [c.name for c in truncated_tool_calls],
+                },
+            )
+            if empty_turn_retries <= max_empty_turn_retries:
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": c.tool_use_id,
+                            "content": (
+                                "Your previous tool call was cut off before its "
+                                "arguments finished, so it could not run. Re-issue "
+                                "the call with the complete 'path' and 'content'. If "
+                                "the file is large, write it in smaller pieces with "
+                                "edit_file."
+                            ),
+                            "is_error": True,
+                        }
+                        for c in turn.tool_calls
+                    ],
+                })
+                continue
+            status = "tool_error"
+            final_summary = "Coder returned repeated truncated tool calls."
+            failure_reason = "no_terminal_summary"
+            completed = True
+            break
         if not turn.tool_calls:
             final_summary = turn.assistant_text[:2048]
             empty_or_truncated_coder_turn = (

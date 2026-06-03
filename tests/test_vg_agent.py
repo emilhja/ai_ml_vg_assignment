@@ -1382,6 +1382,62 @@ def test_parent_retries_after_subagent_tool_error(tmp_path: Path) -> None:
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "x = 1\n"
 
 
+def test_coder_retries_truncated_tool_call_instead_of_empty_write(tmp_path: Path) -> None:
+    # Simulate the client's fallback when a write_file arguments blob is cut off
+    # at the output cap: json.loads fails and args become {"_raw_arguments": ...}.
+    # The coder must NOT execute that as an empty-path write; it must retry.
+    truncated = ModelTurn(
+        "writing calculator",
+        [ToolCall("trunc-write", "write_file", {"_raw_arguments": '{"path": "calc/main.py", "content": "import tk'})],
+        stop_reason="length",
+        input_tokens=60,
+        output_tokens=20,
+    )
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "spawn coder",
+                [ToolCall("spawn-1", "spawn_subagent", {"type": "coder", "question": "create calc/main.py"})],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("calc/main.py created.", input_tokens=80, output_tokens=20),
+        ],
+        by_type={
+            "coder": [
+                truncated,
+                ModelTurn(
+                    "writing complete file",
+                    [ToolCall("good-write", "write_file", {"path": "calc/main.py", "content": "print('ok')\n"})],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn("calc/main.py: created", input_tokens=40, output_tokens=10),
+            ],
+        },
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "create calc/main.py", recorder, client=client)
+    events = read_events(recorder.path)
+    # The truncated call triggered a retry rather than an empty-path write error.
+    assert any(
+        e.get("kind") == "budget_event"
+        and e.get("budget_reason") == "subagent_truncated_tool_call_retry"
+        for e in events
+    )
+    # No empty-path write error was emitted for the truncated call.
+    assert not any(
+        e.get("kind") == "tool_result"
+        and e.get("tool_use_id") == "trunc-write"
+        and "empty path" in str(e.get("result_full") or "")
+        for e in events
+    )
+    # The complete retry actually wrote the file.
+    assert (tmp_path / "calc" / "main.py").read_text(encoding="utf-8") == "print('ok')\n"
+
+
 def test_parent_auto_constrained_retry_for_actionable_coder_tool_error(tmp_path: Path) -> None:
     (tmp_path / "calc_haiku_2").mkdir(parents=True, exist_ok=True)
     fail_turns = [

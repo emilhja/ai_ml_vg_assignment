@@ -89,6 +89,10 @@ WALL_CLOCK_TIMEOUT = 120
 TOOL_TIMEOUT = 30
 K_COMPACT = 4000
 PARENT_MAX_OUTPUT_TOKENS = 4096
+# Sub-agents (notably the Coder) emit whole files inside one tool-call
+# arguments blob; too small a cap truncates the JSON mid-write, which the
+# provider reports as finish_reason="length" and yields unparseable args.
+SUBAGENT_MAX_OUTPUT_TOKENS = 4096
 
 OPENROUTER_ENDPOINT_HOST = "__OPENROUTER_ENDPOINT_HOST__"
 MAX_TOOL_RESULT_BYTES = 1_048_576
