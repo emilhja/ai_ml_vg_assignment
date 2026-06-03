@@ -514,20 +514,31 @@ def _format_chat_statusline(
     return format_statusline_compact(status, width=width)
 
 
+# ANSI display colors for terminal output (every use is gated on use_color).
+_ANSI_RESET = "\x1b[0m"
+_ANSI_RED = "\x1b[31m"
+_ANSI_GREEN = "\x1b[32m"
+_ANSI_YELLOW = "\x1b[33m"
+_ANSI_BLUE = "\x1b[34m"
+_ANSI_MAGENTA = "\x1b[35m"
+_ANSI_CYAN = "\x1b[36m"
+_ANSI_GREY = "\x1b[90m"
+
+
 def _chat_statusline_color(line: str, *, use_color: bool) -> str:
     if not use_color:
         return line
     lowered = line.lower()
     has_tool_errors = "tool errs " in lowered and "tool errs 0" not in lowered and "/ 0 session" not in lowered
     if any(marker in lowered for marker in ("tool_error", "model_error", "aborted")) or has_tool_errors:
-        color = "\x1b[31m"
+        color = _ANSI_RED
     elif "!usd" in lowered or "exceeds cap" in lowered or "(next ~$" in lowered:
-        color = "\x1b[31m"
+        color = _ANSI_RED
     elif any(marker in lowered for marker in ("warn_", "cap")):
-        color = "\x1b[33m"
+        color = _ANSI_YELLOW
     else:
-        color = "\x1b[32m"
-    return f"{color}{line}\x1b[0m"
+        color = _ANSI_GREEN
+    return f"{color}{line}{_ANSI_RESET}"
 
 
 def _print_chat_statusline(
@@ -699,20 +710,20 @@ def _progress_event_color(event: dict[str, object], *, use_color: bool) -> str:
         return ""
     kind = event.get("kind")
     if kind == "tool_result" and event.get("status") != "ok":
-        return "\x1b[31m"
+        return _ANSI_RED
     if kind == "run_end" and event.get("final_status") not in {None, "ok"}:
-        return "\x1b[31m"
+        return _ANSI_RED
     if kind in {"model_error", "egress_blocked"}:
-        return "\x1b[31m"
+        return _ANSI_RED
     if kind == "budget_event":
-        return "\x1b[33m"
+        return _ANSI_YELLOW
     if kind == "approval":
-        return "\x1b[36m"
+        return _ANSI_CYAN
     if kind in {"subagent_spawn", "subagent_return"}:
-        return "\x1b[35m"
+        return _ANSI_MAGENTA
     if kind == "compaction":
-        return "\x1b[34m"
-    return "\x1b[90m"
+        return _ANSI_BLUE
+    return _ANSI_GREY
 
 
 def _make_progress_sink(
@@ -727,7 +738,7 @@ def _make_progress_sink(
     fh = stream if stream is not None else sys.stderr
     use_color = bool(getattr(fh, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
     compact_progress = rich_chat and not _verbose_chat_progress_enabled()
-    reset = "\x1b[0m" if use_color else ""
+    reset = _ANSI_RESET if use_color else ""
     state = turn_state if turn_state is not None else {}
     pending_calls: dict[str, dict[str, object]] = {}
     write_priors: dict[str, str] = state.setdefault("write_priors", {})
@@ -775,7 +786,7 @@ def _progress_sink_event(
         pending_calls.clear()
         state["progress_diff_paths"] = set()
         if use_color:
-            fh.write(f"\n\x1b[90m── turn {state['turn']} ──\x1b[0m\n")
+            fh.write(f"\n{_ANSI_GREY}── turn {state['turn']} ──{_ANSI_RESET}\n")
         else:
             fh.write(f"\n── turn {state['turn']} ──\n")
     if kind == "tool_call":
@@ -820,7 +831,7 @@ def _progress_sink_event(
                     parsed = None
                 if isinstance(parsed, list):
                     spawn_payload = [item for item in parsed if isinstance(item, dict)]
-                parallel_color = "\x1b[35m" if use_color else ""
+                parallel_color = _ANSI_MAGENTA if use_color else ""
                 for parallel_line in format_parallel_progress_lines(summary, spawn_payload=spawn_payload):
                     fh.write(f"{parallel_color}{parallel_line}{reset}\n")
                 fh.flush()
