@@ -97,28 +97,12 @@ services:
 
 ## Config file
 
-`config.example.toml` is tracked at the repo root and documents every
-non-secret config key. A user may copy it to `workspace/config.toml` for demo
-overrides. Runtime defaults still exist for the unit tests, but the
-packaged configuration surface is the TOML schema below:
-
-```toml
-[models]
-parent = "openrouter/google/gemini-2.5-flash"
-grilling = "openrouter/google/gemini-2.5-flash"
-explorer = "openrouter/google/gemini-2.5-flash"
-coder = "openrouter/anthropic/claude-haiku-4.5"
-reviewer = "openrouter/google/gemini-2.5-flash"
-compactor = "openrouter/google/gemini-2.5-flash"
-
-[budget]
-max_usd_per_run = 0.50
-max_usd_per_day = 5.00
-max_tokens_per_run = 80000
-
-[approval]
-mode = "writes"     # off | writes | all
-```
+The tracked `config.example.toml` at the repo root is the **source of truth**
+for the non-secret config surface. A user may copy it to `workspace/config.toml`
+for demo overrides; runtime defaults still exist for the unit tests. See that
+file for the full `[models]`, `[budget]`, and `[approval]` schema — it is not
+duplicated here so the two cannot drift. Model defaults track
+[`MODEL_CONFIG.md`](../MODEL_CONFIG.md).
 
 Loader precedence (highest wins):
 
@@ -159,37 +143,21 @@ stale.
 
 ## .env.example
 
-```ini
-# Required: the agent always runs live against OpenRouter.
-OPENROUTER_API_KEY=
+The tracked `.env.example` at the repo root is the **source of truth** for the
+environment surface and is not duplicated here (so the two cannot drift). It
+enumerates:
 
-# Optional OpenRouter app attribution.
-OPENROUTER_SITE_URL=
-OPENROUTER_APP_NAME=
+- `OPENROUTER_API_KEY` (required for live runs).
+- Optional `OPENROUTER_*` app-attribution and provider-routing vars
+  (`OPENROUTER_SITE_URL`, `OPENROUTER_APP_NAME`, `OPENROUTER_PROVIDER_*`,
+  `OPENROUTER_EXPENSIVE_PROVIDERS`; see § OpenRouter provider routing).
+- Every `VG_*` override (`VG_*_MODEL`, `VG_MAX_USD_PER_RUN`,
+  `VG_MAX_USD_PER_DAY`, `VG_MAX_TOKENS_PER_RUN`, `VG_APPROVAL_MODE`,
+  `VG_K_COMPACT`, `VG_MAX_OUTPUT_TOKENS`, `VG_STRICT_MODEL_PRICING`).
 
-# Optional OpenRouter provider routing (provider-selection guide on openrouter.ai).
-# OPENROUTER_PROVIDER_ORDER=
-# OPENROUTER_PROVIDER_ONLY=
-OPENROUTER_PROVIDER_ONLY_DEEPSEEK=baidu/fp8,deepinfra/fp4
-# OPENROUTER_PROVIDER_SORT=price
-# OPENROUTER_PROVIDER_ALLOW_FALLBACKS=true
-OPENROUTER_EXPENSIVE_PROVIDERS=alibaba,morph,parasail/fp8
-
-# Optional overrides (see config.toml for the same keys).
-VG_PARENT_MODEL=openrouter/google/gemini-2.5-flash
-VG_GRILLING_MODEL=openrouter/google/gemini-2.5-flash
-VG_EXPLORER_MODEL=openrouter/google/gemini-2.5-flash
-VG_CODER_MODEL=openrouter/anthropic/claude-haiku-4.5
-VG_REVIEWER_MODEL=openrouter/google/gemini-2.5-flash
-VG_COMPACTOR_MODEL=openrouter/google/gemini-2.5-flash
-VG_MAX_USD_PER_RUN=0.50
-VG_MAX_USD_PER_DAY=5.00
-VG_MAX_TOKENS_PER_RUN=80000
-VG_APPROVAL_MODE=writes
-VG_K_COMPACT=4000
-# Exit at startup if any VG_*_MODEL lacks PRICING_USD_PER_MTOK (default: warn only).
-# VG_STRICT_MODEL_PRICING=1
-```
+The committed recommended model stack lives in that file; role defaults track
+[`MODEL_CONFIG.md`](../MODEL_CONFIG.md). The packaging smoke test asserts the
+file enumerates every variable the agent reads (see § Smoke test).
 
 - `.env` is optional at Compose-parse time so `docker compose config` works
   in a fresh checkout. Live mode still fails clearly if

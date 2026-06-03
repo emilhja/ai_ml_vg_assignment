@@ -2,7 +2,7 @@
 parent = "openrouter/google/gemini-2.5-flash"
 grilling = "openrouter/google/gemini-2.5-flash"
 explorer = "openrouter/google/gemini-2.5-flash"
-coder = "openrouter/google/gemini-2.5-flash"
+coder = "openrouter/anthropic/claude-haiku-4.5"
 reviewer = "openrouter/google/gemini-2.5-flash"
 compactor = "openrouter/google/gemini-2.5-flash"
 
