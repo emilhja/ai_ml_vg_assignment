@@ -2,7 +2,7 @@
 Interactive CLI for the Calculator application.
 """
 
-from calculator import Calculator
+from workspace.archive.calccalc.calculator import Calculator
 
 
 def display_menu():

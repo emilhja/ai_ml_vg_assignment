@@ -22,7 +22,14 @@ WRITE_EDIT_TOOLS = _WRITE_EDIT_TOOLS
 from . import config, tools
 from .budget import BudgetGuard, format_usd_display
 from .runtime_settings import models_missing_local_pricing
-from .trace import TraceRecorder, latest_spawn_subagents_batch_summary, show_context
+from .trace import (
+    TraceRecorder,
+    build_turn_review_sections,
+    format_turn_review,
+    latest_spawn_subagents_batch_summary,
+    show_context,
+    show_context_overview,
+)
 
 CHAT_PLACEHOLDER = 'Try "read data/sample.log and summarise auth/"'
 
@@ -793,6 +800,223 @@ def format_response_bullets(text: str) -> str:
     return "\n".join(out)
 
 
+def _looks_like_markdown(text: str) -> bool:
+    if "```" in text:
+        return True
+    if re.search(r"^#{1,6}\s", text, re.MULTILINE):
+        return True
+    if re.search(r"^\|.+\|", text, re.MULTILINE):
+        return True
+    if re.search(r"^[-|]{3,}\s*$", text, re.MULTILINE):
+        return True
+    if re.search(r"\*\*.+\*\*", text):
+        return True
+    if re.search(r"^[-*+]\s+\S", text, re.MULTILINE):
+        return True
+    if re.search(r"^\d+\.\s+\S", text, re.MULTILINE):
+        return True
+    return False
+
+
+def _plain_prose_to_markdown(text: str) -> str:
+    """Turn multi-line plain prose into a markdown list for Rich rendering."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return text
+    out: list[str] = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            out.append("")
+            continue
+        if stripped.startswith("- "):
+            out.append(raw)
+            continue
+        if stripped.startswith(("* ", "+ ")):
+            out.append(f"- {stripped[2:]}")
+            continue
+        if stripped.startswith("• "):
+            out.append(f"- {stripped[2:]}")
+            continue
+        if re.match(r"^\d+\.\s", stripped):
+            out.append(raw)
+            continue
+        out.append(f"- {stripped}")
+    return "\n".join(out)
+
+
+def _markdown_source_for_answer(text: str) -> str:
+    if _looks_like_markdown(text):
+        return text
+    return _plain_prose_to_markdown(text)
+
+
+def _answer_wants_response_panel(text: str) -> bool:
+    non_empty = [line for line in text.splitlines() if line.strip()]
+    return len(non_empty) > 1 or _looks_like_markdown(text)
+
+
+def render_rich_answer(console: Any, answer_text: str) -> None:
+    """Render the parent answer with Rich Markdown (panel when multi-line or structured)."""
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+
+    source = _markdown_source_for_answer(answer_text)
+    md = Markdown(source, hyperlinks=False)
+    if _answer_wants_response_panel(answer_text):
+        console.print(Panel(md, title="Response", border_style="dim", padding=(0, 1)))
+    else:
+        console.print(md)
+
+
+def print_turn_review(
+    events: list[dict[str, object]],
+    *,
+    turn_index: int | None = None,
+    trace_path: Path | str | None = None,
+    tool_summary_fn: Any | None = None,
+) -> None:
+    """Render ``/review``; Rich TTY uses Markdown for the Answer section."""
+    sections = build_turn_review_sections(
+        events,
+        turn_index=turn_index,
+        trace_path=trace_path,
+        tool_summary_fn=tool_summary_fn,
+    )
+    if not use_rich_ui():
+        text = format_turn_review(
+            events,
+            turn_index=turn_index,
+            trace_path=trace_path,
+            tool_summary_fn=tool_summary_fn,
+        )
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        return
+    from rich.console import Console
+
+    console = Console(file=sys.stdout, highlight=False)
+    if sections.error:
+        sys.stdout.write(sections.error + "\n")
+        sys.stdout.flush()
+        return
+    console.print(f"=== Turn {sections.turn_num} review ===\n")
+    if sections.body_lines:
+        console.print("\n".join(sections.body_lines))
+    console.print("\n[bold]Answer:[/bold]")
+    if not sections.answer:
+        console.print("  (no final parent text)")
+    elif sections.answer_truncated:
+        render_rich_answer(console, sections.answer[:2048])
+        console.print(
+            f"[dim]  … truncated ({sections.answer_full_len} chars; full text in trace)[/dim]"
+        )
+    else:
+        render_rich_answer(console, sections.answer)
+    if sections.footer_lines:
+        console.print()
+        console.print("\n".join(sections.footer_lines))
+    console.print()
+    sys.stdout.flush()
+
+
+def print_finops_report(
+    *,
+    guard: BudgetGuard,
+    agent_types: list[str],
+    tool_counts: dict[str, int],
+    user_prompts: int,
+    parallel_lines: list[str],
+) -> None:
+    """Render ``/finops`` agent-type table (Rich Table in TTY chat)."""
+    if not use_rich_ui():
+        return
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console(file=sys.stdout, highlight=False)
+    console.print("FinOps - per-agent-type spend this session")
+    console.print("[dim]prompts=model calls, tools=tool calls[/dim]")
+    table = Table(show_header=True, header_style="dim")
+    for column in ("agent_type", "in_tok", "out_tok", "total_tok", "prompts", "tools", "usd"):
+        table.add_column(column, justify="right" if column != "agent_type" else "left")
+    for agent_type in agent_types:
+        table.add_row(
+            agent_type,
+            str(guard.per_agent_type_input_tokens.get(agent_type, 0)),
+            str(guard.per_agent_type_output_tokens.get(agent_type, 0)),
+            str(guard.per_agent_type_tokens.get(agent_type, 0)),
+            str(guard.per_agent_type_model_calls.get(agent_type, 0)),
+            str(tool_counts.get(agent_type, 0)),
+            f"{guard.per_agent_type_usd.get(agent_type, 0.0):.6f}",
+        )
+    table.add_row(
+        "[bold]TOTAL[/bold]",
+        str(guard.running_input_tokens),
+        str(guard.running_output_tokens),
+        str(guard.running_tokens),
+        str(guard.step_count),
+        str(sum(tool_counts.values())),
+        f"{guard.running_usd:.6f}",
+        style="bold",
+    )
+    console.print(table)
+    console.print(f"user_prompts {user_prompts}")
+    for line in parallel_lines:
+        console.print(f"[dim]{line}[/dim]")
+    sys.stdout.flush()
+
+
+def print_show_context_overview(events: list[dict[str, object]]) -> None:
+    """Render ``/show-context overview`` (Rich Table in TTY chat)."""
+    rows = show_context_overview(events)
+    if not use_rich_ui():
+        from .trace import format_show_context_overview
+
+        sys.stdout.write(format_show_context_overview(events))
+        sys.stdout.flush()
+        return
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console(file=sys.stdout, highlight=False)
+    if not rows:
+        console.print("No parent steps yet. Run a task first.")
+        console.print()
+        sys.stdout.flush()
+        return
+    console.print(
+        "Parent context overview — use /show-context N for full JSON at step N",
+        style="dim",
+    )
+    table = Table(show_header=True, header_style="dim")
+    for column in ("step", "ctx", "tools", "results", "compact", "notes"):
+        justify = "right" if column != "notes" else "left"
+        table.add_column(column, justify=justify)
+    for row in rows:
+        step = int(row["step_idx"])
+        tools = row["tool_calls"]
+        tool_count = len(tools) if isinstance(tools, list) else 0
+        tool_label = ", ".join(tools) if isinstance(tools, list) and tools else "-"
+        if tool_count > 3 and isinstance(tools, list):
+            tool_label = ", ".join(tools[:3]) + f", +{tool_count - 3} more"
+        notes: list[str] = [tool_label]
+        parallel = row.get("parallel")
+        if parallel:
+            notes.append(str(parallel))
+        table.add_row(
+            str(step),
+            str(int(row["context_messages"])),
+            str(tool_count),
+            str(int(row["tool_results_visible"])),
+            str(int(row["compacted_results"])),
+            " · ".join(notes),
+        )
+    console.print(table)
+    console.print()
+    sys.stdout.flush()
+
+
 def render_input_top_rule() -> None:
     if not use_rich_ui():
         return
@@ -1288,7 +1512,7 @@ def print_turn_output(
 
         console = Console(file=sys.stdout, highlight=False)
         if answer_text:
-            console.print(format_response_bullets(answer_text))
+            render_rich_answer(console, answer_text)
         for output in filtered_outputs:
             if "\n" in output:
                 title, _, body = output.partition(":\n")
@@ -1307,17 +1531,7 @@ def print_turn_output(
                 console.print(output)
         if changes:
             console.print("[dim]Changes:[/dim]")
-            for change in changes:
-                lines, _ = format_unified_diff(change.old, change.new, path=change.path)
-                if lines:
-                    console.print(f"[dim]--- {change.path} ---[/dim]")
-                    for raw in lines:
-                        if raw.startswith("+") and not raw.startswith("+++"):
-                            console.print(f"[green]{raw}[/green]")
-                        elif raw.startswith("-") and not raw.startswith("---"):
-                            console.print(f"[red]{raw}[/red]")
-                        else:
-                            console.print(f"[dim]{raw}[/dim]")
+            _render_changes_to_console(console, changes)
     else:
         parts: list[str] = []
         if answer_text:

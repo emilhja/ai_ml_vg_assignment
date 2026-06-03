@@ -21,3 +21,14 @@ Spec-first: update `specs/50_packaging.md`, generator template in
 
 Related: global routing landed via `OPENROUTER_PROVIDER_ORDER` / `OPENROUTER_PROVIDER_SORT`
 (see `MODEL_CONFIG.md` Qwen + Alibaba note).
+
+## Rich TTY chat — low-priority polish
+
+Spec-first (`specs/16_chat_ui.md`), then `chat_ui.py` / `scripts/templates/__main__.py.tmpl`,
+regenerate, pytest.
+
+- [ ] Progress turn header `── turn N ──` → Rich `Rule` on stderr (compact chat only).
+- [ ] `[parallel]` rollup → optional dim Rich `Panel` instead of plain magenta lines.
+- [ ] Live progress diffs: wire `render_progress_file_diff()` (Syntax panels) instead of
+  inline `write_progress_diff_lines()` ANSI hunks — matches approval/end-of-turn panels;
+  may add stderr noise during fast Coder loops.

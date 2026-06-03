@@ -3736,8 +3736,136 @@ def test_chat_ui_turn_output_multiline_bullets(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(sys, "stdout", buffer)
     assert chat_ui.print_turn_output(answer="line one\nline two", literal_outputs=[]) is True
     out = buffer.getvalue()
-    assert "\u2022 line one" in out
-    assert "\u2022 line two" in out
+    assert "Response" in out
+    assert "line one" in out
+    assert "line two" in out
+
+
+def test_chat_ui_rich_answer_renders_markdown_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    from vg_agent import chat_ui
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    buffer = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+    answer = (
+        "## Combined Findings\n\n"
+        "| Priority | Issue | Fix |\n"
+        "| --- | --- | --- |\n"
+        "| High | Missing auth | Add middleware |\n"
+    )
+    assert chat_ui.print_turn_output(answer=answer, literal_outputs=[]) is True
+    out = buffer.getvalue()
+    assert "Response" in out
+    assert "Combined Findings" in out
+    assert "Missing auth" in out
+
+
+def test_looks_like_markdown_detects_tables_and_headings() -> None:
+    from vg_agent.chat_ui import _looks_like_markdown
+
+    assert _looks_like_markdown("## Title\n\n| A | B |\n|---|---|\n| 1 | 2 |")
+    assert not _looks_like_markdown("only one line")
+    assert _looks_like_markdown("- bullet one\n- bullet two")
+
+
+def test_plain_prose_to_markdown_converts_multiline() -> None:
+    from vg_agent.chat_ui import _plain_prose_to_markdown
+
+    assert _plain_prose_to_markdown("single") == "single"
+    assert _plain_prose_to_markdown("alpha\nbeta") == "- alpha\n- beta"
+
+
+def test_print_turn_review_rich_answer_panel(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import io
+
+    from vg_agent import chat_ui
+    from vg_agent.trace import TraceRecorder
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    buffer = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="summarise")
+    recorder.emit(
+        "assistant_step",
+        agent_id="parent",
+        assistant_text="## Findings\n\n| Priority | Issue |\n| --- | --- |\n| High | Fix auth |",
+        tool_calls=[],
+        stop_reason="end_turn",
+    )
+    chat_ui.print_turn_review(recorder.events, trace_path=recorder.path)
+    out = buffer.getvalue()
+    assert "=== Turn 1 review ===" in out
+    assert "Response" in out
+    assert "Findings" in out
+    assert "Fix auth" in out
+
+
+def test_print_finops_rich_table(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import io
+
+    from vg_agent import chat_ui
+    from vg_agent.budget import BudgetGuard
+    from vg_agent.trace import TraceRecorder
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    buffer = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+    guard = BudgetGuard(max_tokens=10_000, max_usd=1.0)
+    guard.record_model_call("parent-model", 10, 5, cost_usd=0.01, agent_type="parent")
+    recorder = TraceRecorder(tmp_path)
+    chat_ui.print_finops_report(
+        guard=guard,
+        agent_types=["parent"],
+        tool_counts={"parent": 0},
+        user_prompts=0,
+        parallel_lines=[],
+    )
+    out = buffer.getvalue()
+    assert "FinOps" in out
+    assert "parent" in out
+    assert "TOTAL" in out
+
+
+def test_print_show_context_overview_rich_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+
+    from vg_agent import chat_ui
+
+    monkeypatch.setattr(chat_ui, "use_rich_ui", lambda: True)
+    buffer = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buffer)
+    events = [
+        {
+            "kind": "assistant_step",
+            "agent_id": "parent",
+            "step_idx": 1,
+            "tool_calls": [{"name": "read_file", "args": {"path": "app.py"}}],
+        }
+    ]
+    chat_ui.print_show_context_overview(events)
+    out = buffer.getvalue()
+    assert "Parent context overview" in out
+    assert "read_file" in out or "app.py" in out
+
+
+def test_build_turn_review_sections_extracts_answer(tmp_path: Path) -> None:
+    from vg_agent.trace import TraceRecorder, build_turn_review_sections
+
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="go")
+    recorder.emit(
+        "assistant_step",
+        agent_id="parent",
+        assistant_text="Final answer text.",
+        tool_calls=[],
+        stop_reason="end_turn",
+    )
+    sections = build_turn_review_sections(recorder.events)
+    assert sections.error is None
+    assert sections.answer == "Final answer text."
 
 
 def test_format_unified_diff_includes_plus_minus_lines() -> None:

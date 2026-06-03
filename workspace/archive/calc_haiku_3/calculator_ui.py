@@ -1,5 +1,6 @@
 import tkinter as tk
-from calc_haiku_3.calculator_engine import CalculatorEngine
+
+from workspace.archive.calc_haiku_3.calculator_engine import CalculatorEngine
 
 
 class CalculatorApp(tk.Frame):

@@ -1,6 +1,6 @@
 import pytest
 
-from calculator import add, divide, multiply, subtract
+from workspace.archive.calculator.calculator import add, divide, multiply, subtract
 
 
 def test_basic_operations():

@@ -1,5 +1,6 @@
 import tkinter as tk
-from calc_haiku_3.calculator_ui import CalculatorApp
+
+from workspace.archive.calc_haiku_3.calculator_ui import CalculatorApp
 
 if __name__ == '__main__':
     root = tk.Tk()

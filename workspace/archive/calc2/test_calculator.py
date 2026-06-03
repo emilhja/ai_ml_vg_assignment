@@ -22,8 +22,9 @@ tk_mock.Entry = MagicMock
 tk_mock.Button = MagicMock
 
 import pytest
+
 sys.path.insert(0, 'calc2')
-from calculator import Calculator
+from workspace.archive.calc2.calculator import Calculator
 
 
 @pytest.fixture

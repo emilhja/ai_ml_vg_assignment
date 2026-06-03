@@ -651,26 +651,52 @@ def _turn_event_bounds(events: list[dict[str, object]], turn_index: int) -> tupl
     return start, end
 
 
-def format_turn_review(
+@dataclass(frozen=True)
+class TurnReviewSections:
+    """Structured `/review` payload for plain or Rich rendering."""
+
+    error: str | None = None
+    turn_num: int = 0
+    body_lines: tuple[str, ...] = ()
+    answer: str = ""
+    answer_truncated: bool = False
+    answer_full_len: int = 0
+    footer_lines: tuple[str, ...] = ()
+
+
+def _final_parent_answer(turn_events: list[dict[str, object]]) -> str:
+    for event in reversed(turn_events):
+        if event.get("kind") != "assistant_step" or event.get("agent_id") != "parent":
+            continue
+        tool_calls = event.get("tool_calls") or []
+        text = str(event.get("assistant_text") or "").strip()
+        if not tool_calls and text:
+            return text
+    return ""
+
+
+def build_turn_review_sections(
     events: list[dict[str, object]],
     *,
     turn_index: int | None = None,
     trace_path: Path | str | None = None,
     tool_summary_fn: Any | None = None,
-) -> str:
-    """Human-readable recap of one chat turn for /review."""
+) -> TurnReviewSections:
+    """Collect `/review` sections; use ``format_turn_review`` or ``print_turn_review`` to render."""
     prompt_positions = [
         index for index, event in enumerate(events) if event.get("kind") == "user_prompt"
     ]
     if not prompt_positions:
-        return "No turns recorded yet.\n"
+        return TurnReviewSections(error="No turns recorded yet.")
     chosen = turn_index if turn_index is not None else len(prompt_positions)
     bounds = _turn_event_bounds(events, chosen)
     if bounds is None:
-        return f"Turn {chosen} not found ({len(prompt_positions)} turn(s) in session).\n"
+        return TurnReviewSections(
+            error=f"Turn {chosen} not found ({len(prompt_positions)} turn(s) in session)."
+        )
     start, end = bounds
     turn_events = events[start:end]
-    lines: list[str] = [f"=== Turn {chosen} review ===", ""]
+    lines: list[str] = []
     user_prompt = next((event for event in turn_events if event.get("kind") == "user_prompt"), None)
     if user_prompt:
         lines.extend(["Prompt:", str(user_prompt.get("prompt") or ""), ""])
@@ -744,32 +770,57 @@ def format_turn_review(
             if summary:
                 lines.append(f"    summary: {summary}")
     lines.append("")
-    answer = ""
-    for event in reversed(turn_events):
-        if event.get("kind") != "assistant_step" or event.get("agent_id") != "parent":
-            continue
-        tool_calls = event.get("tool_calls") or []
-        text = str(event.get("assistant_text") or "").strip()
-        if not tool_calls and text:
-            answer = text
-            break
-    lines.append("Answer:")
-    if not answer:
-        lines.append("  (no final parent text)")
-    elif len(answer) > 2048:
-        lines.append(answer[:2048])
-        lines.append(f"  … truncated ({len(answer)} chars; full text in trace)")
-    else:
-        lines.append(answer)
-    lines.append("")
+    answer = _final_parent_answer(turn_events)
+    truncated = len(answer) > 2048
+    footer: list[str] = []
     if trace_path:
-        lines.append(f"trace: {trace_path}")
+        footer.append(f"trace: {trace_path}")
     parent_steps = [
         int(event.get("step_idx") or 0)
         for event in turn_events
         if event.get("kind") == "assistant_step" and event.get("agent_id") == "parent"
     ]
     if parent_steps:
-        lines.append(f"Tip: /show-context {max(parent_steps)} for parent-visible context at final step.")
+        footer.append(
+            f"Tip: /show-context {max(parent_steps)} for parent-visible context at final step."
+        )
+    return TurnReviewSections(
+        turn_num=chosen,
+        body_lines=tuple(lines),
+        answer=answer,
+        answer_truncated=truncated,
+        answer_full_len=len(answer),
+        footer_lines=tuple(footer),
+    )
+
+
+def format_turn_review(
+    events: list[dict[str, object]],
+    *,
+    turn_index: int | None = None,
+    trace_path: Path | str | None = None,
+    tool_summary_fn: Any | None = None,
+) -> str:
+    """Human-readable recap of one chat turn for /review."""
+    sections = build_turn_review_sections(
+        events,
+        turn_index=turn_index,
+        trace_path=trace_path,
+        tool_summary_fn=tool_summary_fn,
+    )
+    if sections.error:
+        return sections.error + "\n"
+    lines: list[str] = [f"=== Turn {sections.turn_num} review ===", ""]
+    lines.extend(sections.body_lines)
+    lines.append("Answer:")
+    if not sections.answer:
+        lines.append("  (no final parent text)")
+    elif sections.answer_truncated:
+        lines.append(sections.answer[:2048])
+        lines.append(f"  … truncated ({sections.answer_full_len} chars; full text in trace)")
+    else:
+        lines.append(sections.answer)
+    lines.append("")
+    lines.extend(sections.footer_lines)
     lines.append("")
     return "\n".join(lines)

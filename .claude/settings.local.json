@@ -4,7 +4,9 @@
       "Bash(sed 's/emit\\(\"//')",
       "Bash(python scripts/generate_project.py --clean)",
       "Bash(uv run *)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(python -c ' *)",
+      "Bash(python *)"
     ]
   }
 }

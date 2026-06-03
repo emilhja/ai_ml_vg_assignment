@@ -1,5 +1,7 @@
 import tkinter as tk
-from tkinter_calc.calculator import Calculator
+
+from workspace.archive.tkinter_calc.calculator import Calculator
+
 
 def test_calculator_initialization():
     root = tk.Tk()

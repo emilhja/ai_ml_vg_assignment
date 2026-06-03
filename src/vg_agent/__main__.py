@@ -41,7 +41,10 @@ from .chat_ui import (
     format_statusline_compact,
     mark_turn_completed,
     print_chat_dashboard_cleared,
+    print_finops_report,
+    print_show_context_overview,
     print_turn_output,
+    print_turn_review,
     progress_diff_lines,
     progress_stderr_lock,
     prompt_approval,
@@ -78,8 +81,6 @@ from .workspace_paths import resolve_workspace_root
 from .trace import (
     TraceRecorder,
     format_parallel_progress_lines,
-    format_show_context_overview,
-    format_turn_review,
     parallel_finops_batch_lines,
     parallel_subagent_summary,
     parallel_subagent_summary_for_tool_result,
@@ -366,6 +367,23 @@ def _print_finops(guard: BudgetGuard, recorder: TraceRecorder | None = None) -> 
         key=lambda t: guard.per_agent_type_usd.get(t, 0.0),
         reverse=True,
     )
+    user_prompts = (
+        sum(1 for event in recorder.events if event.get("kind") == "user_prompt")
+        if recorder is not None
+        else 0
+    )
+    parallel_lines = (
+        parallel_finops_batch_lines(recorder.events) if recorder is not None else []
+    )
+    if use_rich_ui():
+        print_finops_report(
+            guard=guard,
+            agent_types=rows,
+            tool_counts=tool_counts,
+            user_prompts=user_prompts,
+            parallel_lines=parallel_lines,
+        )
+        return
     sys.stdout.write("FinOps - per-agent-type spend this session\n")
     sys.stdout.write("prompts=model calls, tools=tool calls\n")
     sys.stdout.write(f"{'agent_type':<12} {'in_tok':>10} {'out_tok':>10} {'total_tok':>10} {'prompts':>8} {'tools':>7} {'usd':>12}\n")
@@ -382,9 +400,7 @@ def _print_finops(guard: BudgetGuard, recorder: TraceRecorder | None = None) -> 
         f"{guard.running_tokens:>10} {guard.step_count:>8} {sum(tool_counts.values()):>7} {guard.running_usd:>12.6f}\n"
     )
     if recorder is not None:
-        user_prompts = sum(1 for event in recorder.events if event.get("kind") == "user_prompt")
         sys.stdout.write(f"user_prompts {user_prompts}\n")
-        parallel_lines = parallel_finops_batch_lines(recorder.events)
         if parallel_lines:
             sys.stdout.write("\n".join(parallel_lines) + "\n")
 
@@ -1128,20 +1144,19 @@ def _handle_review_command(prompt: str, recorder: TraceRecorder) -> None:
         except ValueError:
             sys.stdout.write(f"Invalid turn index: {parts[1]!r}\n")
             return
-    review_text = format_turn_review(
+    print_turn_review(
         recorder.events,
         turn_index=turn_index,
         trace_path=recorder.path,
         tool_summary_fn=lambda name, args: _tool_summary({"name": name, "args": args}),
     )
-    sys.stdout.write(review_text)
 
 
 def _handle_show_context_command(prompt: str, recorder: TraceRecorder) -> None:
     """Render `/show-context [overview|N]`; on a bad index, print a hint."""
     parts = prompt.split()
     if len(parts) == 1 or (len(parts) == 2 and parts[1].lower() == "overview"):
-        sys.stdout.write(format_show_context_overview(recorder.events))
+        print_show_context_overview(recorder.events)
         return
     try:
         step = int(parts[1])

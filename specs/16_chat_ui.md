@@ -100,18 +100,22 @@ compact statusline during runs (bottom bar is the live HUD).
 After each agent turn (not slash commands), when `use_rich_ui()` is true and
 the turn produces a parent answer and/or literal tool outputs:
 
-1. **Response** — plain stdout text (no titled panel or framing rules). When the
-   body has **more than one non-empty line**, each line is prefixed with `• `
-   unless it already looks like a list item (`- `, `* `, `• `, or `N. `).
-   Single-line answers are unchanged.
+1. **Response** — Rich `Markdown` on stdout for readability. When the body has
+   **more than one non-empty line** or already contains markdown structure
+   (headings, tables, fenced code, bold, or list markers), wrap it in a dim
+   `Panel` titled **`Response`**. Single-line plain answers render as inline
+   `Markdown` without a panel. Plain multi-line prose that is not already
+   markdown is converted to a `-` bullet list before rendering (non-TTY chat
+   keeps the legacy `•` prefix via `format_response_bullets`).
 2. **Tool output** — optional `Panel` with `Tree` for directory listings or
    `Syntax` for multi-line file content; simple single-block output uses a plain
    `title:\nbody` line. Skip a literal block when every line already appears in
    the answer. Large reads use **File preview** (below).
 3. **Changes** (conditional) — when the turn includes a successful `edit_file` or
    `write_file` not already shown inline in the progress stream, a dim
-   `Changes:` header plus colored unified-diff lines on **stdout** (one block per
-   path). Omitted when there are no remaining writes in the turn.
+   `Changes:` header plus black-background `Syntax` diff panels on **stdout** (one
+   panel per path, same as approval diffs). Omitted when there are no remaining
+   writes in the turn.
 
 The status bar refresh on stderr follows immediately after the framed block.
 
@@ -210,7 +214,11 @@ When `--require-approval` is not `off` and Rich chat UI is active:
 
 ## `/review` output
 
-Plain stdout (optional dim Rich sections when TTY). Sections:
+Rich TTY `--chat`: sections 1–4 and 6 as plain stdout text; section 5 **Answer**
+uses the same Rich `Markdown` / `Response` panel rules as turn output. Non-TTY
+chat keeps a single plain-text block.
+
+Sections:
 
 1. **Prompt** — user text for the turn.
 2. **Parent plan** — parent `assistant_step` tool-call summaries.
@@ -224,10 +232,21 @@ Plain stdout (optional dim Rich sections when TTY). Sections:
 
 Complements `/show-context` (machine JSON for graders); does not replace it.
 
+## `/finops` output
+
+Rich TTY `--chat`: agent-type spend as a Rich `Table` on stdout (same columns as
+the plain layout). Parallel-batch footer lines stay plain dim text below the
+table. Non-TTY chat keeps the fixed-width ASCII table.
+
 ## `/show-context` overview
 
-Bare `/show-context` (or `/show-context overview`) prints a table of **parent
-steps** with:
+Bare `/show-context` (or `/show-context overview`):
+
+- Rich TTY `--chat`: Rich `Table` of **parent steps** with columns `step`, `ctx`,
+  `tools`, `results`, `compact`, `notes` (same semantics as the plain overview).
+- Non-TTY: fixed-width ASCII table (unchanged).
+
+Row semantics:
 
 - `ctx` — parent-visible message count at that step (`show_context` length)
 - `tools` — tool calls issued **in that step** (from `assistant_step.tool_calls`)
@@ -235,7 +254,7 @@ steps** with:
 - `notes` — tool names; `N parallel sub-agents (overlap yes|no)` when
   `spawn_subagents` ran that step
 
-Use `/show-context N` for the full JSON parent context at step `N`.
+Use `/show-context N` for the full JSON parent context at step `N` (always plain JSON).
 
 ## Colors (TTY, `NO_COLOR` unset)
 
@@ -253,6 +272,9 @@ Use `/show-context N` for the full JSON parent context at step `N`.
 | Diff removals (`-` lines) | red |
 | Diff additions (`+` lines) | green |
 | Diff headers (`@@`, `---`, `+++`) | dim |
+| Response panel border | dim |
+| Response panel title | default |
+| `/finops` and `/show-context overview` tables | default grid, dim header |
 | Progress stream | unchanged from `specs/60_observability.md` |
 
 ## Environment
