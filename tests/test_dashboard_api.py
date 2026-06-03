@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -466,6 +467,78 @@ def test_stats_model_dashboard(dashboard_client: TestClient, tmp_path: Path) -> 
     assert haiku["active_in_range"] is False
     assert haiku["last_used_at_all_time"]
     assert haiku["last_used_at"] is None
+
+
+def test_stats_range_7d_uses_inclusive_utc_calendar_days(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dashboard.api.services.stats import _day_keys_in_range, _range_start
+
+    fixed_now = datetime(2026, 6, 3, 15, 30, tzinfo=timezone.utc)
+
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ANN001
+            return fixed_now if tz is not None else fixed_now.replace(tzinfo=None)
+
+    monkeypatch.setattr("dashboard.api.services.stats.datetime", _FixedDatetime)
+
+    assert _range_start("today") == datetime(2026, 6, 3, 0, 0, tzinfo=timezone.utc)
+    assert _range_start("7d") == datetime(2026, 5, 28, 0, 0, tzinfo=timezone.utc)
+    assert _range_start("30d") == datetime(2026, 5, 5, 0, 0, tzinfo=timezone.utc)
+    assert _day_keys_in_range(_range_start("7d")) == [
+        "2026-05-28",
+        "2026-05-29",
+        "2026-05-30",
+        "2026-05-31",
+        "2026-06-01",
+        "2026-06-02",
+        "2026-06-03",
+    ]
+
+
+def test_stats_range_7d_excludes_runs_before_window(
+    dashboard_client: TestClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sqlite3
+
+    from dashboard.api.services.stats import _range_start
+
+    fixed_now = datetime(2026, 6, 3, 12, 0, tzinfo=timezone.utc)
+
+    class _FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ANN001
+            return fixed_now if tz is not None else fixed_now.replace(tzinfo=None)
+
+    monkeypatch.setattr("dashboard.api.services.stats.datetime", _FixedDatetime)
+
+    recorder = TraceRecorder(tmp_path)
+    recorder.emit("user_prompt", prompt="in range")
+    db_path = tmp_path / "traces" / "vg_agent.sqlite3"
+    old_ts = (fixed_now - timedelta(days=10)).isoformat()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO runs (run_id, session_id, started_at, total_tokens, total_cost_usd)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("old-run", "sess-old", old_ts, 999, 9.99),
+        )
+        conn.commit()
+
+    stats = dashboard_client.get("/api/v1/stats", params={"range": "7d"})
+    assert stats.status_code == 200
+    body = stats.json()
+    window_start = _range_start("7d").date().isoformat()
+    assert old_ts[:10] < window_start
+    assert body["total_tokens"] < 999
+    assert len(body["by_day"]) == 7
+    assert body["by_day"][0]["date"] == window_start
+    assert body["by_day"][-1]["date"] == fixed_now.date().isoformat()
+    assert sum(point["runs"] for point in body["by_day"]) == body["total_runs"]
 
 
 def test_stats_configured_models_use_env_overrides(

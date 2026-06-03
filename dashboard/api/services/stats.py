@@ -35,15 +35,33 @@ _OCCURRENCES_PER_TOOL = 5
 _STALE_MODEL_DAYS = 7
 
 
+def _utc_today_start(now: datetime | None = None) -> datetime:
+    """UTC midnight for the calendar day containing *now* (default: current time)."""
+    now = now or datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
 def _range_start(range_key: str) -> datetime:
-    now = datetime.now(timezone.utc)
+    """Inclusive UTC calendar windows aligned with the *Today* filter."""
+    today_start = _utc_today_start()
     if range_key == "today":
-        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return today_start
     if range_key == "7d":
-        return now - timedelta(days=7)
+        return today_start - timedelta(days=6)
     if range_key == "30d":
-        return now - timedelta(days=30)
-    return now - timedelta(days=7)
+        return today_start - timedelta(days=29)
+    return today_start - timedelta(days=6)
+
+
+def _day_keys_in_range(start: datetime) -> list[str]:
+    """Every UTC date from *start*'s calendar day through today (inclusive)."""
+    end = datetime.now(timezone.utc).date()
+    day = start.date()
+    keys: list[str] = []
+    while day <= end:
+        keys.append(day.isoformat())
+        day += timedelta(days=1)
+    return keys
 
 
 def _parse_ts(value: str | None) -> datetime | None:
@@ -372,9 +390,13 @@ def compute_stats(db: Session, range_key: str) -> StatsResponse:
     error_rate = (errors / len(filtered_turns)) if filtered_turns else 0.0
 
     by_day: dict[str, DailySeriesPoint] = {}
+    for day_key in _day_keys_in_range(start):
+        by_day[day_key] = DailySeriesPoint(date=day_key)
     for run in filtered_runs:
         day = (run.started_at or "")[:10] or "unknown"
-        point = by_day.setdefault(day, DailySeriesPoint(date=day))
+        if day not in by_day:
+            continue
+        point = by_day[day]
         point.runs += 1
         point.tokens += int(run.total_tokens or 0)
         point.cost_usd += float(run.total_cost_usd or 0.0)

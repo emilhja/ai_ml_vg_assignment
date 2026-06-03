@@ -11,6 +11,10 @@ Constants:
 - `MAX_PARALLEL_CODER_RETRIES_PER_CALL = 2` (bounded constrained retries after
   `spawn_subagents` when Coder children return actionable `tool_error`)
 - `MAX_SUBAGENT_STEPS = 8`
+- `MAX_REVIEWER_STEPS = 3` (Reviewer-only step cap; a verdict on one changed
+  file needs ≤2 tool calls, so Reviewer is bounded tighter than other types to
+  contain runaway token cost. On exhaustion the runtime still returns the
+  deterministic `FAIL:` verdict, same as `MAX_SUBAGENT_STEPS`.)
 - `MAX_SUBAGENT_DEPTH = 1`
 - `MAX_PARALLEL_SUBAGENTS = 4`
 - `MAX_TOKENS_PER_RUN = 80000`

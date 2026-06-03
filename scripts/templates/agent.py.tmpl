@@ -1252,7 +1252,12 @@ def _run_live_subagent(
     max_empty_turn_retries = 2
     failure_reason: str | None = None
 
-    for local_step in range(1, config.MAX_SUBAGENT_STEPS + 1):
+    # Reviewer is bounded tighter than other sub-agents: a verdict on one
+    # changed file needs <=2 tool calls, so cap its loop to contain runaway
+    # token cost. On exhaustion the deterministic FAIL fallback still fires.
+    step_cap = config.MAX_REVIEWER_STEPS if agent_type == "reviewer" else config.MAX_SUBAGENT_STEPS
+
+    for local_step in range(1, step_cap + 1):
         if batch_ctrl is not None and batch_ctrl.abort.is_set():
             status = "parallel_aborted"
             failure_reason = "parallel_aborted"

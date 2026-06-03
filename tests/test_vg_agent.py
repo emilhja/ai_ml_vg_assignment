@@ -4596,6 +4596,9 @@ def test_reviewer_no_read_is_tool_error(tmp_path: Path) -> None:
 
 
 def test_reviewer_verdict_fallback_on_step_exhaustion(tmp_path: Path) -> None:
+    # Reviewer is bounded tighter than other sub-agents so a non-converging
+    # reviewer cannot burn the full sub-agent step budget.
+    assert config.MAX_REVIEWER_STEPS < config.MAX_SUBAGENT_STEPS
     write_fixture(tmp_path)
     recorder = TraceRecorder(tmp_path)
     turns: list[ModelTurn] = []
@@ -4626,10 +4629,14 @@ def test_reviewer_verdict_fallback_on_step_exhaustion(tmp_path: Path) -> None:
         client,
         guard,
         child_id="reviewer-1",
-        started=0.0,
+        started=time.time(),
         policy=policy,
     )
+    # Genuinely exhaust the reviewer step loop (not the wall-clock path): the
+    # fallback must report the step limit, not a timeout.
+    assert len(client.calls) == config.MAX_REVIEWER_STEPS
     assert summary.startswith("FAIL:")
+    assert "step limit" in summary
     assert status == "tool_error"
 
 

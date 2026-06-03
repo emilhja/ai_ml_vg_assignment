@@ -67,7 +67,7 @@ such as `workspace/workspace/traces/` is discoverable without manual copy.
 | GET | `/runs/{run_id}/context/max-step` | `max_step_idx` and `compaction_steps` (parent steps where context includes a compacted tool result) |
 | GET | `/runs/{run_id}/parallel` | Per-turn parallel sub-agent summaries |
 | GET | `/runs/{run_id}/safety` | Approvals, redactions, budget_events |
-| GET | `/stats` | `?range=today\|7d\|30d` — rollups (see below) |
+| GET | `/stats` | `?range=today\|7d\|30d` — rollups (see below). Ranges use **UTC calendar days**: `today` = since UTC midnight today; `7d` = today plus the prior 6 days; `30d` = today plus the prior 29 days. `by_day` includes every day in the window (zeros when no runs). |
 | GET | `/stats/tool-errors` | `?range=&tool=&limit=&offset=` — paginated failed tool calls for one tool |
 | GET | `/finops/daily` | `.vg_daily_spend.json` + caps |
 

@@ -40,6 +40,25 @@ For a given user turn the parent decides per step which type to spawn:
    (not before Coder; Reviewer verifies Coder output, not pre-fix exploration).
    Optional only for trivial single-line edits the parent is confident about.
 
+**Reviewer is a regression / integration guard, not a general code-quality
+auditor.** Its mandate follows from its wiring: it is read-only and receives
+only the JSONL slice of the Coder run (see below), so it answers *"did this
+edit break or correctly integrate with pre-existing code?"* — not *"is this new
+code well written?"*. Two consequences:
+
+- **Greenfield creation — a brand-new file with no existing callers — does not
+  require a Reviewer.** There is nothing to regress against, and every spawn
+  costs tokens/$, so on this (common) case the parent instructs the Coder to
+  finish with a single `python3 -m py_compile <new file>` self-check and yield.
+  This is a deliberate cost/scope tradeoff, not a missing step: greenfield
+  *correctness* is the Coder's own responsibility, covered by that self-check.
+- **`py_compile` is a syntax gate, not a behavior gate.** It confirms the file
+  parses; it cannot catch logic bugs. Greenfield logic errors therefore have no
+  Reviewer safety net by design. If behavior-level coverage is wanted on new
+  code, the right mechanism is a Coder-authored smoke/`test_*.py` (which *does*
+  trigger a Reviewer, since tests count as a reviewable artifact) — not
+  widening Reviewer's mandate to greenfield.
+
 The parent decides each transition autonomously (VG.9). The pipeline is a
 guideline encoded in the parent system prompt, not a fixed Python switch.
 
