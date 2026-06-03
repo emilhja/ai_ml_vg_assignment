@@ -27,6 +27,7 @@ Constants:
 - `TOOL_TIMEOUT = 30`
 - `K_COMPACT = 4000`
 - `PARENT_MAX_OUTPUT_TOKENS = 4096` (per-turn output cap for the parent model loop; also the worst-case output used by the budget preflight; overridable via `VG_MAX_OUTPUT_TOKENS`)
+- `SUBAGENT_MAX_OUTPUT_TOKENS = 4096` (per-turn output cap for sub-agent model calls; fixed because Coder may need to emit complete JSON tool-call arguments for whole-file writes)
 - `COMPACTOR_MAX_OUTPUT_TOKENS = 400`
 - `COMPACTOR_MAX_INPUT_CHARS = 120_000` (payload cap sent to compactor; remainder noted with trace pointer)
 - `COMPACTOR_MAX_SUMMARY_TOKENS = 300`
@@ -189,12 +190,6 @@ SQLite observability persistence:
 - The SQLite connection must be usable from any thread that calls
   `TraceRecorder.emit` (parallel `spawn_subagents`). Use
   `check_same_thread=False` and a store-level write lock around `record_event`.
-
-Approval cache persistence (opt-in):
-
-- `--save-approvals` writes accepted "always-for-folder" choices to
-  `.vg_approvals.json` under the workspace root. The file is on the
-  sensitive-path read denylist. `--reset-approvals` clears it.
 
 Execution safety:
 

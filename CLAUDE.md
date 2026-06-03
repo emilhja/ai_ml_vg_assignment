@@ -100,7 +100,7 @@ safety, cost control.
 - `config.py` — model IDs, pricing, and governance constants generated
   from `MODEL_CONFIG.md` + `specs/30_runtime_governance.md`.
 - `demo_fixture.py` — emits `fixtures/demo_repo/` including a
-  reproducible `data/sample.log` (~6200 lines, >200 KB) sized to exceed
+  reproducible `data/sample.log` (4600 lines, >200 KB) sized to exceed
   `K_COMPACT` on read.
 
 **Two context-engineering tricks to preserve:**

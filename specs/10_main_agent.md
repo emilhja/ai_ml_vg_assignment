@@ -33,8 +33,8 @@ Approval policy:
   scripted demos remain reproducible.
 - The policy holds an in-memory `ApprovalScopeCache`. Scope keys are
   `(tool, dir_prefix)`. Lookup order is exact dir → parent prefixes →
-  `(tool, "*")`. First match wins. Scoped grants are persisted only when
-  `--save-approvals` is set and are revoked by `--reset-approvals`.
+  `(tool, "*")`. First match wins. Scoped grants last only for the current
+  process/session and are cleared by `/reset` and `/new`.
 - Scoped grants never override the command deny-list or the sensitive-path
   denylist. Granting `edit_file` for the workspace root does not let
   `.env` through.
@@ -104,11 +104,11 @@ Interactive chat mode:
   `session_id`. The persisted history list is threaded into `run_live_task`
   (`history=`) so the model sees prior turns; oversized carried tool results are
   compacted like any other parent context.
-- Slash commands handled before dispatch: `/exit`, `/quit`, `/reset`
+- Slash commands handled before dispatch: `/exit`, `/quit`, `/reset`, `/new`
   (clears approvals, budget, and conversation history; emits `session_reset`),
   `/budget`, `/status`, `/finops` (per-agent-type token/USD breakdown),
   `/show-context N`, `/compact` (fold older in-memory turns via compactor),
-  `/approvals`, `/help`.
+  `/review [N]`, `/approvals`, `/help`.
 - Interactive TTY chat uses arrow-key slash-command autocomplete: typing a
   command prefix such as `/fin` displays `/finops`, and the highlighted
   completion can be selected with the arrow keys and Enter. Piped stdin keeps
