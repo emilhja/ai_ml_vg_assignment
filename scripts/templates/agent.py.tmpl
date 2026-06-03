@@ -1,0 +1,2040 @@
+"""Generated parent agent, live loop, and Explorer."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable
+from pathlib import Path
+
+from . import config, tools
+from .live_model_client import LiveModelClient, LiveModelError, ModelTurn, ToolCall
+from .budget import BudgetDecision, BudgetGuard, format_usd_display
+from .trace import TraceRecorder, compacted_marker, now_iso
+
+
+PARENT_SYSTEM_PROMPT = __PARENT_SYSTEM_PROMPT_LITERAL__
+
+GRILLING_SYSTEM_PROMPT = __GRILLING_SYSTEM_PROMPT_LITERAL__
+
+EXPLORER_SYSTEM_PROMPT = __EXPLORER_SYSTEM_PROMPT_LITERAL__
+
+CODER_SYSTEM_PROMPT = __CODER_SYSTEM_PROMPT_LITERAL__
+
+REVIEWER_SYSTEM_PROMPT = __REVIEWER_SYSTEM_PROMPT_LITERAL__
+
+COMPACTION_SYSTEM_PROMPT = __COMPACTION_SYSTEM_PROMPT_LITERAL__
+
+CONVERSATION_COMPACTION_SYSTEM_PROMPT = __CONVERSATION_COMPACTION_SYSTEM_PROMPT_LITERAL__
+
+SUBAGENT_SYSTEM_PROMPTS = {
+    "grilling": GRILLING_SYSTEM_PROMPT,
+    "explorer": EXPLORER_SYSTEM_PROMPT,
+    "coder": CODER_SYSTEM_PROMPT,
+    "reviewer": REVIEWER_SYSTEM_PROMPT,
+}
+
+# Tool surface per typed sub-agent. The parent has NO write tools; Coder is the
+# only mutation path in the system (specs/10, specs/12).
+SUBAGENT_TOOL_NAMES = {
+    "grilling": set(),
+    "explorer": {"read_file", "read_file_range", "run_bash"},
+    "coder": {"read_file", "read_file_range", "run_bash", "run_tests", "write_file", "edit_file"},
+    "reviewer": {"read_file", "read_file_range", "run_bash"},
+}
+
+
+def _normalise_agent_type(value: object) -> str:
+    text = str(value or "explorer").strip().lower()
+    return text if text in config.SUBAGENT_TYPES else "explorer"
+
+
+GATED_WRITES = {"write_file", "edit_file", "run_bash", "run_tests", "spawn_subagent", "spawn_subagents"}
+SOFT_RECOVERABLE_PARENT_TOOLS = {"run_tests"}
+TERMINAL_APPROVAL_FAILURE_REASONS = frozenset({"approval_denied", "approval_aborted"})
+GATED_ALL = {"read_file", "read_file_range"} | GATED_WRITES
+BUDGET_CAP_TOOL = "budget_cap"
+
+
+@dataclass
+class ApprovalRequest:
+    tool: str
+    path: str | None
+    args: dict[str, Any]
+    summary: str
+
+
+@dataclass
+class ApprovalOutcome:
+    decision: str
+    scope_key: str | None = None
+    reason: str = ""
+
+
+class ApprovalScopeCache:
+    def __init__(self) -> None:
+        self._grants: set[tuple[str, str]] = set()
+
+    def lookup(self, tool: str, candidates: list[str]) -> str | None:
+        for key in candidates:
+            if (tool, key) in self._grants:
+                return key
+        return None
+
+    def grant(self, tool: str, scope_key: str) -> None:
+        self._grants.add((tool, scope_key))
+
+    def clear(self) -> None:
+        self._grants.clear()
+
+    def listing(self) -> list[tuple[str, str]]:
+        return sorted(self._grants)
+
+
+def _scope_candidates(request: ApprovalRequest) -> list[str]:
+    if request.tool == "run_bash":
+        if request.path:
+            normalized = request.path.replace("\\", "/")
+            parts = [p for p in normalized.split("/") if p and p != "."]
+            parent = "/".join(parts[:-1])
+            return [parent, "*"] if parent else ["", "*"]
+        command = str(request.args.get("command") or "")
+        head = command.strip().split()[0] if command.strip() else ""
+        return [f"cmd:{head}", "*"] if head else ["*"]
+    if request.tool in {"spawn_subagent", "spawn_subagents"}:
+        return ["*"]
+    if request.path is None:
+        return ["*"]
+    normalized = request.path.replace("\\", "/")
+    parts = [p for p in normalized.split("/") if p and p != "."]
+    if not parts:
+        return ["", "*"]
+    candidates: list[str] = []
+    parent = "/".join(parts[:-1])
+    while True:
+        candidates.append(parent)
+        if not parent:
+            break
+        parent = "/".join(parent.split("/")[:-1])
+    candidates.append("*")
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for key in candidates:
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(key)
+    return deduped
+
+
+@dataclass
+class ApprovalPolicy:
+    mode: str = "off"
+    auto_yes: bool = False
+    step_extend_prompt: bool = True
+    prompt: Callable[[ApprovalRequest], ApprovalOutcome] | None = None
+    cache: ApprovalScopeCache = field(default_factory=ApprovalScopeCache)
+
+    def gated_tools(self) -> set[str]:
+        if self.mode == "off":
+            return set()
+        if self.mode == "writes":
+            return set(GATED_WRITES)
+        if self.mode == "all":
+            return set(GATED_ALL)
+        return set()
+
+    def check(self, request: ApprovalRequest) -> ApprovalOutcome:
+        if request.tool not in self.gated_tools():
+            return ApprovalOutcome(decision="auto", scope_key=None)
+        if self.auto_yes:
+            return ApprovalOutcome(decision="auto", scope_key=None)
+        candidates = _scope_candidates(request)
+        cached = self.cache.lookup(request.tool, candidates)
+        if cached is not None:
+            return ApprovalOutcome(decision="approved_scoped", scope_key=cached, reason="scope cache hit")
+        if self.prompt is None:
+            return ApprovalOutcome(decision="denied", reason="no interactive prompt available")
+        outcome = self.prompt(request)
+        if outcome.decision == "approved_scoped" and outcome.scope_key is not None:
+            self.cache.grant(request.tool, outcome.scope_key)
+        elif outcome.decision == "approved_always":
+            self.cache.grant(request.tool, "*")
+            outcome.scope_key = "*"
+        return outcome
+
+    def check_budget_cap(self, reason: str, details: dict[str, Any], summary: str) -> ApprovalOutcome:
+        if self.auto_yes:
+            return ApprovalOutcome(decision="auto", reason="auto_yes")
+        if self.prompt is None:
+            return ApprovalOutcome(decision="denied", reason="no interactive prompt available")
+        candidates = [reason, "*"]
+        cached = self.cache.lookup(BUDGET_CAP_TOOL, candidates)
+        if cached is not None:
+            return ApprovalOutcome(decision="approved_scoped", scope_key=cached, reason="budget scope cache hit")
+        request = ApprovalRequest(tool=BUDGET_CAP_TOOL, path=reason, args=details, summary=summary)
+        outcome = self.prompt(request)
+        if outcome.decision == "approved_scoped" and outcome.scope_key is not None:
+            self.cache.grant(BUDGET_CAP_TOOL, outcome.scope_key)
+        elif outcome.decision == "approved_always":
+            self.cache.grant(BUDGET_CAP_TOOL, "*")
+            outcome.scope_key = "*"
+        return outcome
+
+
+def _single_line_summary(text: str, *, limit: int = 160) -> str:
+    flat = str(text).replace("\r", "").replace("\n", " ↵ ")
+    return flat[:limit]
+
+
+def _args_summary(tool: str, args: dict[str, Any]) -> str:
+    if tool in {"read_file", "read_file_range", "write_file", "edit_file"}:
+        path = args.get("path") or args.get("rel_path") or ""
+        if tool == "edit_file":
+            old = str(args.get("old") or "")
+            new = str(args.get("new") or "")
+            return _single_line_summary(f"{path}  - {old[:40]!r} -> + {new[:40]!r}", limit=160)
+        return str(path)
+    if tool == "run_bash":
+        return _single_line_summary(str(args.get("command") or ""), limit=160)
+    if tool == "run_tests":
+        return str(args.get("path") or "")
+    if tool == "spawn_subagent":
+        return _single_line_summary(str(args.get("question") or ""), limit=120)
+    if tool == "spawn_subagents":
+        requests = args.get("requests") or []
+        if isinstance(requests, list):
+            return f"{len(requests)} sub-agent requests"
+        return "parallel sub-agent requests"
+    return _single_line_summary(json.dumps(args, sort_keys=True, ensure_ascii=False), limit=160)
+
+
+def _request_for(call: ToolCall) -> ApprovalRequest:
+    path = call.args.get("path") or call.args.get("rel_path")
+    if call.name == "run_bash":
+        command = str(call.args.get("command") or "")
+        path = tools.rm_delete_target(command) or path
+    return ApprovalRequest(
+        tool=call.name,
+        path=str(path) if path else None,
+        args=dict(call.args),
+        summary=_args_summary(call.name, call.args),
+    )
+
+
+def _emit_approval(recorder: TraceRecorder, call: ToolCall, outcome: ApprovalOutcome) -> None:
+    recorder.emit(
+        "approval",
+        tool_use_id=call.tool_use_id,
+        tool=call.name,
+        args_summary=_args_summary(call.name, call.args),
+        decision=outcome.decision,
+        scope_key=outcome.scope_key,
+        reason=outcome.reason,
+    )
+
+
+def _emit_tool_call(recorder: TraceRecorder, call: ToolCall, agent_id: str = "parent", parent_id: str | None = None, agent_type: str = "parent") -> None:
+    recorder.emit(
+        "tool_call",
+        agent_id=agent_id,
+        parent_id=parent_id,
+        agent_type=agent_type,
+        tool_use_id=call.tool_use_id,
+        tool=call.name,
+        args=call.args,
+        args_summary=_args_summary(call.name, call.args),
+        path=call.args.get("path") or call.args.get("rel_path"),
+        command=call.args.get("command"),
+    )
+
+# Concrete file/bash tool schemas keyed by name; reused to compose per-agent surfaces.
+FILE_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    "read_file": {
+        "name": "read_file",
+        "description": "Read a UTF-8 text file under the workspace root.",
+        "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+    },
+    "read_file_range": {
+        "name": "read_file_range",
+        "description": "Read an inclusive 1-based line range from a UTF-8 text file under the workspace root.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}},
+            "required": ["path", "start_line", "end_line"],
+        },
+    },
+    "write_file": {
+        "name": "write_file",
+        "description": "Write a UTF-8 text file under the workspace root (Coder only).",
+        "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]},
+    },
+    "edit_file": {
+        "name": "edit_file",
+        "description": "Replace exact text in a UTF-8 text file under the workspace root (Coder only).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}},
+            "required": ["path", "old", "new"],
+        },
+    },
+    "run_bash": {
+        "name": "run_bash",
+        "description": "Run one simple inspection command through bash, or exactly `rm <relative-file>` for approved single-file deletion. For top-level folder listings use `find . -maxdepth 1 -type d`. No pipes, redirection, shell control, Python, pytest, package managers, network tools, command chains, rm flags, globs, or directory deletion. Use run_tests for pytest.",
+        "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+    },
+    "run_tests": {
+        "name": "run_tests",
+        "description": "Run pytest on a workspace-relative test file (test_*.py) or test directory. Fixed invocation only; do not use run_bash for pytest.",
+        "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+    },
+}
+
+_SUBAGENT_REQUEST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {"type": "string", "enum": list(config.SUBAGENT_TYPES)},
+        "question": {"type": "string"},
+        "review_agent_id": {
+            "type": "string",
+            "description": "Optional coder agent id (e.g. coder-2) whose JSONL slice Reviewer receives. Defaults to the most recent Coder in the trace.",
+        },
+    },
+    "required": ["type", "question"],
+}
+
+SPAWN_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "name": "spawn_subagent",
+        "description": (
+            "Spawn one typed sub-agent (grilling | explorer | coder | reviewer) for a "
+            "bounded task. Grilling asks clarifying questions; Explorer inspects read-only; "
+            "Coder is the only agent that may write/edit files; Reviewer verifies a Coder change."
+        ),
+        "input_schema": _SUBAGENT_REQUEST_SCHEMA,
+    },
+    {
+        "name": "spawn_subagents",
+        "description": (
+            "Spawn two or more typed sub-agents that run concurrently. Use this for >=2 "
+            "independent tasks (e.g. inspecting different files) so they execute in parallel."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "requests": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": config.MAX_PARALLEL_SUBAGENTS,
+                    "items": _SUBAGENT_REQUEST_SCHEMA,
+                }
+            },
+            "required": ["requests"],
+        },
+    },
+]
+
+# The parent never writes files directly: its surface is read tools + spawn tools.
+PARENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    FILE_TOOL_SCHEMAS["read_file"],
+    FILE_TOOL_SCHEMAS["read_file_range"],
+    FILE_TOOL_SCHEMAS["run_bash"],
+    FILE_TOOL_SCHEMAS["run_tests"],
+    *SPAWN_TOOL_SCHEMAS,
+]
+
+
+def _subagent_tool_schemas(agent_type: str) -> list[dict[str, Any]]:
+    names = SUBAGENT_TOOL_NAMES.get(agent_type, set())
+    return [FILE_TOOL_SCHEMAS[name] for name in FILE_TOOL_SCHEMAS if name in names]
+
+
+EXPLORER_TOOL_SCHEMAS = _subagent_tool_schemas("explorer")
+
+
+def _compactor_stub_summary(tool: str, event: dict[str, object]) -> str:
+    lines = str(event.get("result_full") or "").splitlines()
+    return (
+        f"Large {tool} result with {len(lines)} lines and {event.get('bytes')} bytes. "
+        "The full content remains in the JSONL trace; use read_file_range or re-run "
+        "a targeted read to retrieve specific lines."
+    )
+
+
+def _clamp_summary_tokens(summary: str, max_tokens: int | None = None) -> str:
+    limit = max_tokens if max_tokens is not None else config.COMPACTOR_MAX_SUMMARY_TOKENS
+    while summary and tools.estimate_tokens(summary) > limit:
+        summary = summary[: max(1, len(summary) - 200)]
+    return summary.strip()
+
+
+def _prepare_compactor_input(body: str, *, trace_pointer: str) -> str:
+    if len(body) <= config.COMPACTOR_MAX_INPUT_CHARS:
+        return body
+    return (
+        body[: config.COMPACTOR_MAX_INPUT_CHARS]
+        + f"\n[truncated for compaction input; full payload at {trace_pointer}]"
+    )
+
+
+def _summarize_for_compactor(
+    *,
+    system_prompt: str,
+    body: str,
+    tool: str,
+    client: Any,
+    guard: BudgetGuard,
+    recorder: TraceRecorder,
+    trace_pointer: str,
+    deterministic: bool = False,
+    stub_event: dict[str, object] | None = None,
+) -> tuple[str, bool]:
+    """Return (summary, compactor_fallback)."""
+    if deterministic:
+        if "SAMPLE_LOG" in body or (stub_event and int(stub_event.get("tokens") or 0) > config.K_COMPACT):
+            return "SAMPLE_LOG_SUMMARY_SENTINEL: large log summarised for parent context.", False
+        return _compactor_stub_summary(tool, stub_event or {"result_full": body, "bytes": len(body.encode())}), True
+
+    model = config.COMPACTOR_MODEL_ID
+    prepared = _prepare_compactor_input(body, trace_pointer=trace_pointer)
+    user_content = f"Tool: {tool}\n\n{prepared}"
+    expected_in = tools.estimate_tokens(system_prompt + "\n" + user_content)
+    decision = guard.before_model_call(model, expected_in, config.COMPACTOR_MAX_OUTPUT_TOKENS)
+    if not decision.allowed:
+        return _compactor_stub_summary(tool, stub_event or {"result_full": body, "bytes": len(body.encode())}), True
+
+    recorder.emit(
+        "llm_start",
+        agent_id="compactor",
+        agent_type="compactor",
+        model=model,
+        model_id=model,
+        step_idx=guard.step_count,
+        tokens_in=expected_in,
+        max_tokens=config.COMPACTOR_MAX_OUTPUT_TOKENS,
+        endpoint_host=config.OPENROUTER_ENDPOINT_HOST,
+        system_prompt_sha256=hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
+        tool_schema_count=0,
+        tool_schema_names=[],
+    )
+    try:
+        turn = client.complete(
+            model=model,
+            system_prompt=system_prompt,
+            messages=[{"role": "user", "content": user_content}],
+            tools=[],
+            max_tokens=config.COMPACTOR_MAX_OUTPUT_TOKENS,
+        )
+    except LiveModelError:
+        return _compactor_stub_summary(tool, stub_event or {"result_full": body, "bytes": len(body.encode())}), True
+    if not isinstance(turn, ModelTurn):
+        turn = ModelTurn(**turn)
+    summary = _clamp_summary_tokens((turn.assistant_text or "").strip())
+    model_id = turn.model_id or model
+    input_tokens = turn.input_tokens or expected_in
+    output_tokens = turn.output_tokens or tools.estimate_tokens(summary)
+    cost = guard.record_model_call(model_id, input_tokens, output_tokens, cost_usd=turn.cost_usd, agent_type="compactor")
+    recorder.emit(
+        "assistant_step",
+        agent_id="compactor",
+        agent_type="compactor",
+        model=model_id,
+        model_id=model_id,
+        step_idx=guard.step_count,
+        tokens_in=input_tokens,
+        tokens_out=output_tokens,
+        cost_usd=cost,
+        assistant_text=summary,
+        tool_calls=[],
+        stop_reason=turn.stop_reason,
+        openrouter_provider=turn.openrouter_provider,
+    )
+    _emit_expensive_provider_warning(
+        recorder,
+        guard,
+        openrouter_provider=turn.openrouter_provider,
+        model_id=model_id,
+        step_idx=guard.step_count,
+        agent_id="compactor",
+        cost_usd=cost,
+    )
+    return summary, False
+
+
+def _compact_if_needed(
+    recorder: TraceRecorder,
+    event: dict[str, object],
+    *,
+    client: Any,
+    guard: BudgetGuard,
+    tool: str,
+    deterministic: bool = False,
+) -> dict[str, object] | None:
+    tokens = int(event["tokens"])
+    if tokens <= config.K_COMPACT:
+        return None
+    full = str(event["result_full"])
+    trace_pointer = f"{recorder.run_id}:event:{event['event_idx']}"
+    summary, fallback = _summarize_for_compactor(
+        system_prompt=COMPACTION_SYSTEM_PROMPT,
+        body=full,
+        tool=tool or str(event.get("tool") or ""),
+        client=client,
+        guard=guard,
+        recorder=recorder,
+        trace_pointer=trace_pointer,
+        deterministic=deterministic,
+        stub_event=event,
+    )
+    after_tokens = tools.estimate_tokens(summary)
+    return recorder.emit(
+        "compaction",
+        tool_use_id=event["tool_use_id"],
+        before_tokens=tokens,
+        after_tokens=after_tokens,
+        summary=summary,
+        compactor_model=config.COMPACTOR_MODEL_ID,
+        compactor_fallback=fallback,
+        original_event_idx=event["event_idx"],
+        original_sha256=hashlib.sha256(full.encode("utf-8")).hexdigest(),
+    )
+
+
+def _context_window_for_model(model_id: str) -> int:
+    return int(config.CONTEXT_WINDOW_TOKENS.get(model_id, config.DEFAULT_CONTEXT_WINDOW))
+
+
+def _compact_fraction_for_model(model_id: str) -> float:
+    return float(config.AUTO_COMPACT_FRACTION.get(model_id, config.DEFAULT_COMPACT_FRACTION))
+
+
+def _split_messages_for_conversation_compaction(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    user_indices = [index for index, message in enumerate(messages) if message.get("role") == "user"]
+    if len(user_indices) <= config.COMPACT_KEEP_RECENT_TURNS:
+        return None
+    split_at = user_indices[-config.COMPACT_KEEP_RECENT_TURNS]
+    if split_at <= 0:
+        return None
+    return messages[:split_at], messages[split_at:]
+
+
+def compact_conversation(
+    recorder: TraceRecorder,
+    messages: list[dict[str, Any]],
+    parent_model_id: str,
+    guard: BudgetGuard,
+    *,
+    client: Any,
+    reason: str,
+    deterministic: bool = False,
+) -> dict[str, object] | None:
+    split = _split_messages_for_conversation_compaction(messages)
+    if split is None:
+        return None
+    head, tail = split
+    before = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
+    head_text = json.dumps(head, sort_keys=True, ensure_ascii=False)
+    trace_pointer = str(recorder.run_id)
+    summary, fallback = _summarize_for_compactor(
+        system_prompt=CONVERSATION_COMPACTION_SYSTEM_PROMPT,
+        body=head_text,
+        tool="conversation",
+        client=client,
+        guard=guard,
+        recorder=recorder,
+        trace_pointer=trace_pointer,
+        deterministic=deterministic,
+    )
+    folded = {
+        "role": "user",
+        "content": (
+            f"[CONVERSATION COMPACTED reason={reason}]\n"
+            f"{summary}\n"
+            f"Trace pointer: {trace_pointer}. Full history remains in JSONL."
+        ),
+    }
+    messages[:] = [folded, *tail]
+    after = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
+    if before <= 0:
+        percent_reduced = 0.0
+    else:
+        percent_reduced = round(100.0 - (after / before) * 100.0, 1)
+    window = _context_window_for_model(parent_model_id)
+    threshold = int(window * _compact_fraction_for_model(parent_model_id))
+    return recorder.emit(
+        "context_compaction",
+        before_tokens=before,
+        after_tokens=after,
+        percent_reduced=percent_reduced,
+        model=parent_model_id,
+        window=window,
+        threshold=threshold,
+        reason=reason,
+        summary=summary,
+        trace_pointer=trace_pointer,
+        compactor_fallback=fallback,
+    )
+
+
+def conversation_compact_skip_reason(
+    messages: list[dict[str, Any]],
+    parent_model_id: str,
+) -> str | None:
+    """Return a skip reason when manual compact is unnecessary; None if folding may proceed."""
+    if not messages:
+        return "no_history"
+    user_turns = sum(1 for message in messages if message.get("role") == "user")
+    split = _split_messages_for_conversation_compaction(messages)
+    if split is None:
+        if user_turns <= config.COMPACT_KEEP_RECENT_TURNS:
+            return "too_few_user_turns"
+        return "no_foldable_head"
+    before = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
+    window = _context_window_for_model(parent_model_id)
+    threshold = int(window * _compact_fraction_for_model(parent_model_id))
+    if before <= threshold:
+        return "below_auto_threshold"
+    return None
+
+
+def format_manual_compact_skip_warning(
+    reason: str,
+    messages: list[dict[str, Any]],
+    parent_model_id: str,
+) -> str:
+    """Human-readable warning when /compact is skipped as unnecessary."""
+    keep = config.COMPACT_KEEP_RECENT_TURNS
+    if reason == "no_history":
+        return "[context] /compact skipped: no conversation history yet — run a task first."
+    if reason == "too_few_user_turns":
+        user_turns = sum(1 for message in messages if message.get("role") == "user")
+        return (
+            f"[context] /compact skipped: only {user_turns} user turn(s) in chat memory; "
+            f"need more than {keep} to fold older turns while keeping the last {keep} verbatim. "
+            "Large tool results are still compacted automatically (see /review)."
+        )
+    if reason == "no_foldable_head":
+        return (
+            f"[context] /compact skipped: nothing to fold before the last {keep} user turns."
+        )
+    if reason == "below_auto_threshold":
+        before = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
+        window = _context_window_for_model(parent_model_id)
+        fraction = _compact_fraction_for_model(parent_model_id)
+        threshold = int(window * fraction)
+        pct = int(before / window * 100) if window else 0
+        return (
+            f"[context] /compact skipped: parent context is ~{before:,} tokens "
+            f"({pct}% of {window:,} window) — below the "
+            f"auto-fold threshold ({threshold:,} = {fraction:.0%} of window). "
+            "Folding would save little. Tool-result compaction already applied on large reads."
+        )
+    return f"[context] /compact skipped: {reason}."
+
+
+def _result(tool_use_id: str, tool: str, content: str, status: str, started: float) -> dict[str, object]:
+    return {
+        "tool_use_id": tool_use_id,
+        "tool": tool,
+        "result_full": content,
+        "bytes": len(content.encode("utf-8")),
+        "tokens": tools.estimate_tokens(content),
+        "latency_ms": int((time.perf_counter() - started) * 1000),
+        "status": status,
+    }
+
+
+def _normalise_tool_call(call: ToolCall | dict[str, Any]) -> ToolCall:
+    if isinstance(call, ToolCall):
+        return call
+    return ToolCall(
+        tool_use_id=str(call.get("tool_use_id") or call.get("id") or ""),
+        name=str(call.get("name") or call.get("tool") or ""),
+        args=dict(call.get("args") or call.get("input") or {}),
+    )
+
+
+def _tool_call_trace(call: ToolCall) -> dict[str, Any]:
+    return {"tool_use_id": call.tool_use_id, "name": call.name, "args": call.args}
+
+
+def _assistant_content(turn: ModelTurn) -> list[dict[str, Any]]:
+    if turn.raw_content:
+        return turn.raw_content
+    content: list[dict[str, Any]] = []
+    if turn.assistant_text:
+        content.append({"type": "text", "text": turn.assistant_text})
+    for call in turn.tool_calls:
+        normalised = _normalise_tool_call(call)
+        content.append({"type": "tool_use", "id": normalised.tool_use_id, "name": normalised.name, "input": normalised.args})
+    return content or [{"type": "text", "text": ""}]
+
+
+def _estimate_message_tokens(system_prompt: str, messages: list[dict[str, Any]]) -> int:
+    return tools.estimate_tokens(system_prompt + "\n" + json.dumps(messages, sort_keys=True, ensure_ascii=False))
+
+
+def _expensive_openrouter_provider_slugs() -> tuple[str, ...]:
+    raw = os.environ.get("OPENROUTER_EXPENSIVE_PROVIDERS")
+    if raw is not None and str(raw).strip():
+        parts = [part.strip().lower() for part in str(raw).split(",") if part.strip()]
+        if parts:
+            return tuple(parts)
+    return config.EXPENSIVE_OPENROUTER_PROVIDER_SLUGS
+
+
+def _is_expensive_openrouter_provider(slug: str | None) -> bool:
+    if not slug:
+        return False
+    normalized = str(slug).strip().lower()
+    for entry in _expensive_openrouter_provider_slugs():
+        if normalized == entry or normalized.startswith(f"{entry}/"):
+            return True
+    return False
+
+
+def _emit_expensive_provider_warning(
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    *,
+    openrouter_provider: str | None,
+    model_id: str,
+    step_idx: int,
+    agent_id: str,
+    cost_usd: float,
+) -> None:
+    slug = str(openrouter_provider or "").strip()
+    if not slug or not _is_expensive_openrouter_provider(slug):
+        return
+    warn_key = f"warn_expensive_provider:{slug.lower()}"
+    if warn_key in guard.warned:
+        return
+    guard.warned.add(warn_key)
+    recorder.emit(
+        "budget_event",
+        budget_reason="warn_expensive_provider",
+        details={
+            "openrouter_provider": slug,
+            "model_id": model_id,
+            "step_idx": step_idx,
+            "agent_id": agent_id,
+            "cost_usd": cost_usd,
+        },
+    )
+
+
+def _record_budget_abort(recorder: TraceRecorder, guard: BudgetGuard, decision: Any, started: float) -> None:
+    recorder.emit("budget_event", budget_reason=decision.budget_reason, details=decision.details)
+    recorder.emit(
+        "run_end",
+        final_status="aborted",
+        total_cost_usd=round(guard.running_usd, 6),
+        total_tokens=guard.running_tokens,
+        duration_s=round(time.perf_counter() - started, 3),
+    )
+
+
+def _budget_cap_summary(decision: Any) -> str:
+    reason = str(getattr(decision, "budget_reason", None) or "budget")
+    details = dict(getattr(decision, "details", None) or {})
+    if reason in {"step_extend", "step_cap"}:
+        steps = details.get("step_count", details.get("steps"))
+        return f"{reason} steps {steps}/{details.get('max_steps')}"
+    if reason == "token_cap":
+        return f"{reason} tokens {details.get('tokens')}/{details.get('max_tokens')}"
+    if reason == "usd_cap":
+        cap = float(details.get('max_usd', config.MAX_USD_PER_RUN))
+        spent = float(details.get('running_usd') or 0.0)
+        step_est = float(details.get('worst_next_usd') or 0.0)
+        projected = spent + step_est
+        return (
+            f"USD cap: next step ~{format_usd_display(projected)} exceeds cap {format_usd_display(cap)} "
+            f"(spent {format_usd_display(spent)}, step est. ~{format_usd_display(step_est)})"
+        )
+    if reason == "daily_cap":
+        return f"{reason} daily_remaining {details.get('daily_remaining_usd')}"
+    if reason == "timeout":
+        return f"{reason} after {details.get('timeout_s', config.WALL_CLOCK_TIMEOUT)}s"
+    if reason == "repetition_abort":
+        return f"{reason} tool={details.get('tool')} repeats={details.get('repeat_count')}"
+    return reason
+
+
+def _emit_budget_approval(recorder: TraceRecorder, decision: Any, outcome: ApprovalOutcome) -> None:
+    reason = str(getattr(decision, "budget_reason", None) or "budget")
+    recorder.emit(
+        "approval",
+        tool_use_id=f"budget-{reason}",
+        tool=BUDGET_CAP_TOOL,
+        args_summary=_budget_cap_summary(decision),
+        decision=outcome.decision,
+        scope_key=outcome.scope_key,
+        reason=outcome.reason,
+        budget_reason=reason,
+    )
+
+
+def _wall_clock_exceeded(started: float, guard: BudgetGuard) -> bool:
+    return time.perf_counter() - started > float(config.WALL_CLOCK_TIMEOUT) + guard.wall_clock_extra_s
+
+
+def _offer_step_extend_if_needed(
+    *,
+    policy: ApprovalPolicy,
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    started: float,
+) -> bool:
+    """Return False only when the user aborts the proactive step-extend prompt."""
+    if not policy.step_extend_prompt or policy.auto_yes or policy.prompt is None:
+        return True
+    if not guard.should_offer_step_extend():
+        return True
+    details: dict[str, object] = {"step_count": guard.parent_step_count, "max_steps": guard.max_steps}
+    decision = BudgetDecision(False, "step_extend", details)
+    summary = _budget_cap_summary(decision)
+    outcome = policy.check_budget_cap("step_extend", details, summary)
+    _emit_budget_approval(recorder, decision, outcome)
+    guard.mark_step_extend_prompted()
+    if outcome.decision in {"approved", "approved_scoped", "approved_always", "auto"}:
+        once = outcome.decision in {"approved", "auto"}
+        guard.extend_cap("step_cap", once=once)
+        recorder.emit(
+            "budget_event",
+            budget_reason="step_extend",
+            details={**details, "extended": True},
+        )
+        return True
+    if outcome.decision == "aborted":
+        _record_budget_abort(recorder, guard, decision, started)
+        return False
+    return True
+
+
+def _handle_budget_cap(
+    *,
+    policy: ApprovalPolicy,
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    decision: Any,
+    started: float,
+    agent_id: str = "parent",
+    parent_id: str | None = None,
+    agent_type: str = "parent",
+) -> bool:
+    """Return True when the caller should retry after extending a hard cap."""
+    if getattr(decision, "allowed", True):
+        return True
+    reason = str(getattr(decision, "budget_reason", None) or "")
+    if reason.startswith("warn_"):
+        return False
+    summary = _budget_cap_summary(decision)
+    outcome = policy.check_budget_cap(reason, dict(getattr(decision, "details", None) or {}), summary)
+    _emit_budget_approval(recorder, decision, outcome)
+    if outcome.decision in {"approved", "approved_scoped", "approved_always", "auto"}:
+        once = outcome.decision in {"approved", "auto"}
+        guard.extend_cap(reason, once=once)
+        recorder.emit(
+            "budget_event",
+            agent_id=agent_id,
+            parent_id=parent_id,
+            agent_type=agent_type,
+            budget_reason=reason,
+            details={**dict(getattr(decision, "details", None) or {}), "extended": True},
+        )
+        return True
+    if agent_id == "parent":
+        _record_budget_abort(recorder, guard, decision, started)
+    else:
+        recorder.emit(
+            "budget_event",
+            agent_id=agent_id,
+            parent_id=parent_id,
+            agent_type=agent_type,
+            budget_reason=reason,
+            details=getattr(decision, "details", None) or {},
+        )
+    return False
+
+
+def _record_model_error(
+    recorder: TraceRecorder,
+    guard: BudgetGuard,
+    exc: LiveModelError,
+    started: float,
+    *,
+    model: str,
+    step_idx: int,
+    agent_id: str = "parent",
+    parent_id: str | None = None,
+    agent_type: str = "parent",
+) -> None:
+    fields: dict[str, Any] = {
+        "agent_id": agent_id,
+        "parent_id": parent_id,
+        "agent_type": agent_type,
+        "model": model,
+        "model_id": model,
+        "step_idx": step_idx,
+        "error_type": type(exc).__name__,
+        "message": str(exc),
+        "retryable": getattr(exc, "retryable", False),
+    }
+    provider_detail = getattr(exc, "provider_detail", None)
+    if provider_detail:
+        fields["provider_detail"] = provider_detail
+    recorder.emit("model_error", **fields)
+    if agent_id == "parent":
+        recorder.emit(
+            "run_end",
+            final_status="model_error",
+            total_cost_usd=round(guard.running_usd, 6),
+            total_tokens=guard.running_tokens,
+            duration_s=round(time.perf_counter() - started, 3),
+        )
+
+
+PARENT_TOOL_NAMES = {schema["name"] for schema in PARENT_TOOL_SCHEMAS}
+
+
+def _execute_live_tool(
+    *,
+    root: Path,
+    call: ToolCall,
+    recorder: TraceRecorder,
+    client: Any,
+    guard: BudgetGuard,
+    allowed_tools: set[str],
+    started: float,
+    policy: ApprovalPolicy,
+    agent_id: str = "parent",
+    parent_id: str | None = None,
+    agent_type: str = "parent",
+) -> dict[str, object]:
+    tool_name = call.name
+    args = call.args
+    tool_started = time.perf_counter()
+    path = str(args.get("path") or args.get("rel_path") or "")
+    _emit_tool_call(recorder, call, agent_id=agent_id, parent_id=parent_id, agent_type=agent_type)
+
+    if tool_name not in allowed_tools:
+        return _result(call.tool_use_id, tool_name, f"{agent_type} is not permitted to call {tool_name}", "error", tool_started)
+
+    if tool_name == "run_bash":
+        command = str(args.get("command") or "")
+        safety_error = tools.validate_shell_command_for_workspace(root, command)
+        if safety_error:
+            return _result(call.tool_use_id, "run_bash", f"run_bash blocked: {safety_error}", "error", tool_started)
+
+    if tool_name in policy.gated_tools():
+        outcome = policy.check(_request_for(call))
+        _emit_approval(recorder, call, outcome)
+        if outcome.decision == "denied":
+            return _result(call.tool_use_id, tool_name, f"approval denied: {outcome.reason}", "error", tool_started)
+        if outcome.decision == "aborted":
+            return _result(call.tool_use_id, tool_name, "approval aborted by user", "error", tool_started)
+
+    if tool_name == "read_file":
+        return tools.read_file(root, path, call.tool_use_id)
+    if tool_name == "read_file_range":
+        return tools.read_file_range(root, path, int(args.get("start_line", 1)), int(args.get("end_line", 1)), call.tool_use_id)
+    if tool_name == "run_bash":
+        command = str(args.get("command") or "")
+        repeat = guard.record_tool_signature("run_bash", command)
+        if not repeat.allowed:
+            if not _handle_budget_cap(
+                policy=policy,
+                recorder=recorder,
+                guard=guard,
+                decision=repeat,
+                started=started,
+                agent_id=agent_id,
+                parent_id=parent_id,
+                agent_type=agent_type,
+            ):
+                return _result(call.tool_use_id, "run_bash", f"budget abort: {repeat.budget_reason}", "error", tool_started)
+            guard.record_tool_signature("run_bash", command)
+        return tools.run_bash(root, command, call.tool_use_id)
+    if tool_name == "run_tests":
+        test_path = str(args.get("path") or path or "")
+        return tools.run_tests(root, test_path, call.tool_use_id)
+    if tool_name == "write_file":
+        return tools.write_file(root, path, str(args.get("content") or ""), call.tool_use_id)
+    if tool_name == "edit_file":
+        return tools.edit_file(root, path, str(args.get("old") or ""), str(args.get("new") or ""), call.tool_use_id)
+    if tool_name in {"spawn_subagent", "spawn_subagents"} and agent_id == "parent":
+        if guard.at_final_step_reserve():
+            blocked = {
+                "status": "near_cap_blocked",
+                "message": (
+                    "Parent step budget reserves the final step for synthesis. "
+                    "Do not spawn sub-agents; summarize progress and answer the user now."
+                ),
+            }
+            return _result(
+                call.tool_use_id,
+                tool_name,
+                json.dumps(blocked, ensure_ascii=False),
+                "ok",
+                tool_started,
+            )
+        sig = _spawn_signature_key(tool_name, dict(args))
+        repeat = guard.record_tool_signature(tool_name, sig)
+        if not repeat.allowed:
+            if not _handle_budget_cap(
+                policy=policy,
+                recorder=recorder,
+                guard=guard,
+                decision=repeat,
+                started=started,
+                agent_id=agent_id,
+                parent_id=parent_id,
+                agent_type=agent_type,
+            ):
+                return _result(
+                    call.tool_use_id,
+                    tool_name,
+                    f"budget abort: {repeat.budget_reason}",
+                    "error",
+                    tool_started,
+                )
+            guard.record_tool_signature(tool_name, sig)
+    if tool_name == "spawn_subagent":
+        child_type = _normalise_agent_type(args.get("type"))
+        question = str(args.get("question") or "")
+        review_slice = None
+        if child_type == "reviewer":
+            coder_id = _resolve_review_coder_id(recorder, args.get("review_agent_id"))
+            if not coder_id:
+                return _result(
+                    call.tool_use_id,
+                    "spawn_subagent",
+                    "Reviewer requires a prior Coder run in this session; spawn Explorer for read-only review.",
+                    "error",
+                    tool_started,
+                )
+            review_slice = _build_review_slice(recorder, coder_id)
+        outcome = _spawn_one(root, child_type, question, recorder, client, guard, started, policy, review_slice)
+        return _result(call.tool_use_id, "spawn_subagent", json.dumps(outcome, ensure_ascii=False), "ok", tool_started)
+    if tool_name == "spawn_subagents":
+        raw_requests = args.get("requests") or []
+        if not isinstance(raw_requests, list) or len(raw_requests) < 2:
+            return _result(call.tool_use_id, tool_name, "spawn_subagents requires at least two requests", "error", tool_started)
+        summaries = _spawn_many(root, raw_requests, recorder, client, guard, started, policy)
+        return _result(call.tool_use_id, "spawn_subagents", json.dumps(summaries, ensure_ascii=False), "ok", tool_started)
+    return _result(call.tool_use_id, tool_name, f"unknown tool {tool_name!r}", "error", tool_started)
+
+
+def _next_child_id(recorder: TraceRecorder, agent_type: str) -> str:
+    n = sum(1 for event in recorder.events if event.get("kind") == "subagent_spawn") + 1
+    return f"{agent_type}-{n}"
+
+
+def _resolve_review_coder_id(recorder: TraceRecorder, requested: object) -> str | None:
+    if requested is not None and str(requested).strip():
+        return str(requested).strip()
+    coder_ids: list[str] = []
+    for event in recorder.events:
+        if event.get("kind") != "subagent_spawn" or event.get("agent_type") != "coder":
+            continue
+        child_id = event.get("child_agent_id") or event.get("agent_id")
+        if child_id:
+            coder_ids.append(str(child_id))
+    return coder_ids[-1] if coder_ids else None
+
+
+def _build_review_slice(recorder: TraceRecorder, coder_agent_id: str, max_bytes: int = 8192) -> str:
+    matched: list[dict[str, object]] = []
+    for event in recorder.events:
+        agent_id = str(event.get("agent_id") or "")
+        child_id = str(event.get("child_agent_id") or "")
+        if agent_id == coder_agent_id or child_id == coder_agent_id:
+            matched.append(event)
+    body = "\n".join(json.dumps(event, ensure_ascii=False, sort_keys=True) for event in matched)
+    encoded = body.encode("utf-8")
+    if len(encoded) > max_bytes:
+        body = body[: max_bytes // 2] + "\n[review slice truncated]"
+    return body
+
+
+def _is_reviewer_verdict(text: str) -> bool:
+    stripped = (text or "").strip()
+    upper = stripped.upper()
+    return upper.startswith("PASS:") or upper.startswith("FAIL:")
+
+
+def _question_requires_tests(question: str) -> bool:
+    lowered = question.lower()
+    return "test_" in lowered or "pytest" in lowered or re.search(r"\btests?\b", lowered) is not None
+
+
+def _is_test_file_path(path: str) -> bool:
+    name = Path(str(path).replace("\\", "/")).name
+    return name.startswith("test_") and name.endswith(".py")
+
+
+def _is_impl_file_path(path: str) -> bool:
+    name = Path(str(path).replace("\\", "/")).name
+    return name.endswith(".py") and not name.startswith("test_")
+
+
+def _subagent_error_reason_from_tool_result(tool_name: str, result_text: str) -> str:
+    text = str(result_text or "").lower()
+    if text.startswith("approval denied:"):
+        return "approval_denied"
+    if text == "approval aborted by user":
+        return "approval_aborted"
+    if tool_name in {"read_file", "read_file_range"} and ("is a directory" in text or "not a regular file" in text):
+        return "invalid_path_kind"
+    if tool_name == "run_bash" and "shell control or redirection marker" in text:
+        return "blocked_shell_control"
+    if tool_name == "run_bash" and "run_bash blocked:" in text:
+        return "blocked_run_bash"
+    if "old text not found" in text:
+        return "edit_not_found"
+    return "tool_error"
+
+
+def _spawn_signature_key(tool_name: str, args: dict[str, object]) -> str:
+    if tool_name == "spawn_subagent":
+        payload: object = {
+            "type": _normalise_agent_type(args.get("type")),
+            "question": str(args.get("question") or "")[:500],
+        }
+    else:
+        norm: list[dict[str, str]] = []
+        raw = args.get("requests") or []
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    norm.append(
+                        {
+                            "type": _normalise_agent_type(item.get("type")),
+                            "question": str(item.get("question") or "")[:200],
+                        }
+                    )
+        norm.sort(key=lambda entry: (entry["type"], entry["question"]))
+        payload = {"requests": norm}
+    return json.dumps(payload, sort_keys=True, ensure_ascii=False)[:2000]
+
+
+@dataclass
+class _ParallelBatchControl:
+    slice_usd: float
+    slice_tokens: int
+    abort: threading.Event = field(default_factory=threading.Event, compare=False, repr=False)
+    lock: object = field(default_factory=threading.Lock, compare=False, repr=False)
+    offender_agent_id: str | None = None
+
+    def check_over_slice(self, child_id: str, spent_usd: float, spent_tokens: int) -> bool:
+        if spent_usd > self.slice_usd + 1e-9 or spent_tokens > self.slice_tokens:
+            with self.lock:
+                if self.offender_agent_id is None:
+                    self.offender_agent_id = child_id
+                self.abort.set()
+            return True
+        return self.abort.is_set()
+
+
+def _run_live_subagent(
+    root: Path,
+    agent_type: str,
+    question: str,
+    recorder: TraceRecorder,
+    client: Any,
+    guard: BudgetGuard,
+    child_id: str,
+    started: float,
+    policy: ApprovalPolicy,
+    review_slice: str | None = None,
+    batch_ctrl: _ParallelBatchControl | None = None,
+    spawn_cost_before: tuple[float, int] | None = None,
+) -> tuple[str, str, int, int, str | None]:
+    """Run one typed sub-agent loop. Returns (summary, status, writes_ok, reads_ok, failure_reason)."""
+    system_prompt = SUBAGENT_SYSTEM_PROMPTS[agent_type]
+    model = config.SUBAGENT_MODEL_IDS[agent_type]
+    tool_schemas = _subagent_tool_schemas(agent_type)
+    allowed = set(SUBAGENT_TOOL_NAMES.get(agent_type, set()))
+    if review_slice:
+        messages: list[dict[str, Any]] = [{"role": "user", "content": f"{question}\n\nCoder run under review (JSONL slice):\n{review_slice}"}]
+    else:
+        messages = [{"role": "user", "content": question}]
+    final_summary = ""
+    status = "ok"
+    had_tool_error = False
+    completed = False
+    writes_ok = 0
+    reads_ok = 0
+    read_tools_ok = 0
+    verdict_retry_used = False
+    require_impl_read = agent_type == "coder" and _question_requires_tests(question)
+    impl_read_ok = False
+    empty_turn_retries = 0
+    max_empty_turn_retries = 2
+    failure_reason: str | None = None
+
+    for local_step in range(1, config.MAX_SUBAGENT_STEPS + 1):
+        if batch_ctrl is not None and batch_ctrl.abort.is_set():
+            status = "parallel_aborted"
+            failure_reason = "parallel_aborted"
+            final_summary = (
+                f"{agent_type} cancelled because a parallel peer exceeded its budget slice."
+            )
+            break
+        if _wall_clock_exceeded(started, guard):
+            timeout = type("Decision", (), {"budget_reason": "timeout", "details": {"timeout_s": config.WALL_CLOCK_TIMEOUT}})()
+            if not _handle_budget_cap(
+                policy=policy,
+                recorder=recorder,
+                guard=guard,
+                decision=timeout,
+                started=started,
+                agent_id=child_id,
+                parent_id="parent",
+                agent_type=agent_type,
+            ):
+                status = "timeout"
+                break
+            continue
+        expected_in = _estimate_message_tokens(system_prompt, messages)
+        decision = guard.before_model_call(model, expected_in, 2048)
+        if not decision.allowed:
+            if not _handle_budget_cap(
+                policy=policy,
+                recorder=recorder,
+                guard=guard,
+                decision=decision,
+                started=started,
+                agent_id=child_id,
+                parent_id="parent",
+                agent_type=agent_type,
+            ):
+                status = "tool_error"
+                failure_reason = "subagent_budget_cap"
+                break
+            continue
+        recorder.emit(
+            "llm_start",
+            agent_id=child_id,
+            parent_id="parent",
+            agent_type=agent_type,
+            model=model,
+            model_id=model,
+            step_idx=local_step,
+            tokens_in=expected_in,
+            max_tokens=2048,
+            endpoint_host=config.OPENROUTER_ENDPOINT_HOST,
+            system_prompt_sha256=hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
+            tool_schema_count=len(tool_schemas),
+            tool_schema_names=[schema["name"] for schema in tool_schemas],
+        )
+        try:
+            turn = client.complete(
+                model=model,
+                system_prompt=system_prompt,
+                messages=messages,
+                tools=tool_schemas,
+                max_tokens=2048,
+            )
+        except LiveModelError as exc:
+            _record_model_error(recorder, guard, exc, started, model=model, step_idx=local_step, agent_id=child_id, parent_id="parent", agent_type=agent_type)
+            final_summary = f"{agent_type} stopped because {exc}"
+            status = "tool_error"
+            failure_reason = "model_error"
+            break
+        if not isinstance(turn, ModelTurn):
+            turn = ModelTurn(**turn)
+        turn.tool_calls = [_normalise_tool_call(c) for c in turn.tool_calls]
+        model_id = turn.model_id or model
+        input_tokens = turn.input_tokens or expected_in
+        output_tokens = turn.output_tokens or tools.estimate_tokens(turn.assistant_text + json.dumps([asdict(c) for c in turn.tool_calls], sort_keys=True))
+        cost = guard.record_model_call(model_id, input_tokens, output_tokens, cost_usd=turn.cost_usd, agent_type=agent_type)
+        if batch_ctrl is not None and spawn_cost_before is not None:
+            spent_usd = guard.running_usd - spawn_cost_before[0]
+            spent_tokens = guard.running_tokens - spawn_cost_before[1]
+            if batch_ctrl.check_over_slice(child_id, spent_usd, spent_tokens):
+                status = "parallel_aborted"
+                failure_reason = "parallel_aborted"
+                final_summary = (
+                    f"{agent_type} stopped: parallel budget slice exceeded "
+                    f"(offender may be {batch_ctrl.offender_agent_id or child_id})."
+                )
+                break
+        recorder.emit(
+            "assistant_step",
+            agent_id=child_id,
+            parent_id="parent",
+            agent_type=agent_type,
+            model=model_id,
+            model_id=model_id,
+            step_idx=local_step,
+            tokens_in=input_tokens,
+            tokens_out=output_tokens,
+            cost_usd=cost,
+            assistant_text=turn.assistant_text,
+            tool_calls=[_tool_call_trace(c) for c in turn.tool_calls],
+            stop_reason=turn.stop_reason,
+            openrouter_provider=turn.openrouter_provider,
+        )
+        _emit_expensive_provider_warning(
+            recorder,
+            guard,
+            openrouter_provider=turn.openrouter_provider,
+            model_id=model_id,
+            step_idx=local_step,
+            agent_id=child_id,
+            cost_usd=cost,
+        )
+        messages.append({"role": "assistant", "content": _assistant_content(turn)})
+        if not turn.tool_calls:
+            final_summary = turn.assistant_text[:2048]
+            empty_or_truncated_coder_turn = (
+                agent_type == "coder"
+                and (
+                    not str(turn.assistant_text or "").strip()
+                    or str(turn.stop_reason or "").strip().lower() == "length"
+                )
+            )
+            if empty_or_truncated_coder_turn:
+                empty_turn_retries += 1
+                recorder.emit(
+                    "budget_event",
+                    agent_id=child_id,
+                    parent_id="parent",
+                    agent_type=agent_type,
+                    budget_reason="subagent_empty_turn_retry",
+                    details={
+                        "empty_turn_retries": empty_turn_retries,
+                        "max_empty_turn_retries": max_empty_turn_retries,
+                    },
+                )
+                if empty_turn_retries <= max_empty_turn_retries:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your previous response did not complete a valid tool call. "
+                                "For this mutation task you must call write_file or edit_file now. "
+                                "Do not return empty or truncated text."
+                            ),
+                        }
+                    )
+                    continue
+                status = "tool_error"
+                final_summary = (
+                    "Coder returned repeated empty responses without any tool calls."
+                )
+                failure_reason = "no_terminal_summary"
+                recorder.emit(
+                    "budget_event",
+                    agent_id=child_id,
+                    parent_id="parent",
+                    agent_type=agent_type,
+                    budget_reason="subagent_empty_turn_abort",
+                    details={
+                        "empty_turn_retries": empty_turn_retries,
+                        "max_empty_turn_retries": max_empty_turn_retries,
+                    },
+                )
+                completed = True
+                break
+            if agent_type == "reviewer":
+                if read_tools_ok == 0:
+                    if not verdict_retry_used:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": "You must read_file or read_file_range the changed file on disk before returning a verdict.",
+                            }
+                        )
+                        verdict_retry_used = True
+                        continue
+                    status = "tool_error"
+                    final_summary = "Reviewer returned without reading workspace."
+                    failure_reason = "reviewer_no_read"
+                    completed = True
+                    break
+                if not _is_reviewer_verdict(final_summary):
+                    if not verdict_retry_used:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": "Return exactly one line starting with PASS: or FAIL: after verifying the file on disk.",
+                            }
+                        )
+                        verdict_retry_used = True
+                        continue
+                    status = "tool_error"
+                    final_summary = "Reviewer returned without PASS:/FAIL: verdict."
+                    failure_reason = "reviewer_no_verdict"
+                    completed = True
+                    break
+            completed = True
+            break
+        tool_blocks: list[dict[str, Any]] = []
+        for c in turn.tool_calls:
+            if (
+                agent_type == "coder"
+                and require_impl_read
+                and not impl_read_ok
+                and c.name == "write_file"
+                and _is_test_file_path(str(c.args.get("path") or ""))
+            ):
+                result = _result(
+                    c.tool_use_id,
+                    "write_file",
+                    "read the implementation module with read_file before writing test_*.py",
+                    "error",
+                    time.perf_counter(),
+                )
+            else:
+                result = _execute_live_tool(
+                    root=root,
+                    call=c,
+                    recorder=recorder,
+                    client=client,
+                    guard=guard,
+                    allowed_tools=allowed,
+                    started=started,
+                    policy=policy,
+                    agent_id=child_id,
+                    parent_id="parent",
+                    agent_type=agent_type,
+                )
+            recorder.emit("tool_result", agent_id=child_id, parent_id="parent", agent_type=agent_type, **result)
+            tool_blocks.append({"type": "tool_result", "tool_use_id": c.tool_use_id, "content": str(result["result_full"]), "is_error": result["status"] != "ok"})
+            if result["status"] == "ok":
+                if c.name in {"write_file", "edit_file"}:
+                    writes_ok += 1
+                if c.name in {"read_file", "read_file_range"}:
+                    reads_ok += 1
+                    read_tools_ok += 1
+                    read_path = str(c.args.get("path") or c.args.get("rel_path") or "")
+                    if _is_impl_file_path(read_path):
+                        impl_read_ok = True
+                if c.name == "run_bash":
+                    reads_ok += 1
+                    if agent_type == "reviewer":
+                        read_tools_ok += 1
+            if result["status"] != "ok":
+                had_tool_error = True
+                failure_reason = _subagent_error_reason_from_tool_result(c.name, str(result["result_full"]))
+                if failure_reason in TERMINAL_APPROVAL_FAILURE_REASONS:
+                    status = "tool_error"
+                    completed = True
+                break
+        messages.append({"role": "user", "content": tool_blocks})
+        if failure_reason in TERMINAL_APPROVAL_FAILURE_REASONS:
+            break
+
+    if agent_type == "reviewer" and not _is_reviewer_verdict(final_summary):
+        # Contract: reviewer `subagent_return.payload` must start with
+        # `PASS:` or `FAIL:` so the parent can always surface a readable
+        # verdict (even on budget/timeout/step exhaustion).
+        if status == "timeout":
+            stop_reason = "timed out"
+        elif not completed and status == "ok":
+            stop_reason = "reached the reviewer step limit"
+        else:
+            stop_reason = "stopped before returning a verdict"
+        final_summary = f"FAIL: Reviewer did not return PASS:/FAIL: ({stop_reason})."
+        status = "tool_error"
+        failure_reason = "reviewer_no_verdict"
+        completed = True
+    elif not final_summary:
+        reason_label = failure_reason or ("step_limit" if not completed else "unknown")
+        final_summary = f"{agent_type} exited without summary (reason={reason_label})."
+    if not completed and status == "ok" and had_tool_error:
+        status = "tool_error"
+        if failure_reason is None:
+            failure_reason = "tool_error"
+    if agent_type == "coder" and completed and status == "ok" and writes_ok == 0:
+        status = "tool_error"
+        if empty_turn_retries > 0:
+            failure_reason = failure_reason or "no_terminal_summary"
+            final_summary = f"Coder exited without summary (reason={failure_reason})."
+        else:
+            failure_reason = failure_reason or "no_write"
+            final_summary = f"Coder exited without summary (reason={failure_reason})."
+    if agent_type == "coder" and completed and status == "ok" and require_impl_read and writes_ok > 0 and not impl_read_ok:
+        status = "tool_error"
+        failure_reason = "tests_without_impl_read"
+        final_summary = f"Coder exited without summary (reason={failure_reason})."
+    if status == "tool_error" and failure_reason is None:
+        failure_reason = "tool_error"
+    return final_summary, status, writes_ok, reads_ok, failure_reason
+
+
+def _spawn_one(
+    root: Path,
+    agent_type: str,
+    question: str,
+    recorder: TraceRecorder,
+    client: Any,
+    guard: BudgetGuard,
+    started: float,
+    policy: ApprovalPolicy,
+    review_slice: str | None = None,
+    child_id: str | None = None,
+    barrier: "threading.Barrier | None" = None,
+    batch_ctrl: _ParallelBatchControl | None = None,
+) -> dict[str, object]:
+    child_id = child_id or _next_child_id(recorder, agent_type)
+    model = config.SUBAGENT_MODEL_IDS[agent_type]
+    started_at = now_iso()
+    recorder.emit(
+        "subagent_spawn",
+        agent_id=child_id,
+        parent_id="parent",
+        agent_type=agent_type,
+        child_agent_id=child_id,
+        question=question,
+        model=model,
+        started_at=started_at,
+    )
+    cost_before = guard.running_usd
+    tok_before = guard.running_tokens
+    if barrier is not None:
+        try:
+            barrier.wait(timeout=config.WALL_CLOCK_TIMEOUT)
+        except threading.BrokenBarrierError:
+            pass
+    run_started_at = now_iso()
+    spawn_cost_before = (guard.running_usd, guard.running_tokens)
+    summary, status, writes_ok, reads_ok, failure_reason = _run_live_subagent(
+        root,
+        agent_type,
+        question,
+        recorder,
+        client,
+        guard,
+        child_id,
+        started,
+        policy,
+        review_slice,
+        batch_ctrl=batch_ctrl,
+        spawn_cost_before=spawn_cost_before,
+    )
+    ended_at = now_iso()
+    recorder.emit(
+        "subagent_return",
+        agent_id=child_id,
+        parent_id="parent",
+        agent_type=agent_type,
+        child_agent_id=child_id,
+        status=status,
+        summary=summary,
+        failure_reason=failure_reason,
+        writes_ok=writes_ok,
+        reads_ok=reads_ok,
+        started_at=run_started_at,
+        ended_at=ended_at,
+        child_total_cost_usd=round(guard.running_usd - cost_before, 6),
+        child_total_tokens=guard.running_tokens - tok_before,
+    )
+    return {
+        "agent_id": child_id,
+        "agent_type": agent_type,
+        "status": status,
+        "payload": summary,
+        "failure_reason": failure_reason,
+        "writes_ok": writes_ok,
+        "reads_ok": reads_ok,
+        "question": question,
+    }
+
+
+def _spawn_many(
+    root: Path,
+    raw_requests: list[Any],
+    recorder: TraceRecorder,
+    client: Any,
+    guard: BudgetGuard,
+    started: float,
+    policy: ApprovalPolicy,
+) -> list[dict[str, object]]:
+    parsed: list[tuple[str, str, str | None]] = []
+    for raw in raw_requests:
+        if isinstance(raw, dict):
+            review_id = raw.get("review_agent_id")
+            review_key = str(review_id).strip() if review_id is not None and str(review_id).strip() else None
+            parsed.append((_normalise_agent_type(raw.get("type")), str(raw.get("question") or ""), review_key))
+    accepted = parsed[: config.MAX_PARALLEL_SUBAGENTS]
+    overflow = parsed[config.MAX_PARALLEL_SUBAGENTS :]
+
+    # Coders never run concurrently with another Coder (overlapping write paths):
+    # the runtime serialises them and reports `conflict` for the second.
+    runnable: list[tuple[int, str, str, str, str | None]] = []  # (slot, child_id, type, question, review_agent_id)
+    conflicts: list[dict[str, object]] = []
+    seen_coder = False
+    for slot, (atype, question, review_agent_id) in enumerate(accepted):
+        child_id = _next_child_id(recorder, atype) + f".{slot}"
+        if atype == "coder" and seen_coder:
+            conflicts.append({"agent_id": child_id, "agent_type": atype, "status": "conflict", "payload": "serialised: another Coder in the same batch holds the write lock", "slot": slot})
+            continue
+        if atype == "coder":
+            seen_coder = True
+        if atype == "reviewer" and _resolve_review_coder_id(recorder, review_agent_id) is None:
+            conflicts.append(
+                {
+                    "agent_id": child_id,
+                    "agent_type": atype,
+                    "status": "tool_error",
+                    "payload": "Reviewer requires a prior Coder run in this session; spawn Explorer for read-only review.",
+                    "slot": slot,
+                }
+            )
+            continue
+        runnable.append((slot, child_id, atype, question, review_agent_id))
+
+    results_by_slot: dict[int, dict[str, object]] = {}
+    barrier = threading.Barrier(len(runnable)) if len(runnable) > 1 else None
+    batch_ctrl: _ParallelBatchControl | None = None
+    if len(runnable) > 1:
+        with guard.lock:
+            remaining_usd = max(0.0, guard.max_usd - guard.running_usd)
+            remaining_tokens = max(0, guard.max_tokens - guard.running_tokens)
+        n = len(runnable)
+        batch_ctrl = _ParallelBatchControl(
+            slice_usd=max(0.01, remaining_usd / n),
+            slice_tokens=max(1000, remaining_tokens // n),
+        )
+    if runnable:
+        with ThreadPoolExecutor(max_workers=len(runnable)) as pool:
+            futures = {}
+            for slot, child_id, atype, question, review_agent_id in runnable:
+                review_slice = None
+                if atype == "reviewer":
+                    coder_id = _resolve_review_coder_id(recorder, review_agent_id)
+                    if coder_id:
+                        review_slice = _build_review_slice(recorder, coder_id)
+                futures[
+                    pool.submit(
+                        _spawn_one,
+                        root,
+                        atype,
+                        question,
+                        recorder,
+                        client,
+                        guard,
+                        started,
+                        policy,
+                        review_slice,
+                        child_id,
+                        barrier,
+                        batch_ctrl,
+                    )
+                ] = slot
+            for future, slot in futures.items():
+                out = future.result()
+                out["slot"] = slot
+                results_by_slot[slot] = out
+        if batch_ctrl is not None and batch_ctrl.offender_agent_id:
+            recorder.emit(
+                "budget_event",
+                budget_reason="parallel_aborted",
+                details={
+                    "offender_agent_id": batch_ctrl.offender_agent_id,
+                    "slice_usd": batch_ctrl.slice_usd,
+                    "slice_tokens": batch_ctrl.slice_tokens,
+                },
+            )
+    for conflict in conflicts:
+        results_by_slot[int(conflict["slot"])] = conflict
+
+    summaries = [results_by_slot[slot] for slot in sorted(results_by_slot)]
+    for slot, (atype, question, _review_agent_id) in enumerate(overflow, start=len(accepted)):
+        summaries.append({"agent_id": f"{atype}-overflow-{slot}", "agent_type": atype, "status": "tool_error", "payload": "parallel cap exceeded"})
+    for entry in summaries:
+        entry.pop("slot", None)
+    return summaries
+
+
+def _parse_spawn_payload(result: dict[str, object]) -> dict[str, object] | None:
+    if str(result.get("tool") or "") != "spawn_subagent":
+        return None
+    if str(result.get("status") or "") != "ok":
+        return None
+    body = str(result.get("result_full") or "")
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _should_retry_coder_spawn(payload: dict[str, object], *, retry_used: bool) -> bool:
+    if retry_used:
+        return False
+    if str(payload.get("agent_type") or "") != "coder":
+        return False
+    if str(payload.get("status") or "") != "tool_error":
+        return False
+    reason = str(payload.get("failure_reason") or "")
+    if reason in TERMINAL_APPROVAL_FAILURE_REASONS:
+        return False
+    return reason in {
+        "invalid_path_kind",
+        "blocked_shell_control",
+        "blocked_run_bash",
+        "no_terminal_summary",
+        "no_write",
+        "tool_error",
+    }
+
+
+def _constrained_retry_question(original_question: str, reason: str) -> str:
+    constraints = (
+        "Retry this coding task with strict constraints: use read_file on the exact file path "
+        "(not a directory), then use write_file/edit_file directly. Do not use run_bash unless "
+        "explicitly asked for `python3 -m py_compile <relative .py path> [...]`. "
+        "Return only after at least one successful write_file or edit_file."
+    )
+    return f"{original_question}\n\nFailure reason from previous attempt: {reason}\n{constraints}"
+
+
+def _is_terminal_coder_approval_failure(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("agent_type") or "") != "coder":
+        return False
+    if str(payload.get("status") or "") != "tool_error":
+        return False
+    return str(payload.get("failure_reason") or "") in TERMINAL_APPROVAL_FAILURE_REASONS
+
+
+def _contains_terminal_coder_approval_failure(payload: object) -> bool:
+    if _is_terminal_coder_approval_failure(payload):
+        return True
+    if isinstance(payload, list):
+        return any(_contains_terminal_coder_approval_failure(item) for item in payload)
+    if isinstance(payload, dict):
+        return any(
+            _contains_terminal_coder_approval_failure(payload.get(key))
+            for key in ("initial", "retry")
+        )
+    return False
+
+
+def _parallel_spawn_question(entry: dict[str, object]) -> str:
+    if "initial" in entry and isinstance(entry.get("initial"), dict):
+        initial = entry["initial"]
+        return str(initial.get("question") or initial.get("payload") or "")
+    return str(entry.get("payload") or "")
+
+
+def _retry_failed_parallel_coders(
+    root: Path,
+    summaries: list[dict[str, object]],
+    raw_requests: list[Any],
+    recorder: TraceRecorder,
+    client: Any,
+    guard: BudgetGuard,
+    started: float,
+    policy: ApprovalPolicy,
+) -> list[dict[str, object]]:
+    """Bounded same-turn constrained retries for failed Coder entries in a parallel batch."""
+    retries_done = 0
+    out: list[dict[str, object]] = []
+    for index, entry in enumerate(summaries):
+        merged = dict(entry)
+        if retries_done >= config.MAX_PARALLEL_CODER_RETRIES_PER_CALL:
+            out.append(merged)
+            continue
+        if str(merged.get("agent_type") or "") != "coder":
+            out.append(merged)
+            continue
+        if _should_retry_coder_spawn(merged, retry_used=False):
+            question = str(merged.get("question") or "")
+            if not question and index < len(raw_requests) and isinstance(raw_requests[index], dict):
+                question = str(raw_requests[index].get("question") or "")
+            if not question:
+                question = _parallel_spawn_question(merged)
+            retry_question = _constrained_retry_question(
+                question,
+                str(merged.get("failure_reason") or "tool_error"),
+            )
+            retry_payload = _spawn_one(
+                root,
+                "coder",
+                retry_question,
+                recorder,
+                client,
+                guard,
+                started,
+                policy,
+            )
+            retries_done += 1
+            recorder.emit(
+                "budget_event",
+                budget_reason="coder_constrained_retry",
+                details={
+                    "reason": str(merged.get("failure_reason") or "tool_error"),
+                    "original_agent_id": str(merged.get("agent_id") or ""),
+                    "retry_agent_id": str(retry_payload.get("agent_id") or ""),
+                    "parallel_index": index,
+                },
+            )
+            merged = {"initial": entry, "retry": retry_payload, **retry_payload}
+        out.append(merged)
+    return out
+
+
+def run_live_task(
+    root: Path,
+    task: str,
+    recorder: TraceRecorder | None = None,
+    client: Any | None = None,
+    guard: BudgetGuard | None = None,
+    policy: ApprovalPolicy | None = None,
+    history: list[dict[str, Any]] | None = None,
+) -> TraceRecorder:
+    recorder = recorder or TraceRecorder(root)
+    client = client or LiveModelClient.from_env(recorder=recorder)
+    if isinstance(client, LiveModelClient) and client.recorder is None:
+        client.recorder = recorder
+    guard = guard or BudgetGuard.for_workspace(root)
+    policy = policy or ApprovalPolicy()
+    started = time.perf_counter()
+    # `history` lets --chat carry conversation context across turns under one session;
+    # when None this is a single-shot task.
+    messages: list[dict[str, Any]] = history if history is not None else []
+    messages.append({"role": "user", "content": task})
+    recorder.emit("user_prompt", prompt=task, live_model=True)
+    constrained_coder_retry_used = False
+
+    while True:
+        if _wall_clock_exceeded(started, guard):
+            timeout = type("Decision", (), {"budget_reason": "timeout", "details": {"timeout_s": config.WALL_CLOCK_TIMEOUT}})()
+            if not _handle_budget_cap(policy=policy, recorder=recorder, guard=guard, decision=timeout, started=started):
+                return recorder
+            continue
+        if not _offer_step_extend_if_needed(policy=policy, recorder=recorder, guard=guard, started=started):
+            return recorder
+        expected_in = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
+        window = _context_window_for_model(config.PARENT_MODEL_ID)
+        threshold = int(window * _compact_fraction_for_model(config.PARENT_MODEL_ID))
+        if expected_in > threshold:
+            compact_conversation(
+                recorder,
+                messages,
+                config.PARENT_MODEL_ID,
+                guard,
+                client=client,
+                reason="auto",
+                deterministic=False,
+            )
+            expected_in = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
+        decision = guard.before_model_call(
+            config.PARENT_MODEL_ID,
+            expected_in,
+            config.PARENT_MAX_OUTPUT_TOKENS,
+            enforce_parent_step_cap=True,
+        )
+        if not decision.allowed:
+            if not _handle_budget_cap(policy=policy, recorder=recorder, guard=guard, decision=decision, started=started):
+                return recorder
+            continue
+        recorder.emit(
+            "llm_start",
+            model=config.PARENT_MODEL_ID,
+            model_id=config.PARENT_MODEL_ID,
+            step_idx=guard.parent_step_count + 1,
+            tokens_in=expected_in,
+            max_tokens=config.PARENT_MAX_OUTPUT_TOKENS,
+            endpoint_host=config.OPENROUTER_ENDPOINT_HOST,
+            system_prompt_sha256=hashlib.sha256(PARENT_SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
+            tool_schema_count=len(PARENT_TOOL_SCHEMAS),
+            tool_schema_names=[schema["name"] for schema in PARENT_TOOL_SCHEMAS],
+        )
+        try:
+            turn = client.complete(
+                model=config.PARENT_MODEL_ID,
+                system_prompt=PARENT_SYSTEM_PROMPT,
+                messages=messages,
+                tools=PARENT_TOOL_SCHEMAS,
+                max_tokens=config.PARENT_MAX_OUTPUT_TOKENS,
+            )
+        except LiveModelError as exc:
+            _record_model_error(
+                recorder,
+                guard,
+                exc,
+                started,
+                model=config.PARENT_MODEL_ID,
+                step_idx=guard.parent_step_count + 1,
+            )
+            return recorder
+        if not isinstance(turn, ModelTurn):
+            turn = ModelTurn(**turn)
+        turn.tool_calls = [_normalise_tool_call(call) for call in turn.tool_calls]
+        model_id = turn.model_id or config.PARENT_MODEL_ID
+        input_tokens = turn.input_tokens or expected_in
+        output_tokens = turn.output_tokens or tools.estimate_tokens(turn.assistant_text + json.dumps([asdict(c) for c in turn.tool_calls], sort_keys=True))
+        cost = guard.record_model_call(model_id, input_tokens, output_tokens, cost_usd=turn.cost_usd)
+        for warning in guard.pending_warnings():
+            recorder.emit("budget_event", budget_reason=warning.budget_reason, details=warning.details)
+        step_idx = guard.parent_step_count
+        recorder.emit(
+            "assistant_step",
+            model=model_id,
+            model_id=model_id,
+            step_idx=step_idx,
+            tokens_in=input_tokens,
+            tokens_out=output_tokens,
+            cost_usd=cost,
+            assistant_text=turn.assistant_text,
+            tool_calls=[_tool_call_trace(call) for call in turn.tool_calls],
+            stop_reason=turn.stop_reason,
+            openrouter_provider=turn.openrouter_provider,
+        )
+        _emit_expensive_provider_warning(
+            recorder,
+            guard,
+            openrouter_provider=turn.openrouter_provider,
+            model_id=model_id,
+            step_idx=step_idx,
+            agent_id="parent",
+            cost_usd=cost,
+        )
+        messages.append({"role": "assistant", "content": _assistant_content(turn)})
+        if not turn.tool_calls:
+            recorder.emit(
+                "run_end",
+                final_status="ok",
+                total_cost_usd=round(guard.running_usd, 6),
+                total_tokens=guard.running_tokens,
+                duration_s=round(time.perf_counter() - started, 3),
+            )
+            return recorder
+
+        tool_blocks: list[dict[str, Any]] = []
+        for call in turn.tool_calls:
+            terminal_coder_approval_failure = False
+            result = _execute_live_tool(
+                root=root,
+                call=call,
+                recorder=recorder,
+                client=client,
+                guard=guard,
+                allowed_tools=PARENT_TOOL_NAMES,
+                started=started,
+                policy=policy,
+                agent_type="parent",
+            )
+            if call.name == "spawn_subagents" and result.get("status") == "ok":
+                try:
+                    batch = json.loads(str(result.get("result_full") or "[]"))
+                except json.JSONDecodeError:
+                    batch = None
+                if isinstance(batch, list):
+                    raw_requests = call.args.get("requests") if isinstance(call.args.get("requests"), list) else []
+                    retried = _retry_failed_parallel_coders(
+                        root,
+                        batch,
+                        raw_requests,
+                        recorder,
+                        client,
+                        guard,
+                        started,
+                        policy,
+                    )
+                    terminal_coder_approval_failure = _contains_terminal_coder_approval_failure(
+                        retried
+                    )
+                    if any(
+                        "retry" in item
+                        for item in retried
+                        if isinstance(item, dict)
+                    ):
+                        result = {
+                            **result,
+                            "result_full": json.dumps(retried, ensure_ascii=False),
+                        }
+            if call.name == "spawn_subagent":
+                payload = _parse_spawn_payload(result)
+                terminal_coder_approval_failure = _contains_terminal_coder_approval_failure(
+                    payload
+                )
+                if isinstance(payload, dict) and _should_retry_coder_spawn(payload, retry_used=constrained_coder_retry_used):
+                    retry_question = _constrained_retry_question(
+                        str(call.args.get("question") or ""),
+                        str(payload.get("failure_reason") or "tool_error"),
+                    )
+                    retry_payload = _spawn_one(
+                        root,
+                        "coder",
+                        retry_question,
+                        recorder,
+                        client,
+                        guard,
+                        started,
+                        policy,
+                    )
+                    constrained_coder_retry_used = True
+                    recorder.emit(
+                        "budget_event",
+                        budget_reason="coder_constrained_retry",
+                        details={
+                            "reason": str(payload.get("failure_reason") or "tool_error"),
+                            "original_agent_id": str(payload.get("agent_id") or ""),
+                            "retry_agent_id": str(retry_payload.get("agent_id") or ""),
+                        },
+                    )
+                    result = {
+                        **result,
+                        "result_full": json.dumps(
+                            {
+                                "initial": payload,
+                                "retry": retry_payload,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+            event = recorder.emit("tool_result", **result)
+            content = str(result["result_full"])
+            compaction = _compact_if_needed(
+                recorder,
+                event,
+                client=client,
+                guard=guard,
+                tool=call.name,
+                deterministic=False,
+            )
+            if compaction is not None:
+                content = compacted_marker(compaction)
+            elif len(content.encode("utf-8")) > config.MAX_TOOL_RESULT_BYTES:
+                head = content[: config.MAX_TOOL_RESULT_BYTES // 2]
+                content = (
+                    f"{head}\n[TRUNCATED at {config.MAX_TOOL_RESULT_BYTES} bytes; full content at "
+                    f"trace pointer {recorder.run_id}:event:{event['event_idx']}]"
+                )
+            tool_blocks.append({"type": "tool_result", "tool_use_id": call.tool_use_id, "content": content, "is_error": result["status"] != "ok"})
+            if terminal_coder_approval_failure:
+                recorder.emit(
+                    "run_end",
+                    final_status="tool_error",
+                    total_cost_usd=round(guard.running_usd, 6),
+                    total_tokens=guard.running_tokens,
+                    duration_s=round(time.perf_counter() - started, 3),
+                )
+                return recorder
+            if result["status"] != "ok":
+                if call.name not in SOFT_RECOVERABLE_PARENT_TOOLS:
+                    recorder.emit(
+                        "run_end",
+                        final_status="tool_error",
+                        total_cost_usd=round(guard.running_usd, 6),
+                        total_tokens=guard.running_tokens,
+                        duration_s=round(time.perf_counter() - started, 3),
+                    )
+                    return recorder
+        messages.append({"role": "user", "content": tool_blocks})

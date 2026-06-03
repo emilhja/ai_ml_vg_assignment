@@ -1,0 +1,99 @@
+"""Generated runtime constants from MODEL_CONFIG.md."""
+
+SPEC_DIGEST = "__SPEC_DIGEST__"
+
+PARENT_MODEL_ID = "__PARENT_MODEL_ID__"
+GRILLING_MODEL_ID = "__GRILLING_MODEL_ID__"
+EXPLORER_MODEL_ID = "__EXPLORER_MODEL_ID__"
+CODER_MODEL_ID = "__CODER_MODEL_ID__"
+REVIEWER_MODEL_ID = "__REVIEWER_MODEL_ID__"
+COMPACTOR_MODEL_ID = "__COMPACTOR_MODEL_ID__"
+
+SUBAGENT_MODEL_IDS = {
+    "grilling": GRILLING_MODEL_ID,
+    "explorer": EXPLORER_MODEL_ID,
+    "coder": CODER_MODEL_ID,
+    "reviewer": REVIEWER_MODEL_ID,
+}
+
+# Per-model catalog: each model id is listed once with its pricing
+# (USD/Mtok), context window, and auto-compact fraction. The public dicts
+# below are derived from it so adding a model means one entry here, not edits
+# to three parallel dicts. They stay plain dicts so runtime_settings and tests
+# can still mutate them in place.
+_MODELS: dict[str, dict] = {
+    "openrouter/google/gemini-2.0-flash-001": {
+        "pricing": {"input": __GEMINI_2_0_FLASH_INPUT_PER_MTOK__, "output": __GEMINI_2_0_FLASH_OUTPUT_PER_MTOK__},
+        "context_window": __GEMINI_2_0_FLASH_CONTEXT_WINDOW__,
+        "compact_fraction": __GEMINI_2_0_FLASH_COMPACT_FRACTION__,
+    },
+    "openrouter/google/gemini-2.5-flash": {
+        "pricing": {"input": __GEMINI_2_5_FLASH_INPUT_PER_MTOK__, "output": __GEMINI_2_5_FLASH_OUTPUT_PER_MTOK__},
+        "context_window": __GEMINI_2_5_FLASH_CONTEXT_WINDOW__,
+        "compact_fraction": __GEMINI_2_5_FLASH_COMPACT_FRACTION__,
+    },
+    "openrouter/google/gemini-2.5-flash-lite": {
+        "pricing": {"input": __GEMINI_2_5_FLASH_LITE_INPUT_PER_MTOK__, "output": __GEMINI_2_5_FLASH_LITE_OUTPUT_PER_MTOK__},
+        "context_window": __GEMINI_2_5_FLASH_LITE_CONTEXT_WINDOW__,
+        "compact_fraction": __GEMINI_2_5_FLASH_LITE_COMPACT_FRACTION__,
+    },
+    "openrouter/anthropic/claude-haiku-4.5": {
+        "pricing": {"input": __CLAUDE_HAIKU_4_5_INPUT_PER_MTOK__, "output": __CLAUDE_HAIKU_4_5_OUTPUT_PER_MTOK__},
+        "context_window": __CLAUDE_HAIKU_4_5_CONTEXT_WINDOW__,
+        "compact_fraction": __CLAUDE_HAIKU_4_5_COMPACT_FRACTION__,
+    },
+    "openrouter/anthropic/claude-sonnet-4.6": {
+        "pricing": {"input": __CLAUDE_SONNET_4_6_INPUT_PER_MTOK__, "output": __CLAUDE_SONNET_4_6_OUTPUT_PER_MTOK__},
+        "context_window": __CLAUDE_SONNET_4_6_CONTEXT_WINDOW__,
+        "compact_fraction": __CLAUDE_SONNET_4_6_COMPACT_FRACTION__,
+    },
+    "openrouter/qwen/qwen3-coder-30b-a3b-instruct": {
+        "pricing": {"input": __QWEN3_CODER_30B_INPUT_PER_MTOK__, "output": __QWEN3_CODER_30B_OUTPUT_PER_MTOK__},
+        "context_window": __QWEN3_CODER_30B_CONTEXT_WINDOW__,
+        "compact_fraction": __QWEN3_CODER_30B_COMPACT_FRACTION__,
+    },
+    "openrouter/deepseek/deepseek-v4-flash": {
+        "pricing": {"input": __DEEPSEEK_V4_FLASH_INPUT_PER_MTOK__, "output": __DEEPSEEK_V4_FLASH_OUTPUT_PER_MTOK__},
+        "context_window": __DEEPSEEK_V4_FLASH_CONTEXT_WINDOW__,
+        "compact_fraction": __DEEPSEEK_V4_FLASH_COMPACT_FRACTION__,
+    },
+}
+
+PRICING_USD_PER_MTOK = {mid: spec["pricing"] for mid, spec in _MODELS.items()}
+CONTEXT_WINDOW_TOKENS = {mid: spec["context_window"] for mid, spec in _MODELS.items()}
+AUTO_COMPACT_FRACTION = {mid: spec["compact_fraction"] for mid, spec in _MODELS.items()}
+UNKNOWN_MODEL_ESTIMATE_USD_PER_MTOK = {"input": __UNKNOWN_MODEL_INPUT_ESTIMATE_PER_MTOK__, "output": __UNKNOWN_MODEL_OUTPUT_ESTIMATE_PER_MTOK__}
+EXPENSIVE_OPENROUTER_PROVIDER_SLUGS = __EXPENSIVE_OPENROUTER_PROVIDER_SLUGS_TUPLE__
+DEFAULT_CONTEXT_WINDOW = 128_000
+DEFAULT_COMPACT_FRACTION = 0.80
+COMPACT_KEEP_RECENT_TURNS = 4
+COMPACTOR_MAX_OUTPUT_TOKENS = 400
+COMPACTOR_MAX_INPUT_CHARS = 120_000
+COMPACTOR_MAX_SUMMARY_TOKENS = 300
+
+MAX_PARENT_STEPS = 15
+FINAL_STEP_RESERVE = 1
+MAX_PARALLEL_CODER_RETRIES_PER_CALL = 2
+MAX_SUBAGENT_STEPS = 8
+MAX_SUBAGENT_DEPTH = 1
+MAX_CONCURRENT_SUBAGENTS = 2
+MAX_PARALLEL_SUBAGENTS = 4
+SUBAGENT_TYPES = ("grilling", "explorer", "coder", "reviewer")
+MAX_TOKENS_PER_RUN = 80_000
+MAX_USD_PER_RUN = 0.50
+MAX_USD_PER_DAY = 5.00
+WARN_USD_FRACTION = 0.8
+WARN_TOKEN_FRACTION = 0.8
+WARN_STEP_FRACTION = 0.8
+WALL_CLOCK_TIMEOUT = 120
+TOOL_TIMEOUT = 30
+K_COMPACT = 4000
+PARENT_MAX_OUTPUT_TOKENS = 4096
+
+OPENROUTER_ENDPOINT_HOST = "__OPENROUTER_ENDPOINT_HOST__"
+MAX_TOOL_RESULT_BYTES = 1_048_576
+DAILY_SPEND_FILE = ".vg_daily_spend.json"
+APPROVALS_FILE = ".vg_approvals.json"
+REQUIRE_APPROVAL_DEFAULT = "off"
+STEP_EXTEND_PROMPT_ON_LAST_STEP = True
+SQLITE_TRACE_DB = "traces/vg_agent.sqlite3"

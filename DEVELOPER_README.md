@@ -18,39 +18,45 @@ There are **three tiers** of code here:
 
 | Tier | Paths | Edit it directly? | Source of truth |
 |---|---|---|---|
-| **A. Generated from templates** | most of `src/vg_agent/*`, all of `fixtures/demo_repo/*` | **No** | template strings in `scripts/generate_project.py` + the markdown specs |
+| **A. Generated from templates** | most of `src/vg_agent/*`, all of `fixtures/demo_repo/*` | **No** | `scripts/templates/*.tmpl` (rendered by `scripts/generate_project.py`) + the markdown specs |
 | **B. Hand-written, but lives in the generated dir** | `src/vg_agent/sqlite_store.py`, `src/vg_agent/chat_ui.py`, `src/vg_agent/workspace_paths.py` | **Yes** — these *are* the source | the files themselves |
 | **C. Ordinary hand-maintained code** | `dashboard/`, `tests/`, `scripts/`, `docs/`, `specs/`, `*.md`, `Dockerfile`, `docker-compose.yml`, `pyproject.toml` | **Yes** | the files themselves |
 
 > **Gotcha:** Tier B files sit *inside* `src/vg_agent/`, so the blanket advice
 > "never touch `src/vg_agent/*`" is wrong for them. The generator lists them in
-> `EXTRA_SOURCE_GENERATED_FILES` (`scripts/generate_project.py:6016`), reads them
+> `EXTRA_SOURCE_GENERATED_FILES` (in `scripts/generate_project.py`), reads them
 > from disk **before** `--clean` wipes the directory, runs placeholder
 > substitution, and writes them back. So they are real, hand-edited source that
 > merely shares a folder with generated output. (`render()` still runs on them,
-> so `__PLACEHOLDER__` tokens are substituted — avoid literal double-underscore
-> tokens of that form.)
+> so `__PLACEHOLDER__` tokens are substituted — avoid literal uppercase
+> `__NAME__` tokens; `render()` now hard-fails on any that survive.)
 
 ---
 
 ## Where each runtime module really comes from
 
 Everything in this table is **Tier A (generated)** — to change it, edit the
-template string at the given line range inside `scripts/generate_project.py` (or
-the markdown it reads), then regenerate.
+matching template file under `scripts/templates/` (or the markdown the generator
+reads), then regenerate. Each `scripts/templates/<name>.tmpl` is the pre-render
+source for `src/vg_agent/<name>`; `scripts/generate_project.py` loads them via
+`_load_generated_templates()` and substitutes `__PLACEHOLDER__` tokens.
 
-| Generated module | Template location in `generate_project.py` | Approx size |
+| Generated module | Template file | Approx size |
 |---|---|---|
-| `__init__.py` | ~134 | 6 |
-| `config.py` | ~140–221 | 82 |
-| `runtime_settings.py` | ~222–440 | 218 |
-| `budget.py` | ~441–730 | 290 |
-| `live_model_client.py` | ~731–1147 | 417 |
-| `tools.py` | ~1148–1648 | 501 |
-| `trace.py` | ~1649–2424 | 776 |
-| `demo_fixture.py` | ~2425–2513 | 89 |
-| `agent.py` | ~2514–4554 | 2,041 |
-| `__main__.py` | ~4555–6012 | 1,458 |
+| `__init__.py` | `scripts/templates/__init__.py.tmpl` | 6 |
+| `config.py` | `scripts/templates/config.py.tmpl` | 82 |
+| `runtime_settings.py` | `scripts/templates/runtime_settings.py.tmpl` | 218 |
+| `budget.py` | `scripts/templates/budget.py.tmpl` | 290 |
+| `live_model_client.py` | `scripts/templates/live_model_client.py.tmpl` | 417 |
+| `tools.py` | `scripts/templates/tools.py.tmpl` | 501 |
+| `trace.py` | `scripts/templates/trace.py.tmpl` | 776 |
+| `demo_fixture.py` | `scripts/templates/demo_fixture.py.tmpl` | 89 |
+| `agent.py` | `scripts/templates/agent.py.tmpl` | 2,041 |
+| `__main__.py` | `scripts/templates/__main__.py.tmpl` | 1,458 |
+
+> Until recently these templates lived as ~4,000 lines of triple-quoted strings
+> inside `generate_project.py`; they were extracted to `scripts/templates/` so
+> the runtime is reviewable with normal Python tooling.
 
 The markdown inputs that feed the generator (and are hashed into `SPEC_DIGEST`)
 are listed in `SOURCE_INPUTS` (`scripts/generate_project.py:11`):
@@ -64,7 +70,7 @@ from `PROMPTS.md` via `read_prompts()`.
 ## How to make a change (the loop)
 
 1. Decide the tier (table above).
-   - **Tier A** → edit the template in `scripts/generate_project.py`, or the
+   - **Tier A** → edit the matching `scripts/templates/<name>.tmpl`, or the
      spec/`PROMPTS.md`/`MODEL_CONFIG.md`/`CONTEXT_WINDOWS.md` it reads.
    - **Tier B/C** → edit the file directly.
 2. Regenerate (only needed if you touched Tier A inputs):
@@ -125,9 +131,10 @@ compare it **byte-for-byte** with the checked-in `src/vg_agent/`. Consequences:
 A full clarity/DRY/SOC review and an ordered refactor plan live in
 [`plans/make-a-a-thorough-gentle-goblet.md`](plans/make-a-a-thorough-gentle-goblet.md).
 Highlights a reviewer will notice:
-- The generator embeds ~4,000 lines of runtime Python as triple-quoted strings,
-  so IDE/lint/type tooling doesn't see it (Phase 0 of the plan extracts these to
-  `.py.tmpl` files).
+- **(Phase 0 — done)** The generator used to embed ~4,000 lines of runtime
+  Python as triple-quoted strings; these now live as reviewable
+  `scripts/templates/*.tmpl` files, and `render()` hard-fails on unsubstituted
+  placeholders.
 - Duplicated safety pattern lists in `tools.py`, repeated model IDs across five
   dicts in `config.py`, scattered tool-summary/ANSI/event-kind literals.
 - A few very large functions (`_run_live_subagent`, `_chat_loop`).

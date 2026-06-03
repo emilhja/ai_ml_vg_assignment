@@ -22,7 +22,9 @@ the checked-in tree byte-for-byte with a fresh regeneration. To change
 runtime behavior:
 
 1. Edit the relevant spec / `PROMPTS.md` / `MODEL_CONFIG.md`, **or** the
-   template string inside `scripts/generate_project.py`.
+   matching template file under `scripts/templates/<name>.tmpl` (these hold the
+   pre-render source for each `src/vg_agent/<name>`; `generate_project.py` loads
+   and renders them).
 2. Run `python scripts/generate_project.py --clean`.
 3. Run `uv run pytest`.
 
@@ -123,9 +125,10 @@ safety, cost control.
 ## Important constraints when editing
 
 - **Don't touch generated files.** If `src/vg_agent/*` or
-  `fixtures/demo_repo/*` need to change, edit the corresponding
-  spec/template under `specs/`, `PROMPTS.md`, `MODEL_CONFIG.md`, or
-  `scripts/generate_project.py`, then regenerate.
+  `fixtures/demo_repo/*` need to change, edit the corresponding source under
+  `specs/`, `PROMPTS.md`, `MODEL_CONFIG.md`, or the per-module template in
+  `scripts/templates/<name>.tmpl`, then regenerate. (Exception: the three
+  hand-written files noted above.)
 - **`run_bash` allowlist changes require a spec update first.** Add the
   command to `specs/20_tools.md` with justification, regenerate, and add a
   test proving it stays read-only.

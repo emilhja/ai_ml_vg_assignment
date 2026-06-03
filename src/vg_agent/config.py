@@ -16,36 +16,54 @@ SUBAGENT_MODEL_IDS = {
     "reviewer": REVIEWER_MODEL_ID,
 }
 
-PRICING_USD_PER_MTOK = {
-    "openrouter/google/gemini-2.0-flash-001": {"input": 0.10, "output": 0.40},
-    "openrouter/google/gemini-2.5-flash": {"input": 0.10, "output": 0.40},
-    "openrouter/google/gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
-    "openrouter/anthropic/claude-haiku-4.5": {"input": 1.00, "output": 5.00},
-    "openrouter/anthropic/claude-sonnet-4.6": {"input": 3.00, "output": 15.00},
-    "openrouter/qwen/qwen3-coder-30b-a3b-instruct": {"input": 0.07, "output": 0.27},
-    "openrouter/deepseek/deepseek-v4-flash": {"input": 0.0983, "output": 0.1966},
+# Per-model catalog: each model id is listed once with its pricing
+# (USD/Mtok), context window, and auto-compact fraction. The public dicts
+# below are derived from it so adding a model means one entry here, not edits
+# to three parallel dicts. They stay plain dicts so runtime_settings and tests
+# can still mutate them in place.
+_MODELS: dict[str, dict] = {
+    "openrouter/google/gemini-2.0-flash-001": {
+        "pricing": {"input": 0.10, "output": 0.40},
+        "context_window": 1000000,
+        "compact_fraction": 0.80,
+    },
+    "openrouter/google/gemini-2.5-flash": {
+        "pricing": {"input": 0.10, "output": 0.40},
+        "context_window": 1048576,
+        "compact_fraction": 0.80,
+    },
+    "openrouter/google/gemini-2.5-flash-lite": {
+        "pricing": {"input": 0.10, "output": 0.40},
+        "context_window": 1048576,
+        "compact_fraction": 0.80,
+    },
+    "openrouter/anthropic/claude-haiku-4.5": {
+        "pricing": {"input": 1.00, "output": 5.00},
+        "context_window": 200000,
+        "compact_fraction": 0.80,
+    },
+    "openrouter/anthropic/claude-sonnet-4.6": {
+        "pricing": {"input": 3.00, "output": 15.00},
+        "context_window": 200000,
+        "compact_fraction": 0.80,
+    },
+    "openrouter/qwen/qwen3-coder-30b-a3b-instruct": {
+        "pricing": {"input": 0.07, "output": 0.27},
+        "context_window": 160000,
+        "compact_fraction": 0.80,
+    },
+    "openrouter/deepseek/deepseek-v4-flash": {
+        "pricing": {"input": 0.0983, "output": 0.1966},
+        "context_window": 1048576,
+        "compact_fraction": 0.80,
+    },
 }
+
+PRICING_USD_PER_MTOK = {mid: spec["pricing"] for mid, spec in _MODELS.items()}
+CONTEXT_WINDOW_TOKENS = {mid: spec["context_window"] for mid, spec in _MODELS.items()}
+AUTO_COMPACT_FRACTION = {mid: spec["compact_fraction"] for mid, spec in _MODELS.items()}
 UNKNOWN_MODEL_ESTIMATE_USD_PER_MTOK = {"input": 30.00, "output": 120.00}
 EXPENSIVE_OPENROUTER_PROVIDER_SLUGS = ('alibaba', 'morph', 'parasail/fp8')
-
-CONTEXT_WINDOW_TOKENS = {
-    "openrouter/google/gemini-2.0-flash-001": 1000000,
-    "openrouter/google/gemini-2.5-flash": 1048576,
-    "openrouter/google/gemini-2.5-flash-lite": 1048576,
-    "openrouter/anthropic/claude-haiku-4.5": 200000,
-    "openrouter/anthropic/claude-sonnet-4.6": 200000,
-    "openrouter/qwen/qwen3-coder-30b-a3b-instruct": 160000,
-    "openrouter/deepseek/deepseek-v4-flash": 1048576,
-}
-AUTO_COMPACT_FRACTION = {
-    "openrouter/google/gemini-2.0-flash-001": 0.80,
-    "openrouter/google/gemini-2.5-flash": 0.80,
-    "openrouter/google/gemini-2.5-flash-lite": 0.80,
-    "openrouter/anthropic/claude-haiku-4.5": 0.80,
-    "openrouter/anthropic/claude-sonnet-4.6": 0.80,
-    "openrouter/qwen/qwen3-coder-30b-a3b-instruct": 0.80,
-    "openrouter/deepseek/deepseek-v4-flash": 0.80,
-}
 DEFAULT_CONTEXT_WINDOW = 128_000
 DEFAULT_COMPACT_FRACTION = 0.80
 COMPACT_KEEP_RECENT_TURNS = 4
