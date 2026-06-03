@@ -9,6 +9,13 @@ The competitor claim is about the agent shell and architecture: tool execution,
 context management, sub-agent boundaries, tracing, safety, and cost
 control. It is not a claim to beat frontier model quality.
 
+Product architecture and technology inventory:
+
+- `specs/01_architecture.md` — system context, agent topology, context
+  engineering, observability, safety layers, module map, spec reading order.
+- `specs/02_tech_stack.md` — Python dependencies, LLM stack, persistence,
+  dashboard stack, Docker, configuration surfaces, codegen toolchain.
+
 Non-goals:
 
 - No multi-level sub-agent tree (`MAX_SUBAGENT_DEPTH = 1` is hard).
@@ -43,7 +50,9 @@ Execution model:
 - Grading evidence is the **live demo**. Unit tests exercise the same live loop
   with an injected `FakeClient` (no network, per the no-network test rule) to
   prove caps, parallelism, safety, and context behavior reproducibly in CI.
+- Product shape and stack: `specs/01_architecture.md`, `specs/02_tech_stack.md`.
 - Source-of-truth and CLI details live in
   `specs/05_source_of_truth_and_generation.md`,
   `specs/15_cli_contract.md`, and
-  `specs/16_chat_ui.md` (interactive TTY chat layout).
+  `specs/16_chat_ui.md` (interactive TTY chat layout), and
+  `specs/17_rich_tui_stack.md` (Rich / prompt-toolkit stack reference).

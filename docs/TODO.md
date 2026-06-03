@@ -24,8 +24,8 @@ Related: global routing landed via `OPENROUTER_PROVIDER_ORDER` / `OPENROUTER_PRO
 
 ## Rich TTY chat — low-priority polish
 
-Spec-first (`specs/16_chat_ui.md`), then `chat_ui.py` / `scripts/templates/__main__.py.tmpl`,
-regenerate, pytest.
+Spec-first (`specs/16_chat_ui.md`, `specs/17_rich_tui_stack.md`), then `chat_ui.py` /
+`scripts/templates/__main__.py.tmpl`, regenerate, pytest.
 
 - [ ] Progress turn header `── turn N ──` → Rich `Rule` on stderr (compact chat only).
 - [ ] `[parallel]` rollup → optional dim Rich `Panel` instead of plain magenta lines.

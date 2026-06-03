@@ -307,7 +307,9 @@ Quick checks:
 |-------|------|
 | Developer & code-review guide | [`DEVELOPER_README.md`](DEVELOPER_README.md) |
 | Source-of-truth specs | [`specs/`](specs/) |
-| Architecture | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
+| Product architecture (spec) | [`specs/01_architecture.md`](specs/01_architecture.md) |
+| Tech stack (spec) | [`specs/02_tech_stack.md`](specs/02_tech_stack.md) |
+| Architecture (oral exam) | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
 | Pricing / models | [`docs/PRICE.md`](docs/PRICE.md), [`MODEL_CONFIG.md`](MODEL_CONFIG.md) |
 | Model selection notes | [`specs/model_experience.md`](specs/model_experience.md) |
 | Context windows (generator input) | [`CONTEXT_WINDOWS.md`](CONTEXT_WINDOWS.md) |

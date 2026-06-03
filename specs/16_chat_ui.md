@@ -306,8 +306,11 @@ only; JSONL schema additions are limited to optional fields on `statusline` even
 
 ## Dependencies
 
-- `rich>=13` for panels, rules, tree, syntax, and styled stderr console.
-- `prompt-toolkit>=3.0` for prompt, history, autocomplete, placeholder, approvals.
+See **`specs/17_rich_tui_stack.md`** for package versions, Rich API usage map,
+activation rules, and stdout/stderr split. Summary:
+
+- `rich>=13` — panels, rules, tree, syntax, Markdown, tables
+- `prompt-toolkit>=3.0` — prompt, history, autocomplete, placeholder
 
 ## Out of scope
 

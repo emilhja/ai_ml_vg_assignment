@@ -114,7 +114,8 @@ compare it **byte-for-byte** with the checked-in `src/vg_agent/`. Consequences:
   a `FakeClient`/`PipelineClient` and never hits the network. Other suites cover
   the dashboard API, packaging, runtime settings, and OpenRouter provider logic.
 - **Specs** (`specs/`): the behavioral contract. Start at
-  `00_overview.md` and `05_source_of_truth_and_generation.md`.
+  `00_overview.md`, then `01_architecture.md` and `02_tech_stack.md`, then
+  `05_source_of_truth_and_generation.md`.
 
 ### Constraints a reviewer should enforce
 - No network in unit tests — use the `FakeClient`/`PipelineClient` pattern.

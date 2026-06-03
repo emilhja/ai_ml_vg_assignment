@@ -1,7 +1,9 @@
 # Architecture
 
-Reference for the §4 oral knowledge-check. Source of truth remains
-`specs/`, `PROMPTS.md`, and `MODEL_CONFIG.md`.
+Reference for the §4 oral knowledge-check. For the full product architecture
+(system diagrams, module map, spec reading order), see
+[`specs/01_architecture.md`](../specs/01_architecture.md). Source of truth
+remains `specs/`, `PROMPTS.md`, and `MODEL_CONFIG.md`.
 
 ## Diagram
 

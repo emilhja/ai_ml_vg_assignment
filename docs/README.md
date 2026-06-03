@@ -6,7 +6,9 @@ repository root.
 
 | Topic | Path |
 |-------|------|
-| Architecture | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| Product architecture (spec) | [../specs/01_architecture.md](../specs/01_architecture.md) |
+| Tech stack (spec) | [../specs/02_tech_stack.md](../specs/02_tech_stack.md) |
+| Architecture (oral exam) | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | Pricing checklist | [PRICE.md](PRICE.md) |
 | Follow-ups | [TODO.md](TODO.md) |
 | Live demo script | [demo/final_demo_live_chat_script.md](demo/final_demo_live_chat_script.md) |

@@ -9,7 +9,8 @@ behavior from stale generated Python.
 These files are human-/agent-edited sources of truth:
 
 - `specs/*.md` — architecture, tool contracts, governance, tests, packaging,
-  observability, and demo behavior.
+  observability, and demo behavior. Start with `specs/01_architecture.md` and
+  `specs/02_tech_stack.md` for product shape and technology inventory.
 - `PROMPTS.md` — parent and sub-agent prompts compiled into runtime code.
 - `MODEL_CONFIG.md` — exact model IDs, endpoint host, and pricing constants.
 - `CONTEXT_WINDOWS.md` — per-model context window and auto-compact fraction.
