@@ -55,6 +55,11 @@ uv run pytest tests/test_vg_agent.py::test_parallel_explorers_run_concurrently_w
 .\scripts\run_demo.ps1
 .\scripts\run_demo.ps1 -SkipTests   # skip pytest
 
+# Live smoke test: one tuned prompt per VG feature through Docker, auto-verified
+# against traces, writes traces/smoke_report.md (needs OPENROUTER_API_KEY in .env)
+bash scripts/smoke_live.sh            # or: .\scripts\smoke_live.ps1
+bash scripts/smoke_live.sh --skip-build --only F6,F7
+
 # Canonical live Docker demo (requires OPENROUTER_API_KEY in .env)
 Copy-Item .env.example .env            # then edit .env and set OPENROUTER_API_KEY
 New-Item -ItemType Directory -Force workspace,traces

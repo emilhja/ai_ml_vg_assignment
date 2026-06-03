@@ -1,5 +1,13 @@
 # Current Demo Status
 
+> **Automated smoke test (non-interactive).** This doc is the human-driven
+> presentation. For a fast regression check that fires *one tuned prompt per
+> feature* through Docker and auto-verifies each against its trace, run
+> `bash scripts/smoke_live.sh` (or `./scripts/smoke_live.ps1` on PowerShell).
+> It writes a PASS/FAIL board to `traces/smoke_report.md`. Use it after large
+> changes or when swapping models; supports `--skip-build`, `--keep-fixture`,
+> and `--only F6,F7`.
+
 Last reviewed sessions:
 
 - `traces/81d6be281a7f.jsonl` - hard-cap abort proof.
