@@ -62,6 +62,11 @@ def estimate_tokens(text: str) -> int:
 
 def resolve_workspace_path(root: Path, rel_path: str) -> Path:
     root_resolved = root.resolve()
+    if not rel_path or not rel_path.strip():
+        raise ValueError(
+            "path must name a file relative to the workspace root, e.g. "
+            "'tkinter_calc2/calculator.py' (received an empty path)"
+        )
     requested = Path(rel_path)
     if requested.is_absolute():
         raise ValueError(f"path {rel_path!r} must be relative to the workspace")

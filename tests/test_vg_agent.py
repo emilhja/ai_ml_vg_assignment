@@ -24,6 +24,7 @@ from vg_agent.agent import (
     _build_review_slice,
     _resolve_review_coder_id,
     _run_live_subagent,
+    _tool_path,
     run_live_task,
 )
 from vg_agent.live_model_client import (
@@ -775,6 +776,39 @@ def test_file_tools_reject_path_traversal(tmp_path: Path) -> None:
     assert ok["status"] == "ok"
 
 
+def test_file_tools_reject_empty_path(tmp_path: Path) -> None:
+    # An empty path must not silently resolve to (and clobber) the workspace
+    # root. Before the fix this raised an opaque "[Errno 21] Is a directory"
+    # that the model could not recover from, causing a write/retry loop.
+    result = write_file(tmp_path, "", "x = 1\n", "w-empty")
+    assert result["status"] == "error"
+    message = str(result["result_full"])
+    assert "empty path" in message
+    assert "Is a directory" not in message
+    # The root was not turned into a file.
+    assert tmp_path.is_dir()
+
+    assert write_file(tmp_path, "   ", "x", "w-blank")["status"] == "error"
+    assert read_file(tmp_path, "", "r-empty")["status"] == "error"
+    assert edit_file(tmp_path, "", "a", "b", "e-empty")["status"] == "error"
+
+    # A real nested path still works and creates the parent folder.
+    ok = write_file(tmp_path, "tkinter_calc2/calculator.py", "print('ok')\n", "w-ok")
+    assert ok["status"] == "ok"
+    assert (tmp_path / "tkinter_calc2" / "calculator.py").read_text(encoding="utf-8") == "print('ok')\n"
+
+
+def test_tool_path_accepts_common_aliases() -> None:
+    assert _tool_path({"path": "a.py"}) == "a.py"
+    assert _tool_path({"rel_path": "b.py"}) == "b.py"
+    # Models sometimes use file_path / filename instead of path.
+    assert _tool_path({"file_path": "tkinter_calc2/calc.py"}) == "tkinter_calc2/calc.py"
+    assert _tool_path({"filename": "main.py"}) == "main.py"
+    # path wins over aliases when several are present.
+    assert _tool_path({"path": "a.py", "file_path": "b.py"}) == "a.py"
+    assert _tool_path({"content": "x"}) == ""
+
+
 def test_edit_file_reports_replacement_count(tmp_path: Path) -> None:
     target = tmp_path / "app.py"
     target.write_text("foo = 1\nprint(foo)\n", encoding="utf-8")
@@ -979,6 +1013,20 @@ def test_args_summary_spawn_subagent_single_line() -> None:
     summary = _args_summary("spawn_subagent", {"question": "Edit only\n\nEngine API"})
     assert "\n" not in summary
     assert "↵" in summary
+
+
+def test_args_summary_file_tools_never_blank() -> None:
+    from vg_agent.agent import _args_summary
+
+    # A write with a path shows the path plus content size.
+    summary = _args_summary("write_file", {"path": "calc/main.py", "content": "x = 1\n"})
+    assert "calc/main.py" in summary
+    assert "6 chars" in summary
+
+    # A missing path must never render as an empty approval line.
+    blank = _args_summary("write_file", {"content": "x = 1\n"})
+    assert blank.strip() != ""
+    assert "<missing path>" in blank
 
 
 def test_use_rich_approval_ui_latched_when_stderr_not_tty(monkeypatch: pytest.MonkeyPatch) -> None:

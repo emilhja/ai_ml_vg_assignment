@@ -193,13 +193,32 @@ def _single_line_summary(text: str, *, limit: int = 160) -> str:
     return flat[:limit]
 
 
+# Models occasionally name the path argument differently (e.g. `file_path`).
+# Accept the common aliases so a write/edit never silently targets the
+# workspace root with an empty path.
+_PATH_ARG_KEYS = ("path", "rel_path", "file_path", "filepath", "filename")
+
+
+def _tool_path(args: dict[str, Any]) -> str:
+    for key in _PATH_ARG_KEYS:
+        value = args.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
 def _args_summary(tool: str, args: dict[str, Any]) -> str:
     if tool in {"read_file", "read_file_range", "write_file", "edit_file"}:
-        path = args.get("path") or args.get("rel_path") or ""
+        # Never render a blank approval line: a missing path is itself the
+        # signal a reviewer needs to see, not an empty box.
+        path = _tool_path(args) or "<missing path>"
         if tool == "edit_file":
             old = str(args.get("old") or "")
             new = str(args.get("new") or "")
             return _single_line_summary(f"{path}  - {old[:40]!r} -> + {new[:40]!r}", limit=160)
+        if tool == "write_file":
+            content = str(args.get("content") or "")
+            return _single_line_summary(f"{path}  ({len(content)} chars)", limit=160)
         return str(path)
     if tool == "run_bash":
         return _single_line_summary(str(args.get("command") or ""), limit=160)
@@ -216,7 +235,7 @@ def _args_summary(tool: str, args: dict[str, Any]) -> str:
 
 
 def _request_for(call: ToolCall) -> ApprovalRequest:
-    path = call.args.get("path") or call.args.get("rel_path")
+    path = _tool_path(call.args) or None
     if call.name == "run_bash":
         command = str(call.args.get("command") or "")
         path = tools.rm_delete_target(command) or path
@@ -250,7 +269,7 @@ def _emit_tool_call(recorder: TraceRecorder, call: ToolCall, agent_id: str = "pa
         tool=call.name,
         args=call.args,
         args_summary=_args_summary(call.name, call.args),
-        path=call.args.get("path") or call.args.get("rel_path"),
+        path=_tool_path(call.args) or None,
         command=call.args.get("command"),
     )
 
@@ -920,7 +939,7 @@ def _execute_live_tool(
     tool_name = call.name
     args = call.args
     tool_started = time.perf_counter()
-    path = str(args.get("path") or args.get("rel_path") or "")
+    path = _tool_path(args)
     _emit_tool_call(recorder, call, agent_id=agent_id, parent_id=parent_id, agent_type=agent_type)
 
     if tool_name not in allowed_tools:
