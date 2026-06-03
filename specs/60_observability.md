@@ -79,7 +79,7 @@ Every event the trace recorder writes must carry these fields (or
 | Field | Applies to | Purpose |
 |---|---|---|
 | `agent_id` | all | UUID of the agent that produced the event (parent or sub-agent) |
-| `agent_type` | all | `parent` \| `grilling` \| `explorer` \| `coder` \| `reviewer` |
+| `agent_type` | all | `parent` \| `grilling` \| `explorer` \| `coder` \| `reviewer` \| `compactor` |
 | `parent_step_idx` | sub-agent events | parent step that spawned this sub-agent |
 | `model_id` | `assistant_step` and any event tied to an OpenRouter request | exact model ID used |
 | `openrouter_provider` | `assistant_step` (live OpenRouter only) | backend slug from the OR response (`novita`, `alibaba`, …); omitted when unknown |
@@ -141,6 +141,41 @@ require the dashboard for v1:
 
 A spec assertion in `40_demo_and_eval.md` checks that a representative trace
 contains every field listed above at least once.
+
+## Trace event catalog
+
+Authoritative list of JSONL `kind` values. Every event also carries `event_idx`,
+`agent_id`, and `agent_type` unless noted. Field details for compaction,
+approval, and budget events: [`30_runtime_governance.md`](30_runtime_governance.md).
+
+| `kind` | Typical `agent_type` | In parent `show_context`? | Purpose |
+|--------|----------------------|---------------------------|---------|
+| `user_prompt` | `parent` | yes (user turn) | User task or chat message |
+| `llm_start` | `parent`, `compactor`, sub-agents | no | Preflight record before a model call (model, tokens_in estimate, schemas) |
+| `assistant_step` | any | yes for **parent** only | Model turn: text, tool_calls, usage, `openrouter_provider` |
+| `tool_call` | any | yes for **parent** only | Tool invocation (name, args, timestamps) |
+| `tool_result` | any | yes for **parent** (may be compacted) | Tool output; full body in JSONL |
+| `compaction` | `parent` | marker replaces parent `tool_result` | Tool-result summary; `original_event_idx`, `original_sha256` |
+| `context_compaction` | `parent` | meta row in `/show-context` | Conversation fold; `reason` ∈ {`auto`, `manual`} |
+| `subagent_spawn` | sub-agent type | no | Child run started |
+| `subagent_return` | sub-agent type | via summary in parent tool_result only | ≤2 KB return payload to parent |
+| `budget_event` | `parent` (usually) | no | Cap warning, abort, user config, diagnostics (`budget_reason`) |
+| `approval` | `parent` | no | Allow/deny/auto for tool or budget cap |
+| `egress_blocked` | n/a | no | Non-pinned host refused before request |
+| `redaction` | n/a | no | Secret fields redacted on a prior `event_idx` |
+| `session_reset` | `parent` | no | Chat `/reset` |
+| `session_new` | `parent` | no | Chat `/new` (new trace file) |
+| `statusline` | `parent` | no | Compact HUD snapshot (`text`, caps, `ctx_tokens`) |
+| `run_end` | `parent` | no | Terminal status: `ok`, `aborted`, `tool_error`, … |
+| `model_error` | `parent` | no | Live model failure (network, API, pin) |
+
+**Sub-agent visibility:** intermediate sub-agent `llm_start`, `assistant_step`,
+`tool_call`, and `tool_result` events are in JSONL under the child `agent_id` but
+**excluded** from parent `show_context` except the final return summary embedded
+in the parent `tool_result` for `spawn_subagent` / `spawn_subagents`.
+
+**`budget_event.budget_reason`:** not a separate `kind`; see
+[`30_runtime_governance.md`](30_runtime_governance.md) § Budget events.
 
 ## Trace location
 

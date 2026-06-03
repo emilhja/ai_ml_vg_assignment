@@ -1,17 +1,9 @@
 # 40 Demo And Eval
 
-Fixture layout:
+Fixture layout and file roles: [`specs/04_demo_fixture.md`](04_demo_fixture.md).
 
-- `app.py`
-- `auth/__init__.py`
-- `auth/session.py`
-- `auth/middleware.py`
-- `utils.py`
-- `README.md`
-- `data/sample.log`
-
-The sample log is reproducible and larger than 200 KB so the parent
-`read_file data/sample.log` result exceeds `K_COMPACT`.
+Summary: `app.py`, `auth/`, `utils.py`, `data/sample.log` (>200 KB, triggers
+parent `K_COMPACT` on full read), seeded via `--seed-fixture`.
 
 VG slide assertions (context engineering — VG.2):
 

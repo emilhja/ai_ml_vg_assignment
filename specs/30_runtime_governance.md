@@ -45,16 +45,18 @@ Model and pricing constants are imported from `MODEL_CONFIG.md`.
 
 Event kinds:
 
-- Top-level `kind` is always the event discriminator. Defined kinds:
-  `user_prompt`, `assistant_step`, `tool_call`, `tool_result`, `compaction`,
-  `context_compaction`, `subagent_spawn`, `subagent_return`, `budget_event`,
-  `approval`,
-  `egress_blocked`, `redaction`, `session_reset`, `statusline`, `run_end`.
+- Top-level `kind` is always the event discriminator. Full catalog (parent
+  visibility, purpose): [`specs/60_observability.md`](60_observability.md) §
+  Trace event catalog.
+- Inline list: `user_prompt`, `llm_start`, `assistant_step`, `tool_call`,
+  `tool_result`, `compaction`, `context_compaction`, `subagent_spawn`,
+  `subagent_return`, `budget_event`, `approval`, `egress_blocked`, `redaction`,
+  `session_reset`, `session_new`, `statusline`, `run_end`, `model_error`.
 
 Per-event attribution (see `specs/60_observability.md`):
 
 - Every event carries `agent_id`, `agent_type`
-  (`parent` | `grilling` | `explorer` | `coder` | `reviewer`), and
+  (`parent` | `grilling` | `explorer` | `coder` | `reviewer` | `compactor`), and
   `event_idx`.
 - Sub-agent events also carry `parent_step_idx`.
 - `assistant_step` events carry `model_id`, `tokens_in`, `tokens_out`,
@@ -68,7 +70,12 @@ Budget events:
 
 - `budget_reason` enum: `step_cap`, `token_cap`, `usd_cap`, `daily_cap`,
   `repetition_abort`, `timeout`, `user_abort`, `user_config`, `parallel_aborted`,
-  `warn_usd`, `warn_tokens`, `warn_steps`, `warn_expensive_provider`.
+  `warn_usd`, `warn_tokens`, `warn_steps`, `warn_expensive_provider`,
+  `step_extend` (user approved proactive step raise),
+  `coder_constrained_retry`, `subagent_empty_turn_retry`,
+  `subagent_empty_turn_abort`, `subagent_truncated_tool_call_retry`.
+  Sub-agent budget exhaustion may surface as `subagent_return` with
+  `failure_reason: subagent_budget_cap` without a separate `budget_reason`.
 - `warn_expensive_provider` is emitted **once per expensive OpenRouter slug per
   run** when `assistant_step` records `openrouter_provider` matching the denylist
   (`OPENROUTER_EXPENSIVE_PROVIDERS` or generated defaults). Does not abort.

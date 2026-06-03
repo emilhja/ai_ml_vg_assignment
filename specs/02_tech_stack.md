@@ -226,7 +226,11 @@ Technologies **not** used (avoid confusion when extending the repo):
 
 ## Related specs
 
+- [`README.md`](README.md) — full spec index
 - [`specs/01_architecture.md`](01_architecture.md) — system design and module map
+- [`specs/03_testing.md`](03_testing.md) — test and provenance contract
+- [`specs/04_demo_fixture.md`](04_demo_fixture.md) — demo workspace layout
+- [`specs/25_security.md`](25_security.md) — safety layers rollup
 - [`specs/05_source_of_truth_and_generation.md`](05_source_of_truth_and_generation.md) — edit tiers and regenerate
 - [`specs/17_rich_tui_stack.md`](17_rich_tui_stack.md) — Rich/prompt-toolkit deep dive
 - [`specs/50_packaging.md`](50_packaging.md) — Docker images and Compose

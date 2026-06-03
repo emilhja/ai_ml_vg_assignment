@@ -6,8 +6,10 @@ repository root.
 
 | Topic | Path |
 |-------|------|
+| Spec index | [../specs/README.md](../specs/README.md) |
 | Product architecture (spec) | [../specs/01_architecture.md](../specs/01_architecture.md) |
 | Tech stack (spec) | [../specs/02_tech_stack.md](../specs/02_tech_stack.md) |
+| Testing / demo fixture (spec) | [../specs/03_testing.md](../specs/03_testing.md), [../specs/04_demo_fixture.md](../specs/04_demo_fixture.md) |
 | Architecture (oral exam) | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | Pricing checklist | [PRICE.md](PRICE.md) |
 | Follow-ups | [TODO.md](TODO.md) |

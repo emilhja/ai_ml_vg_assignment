@@ -77,7 +77,7 @@ from `PROMPTS.md` via `read_prompts()`.
    ```powershell
    python scripts/generate_project.py --clean
    ```
-3. Test:
+3. Test (see [`specs/03_testing.md`](specs/03_testing.md)):
    ```powershell
    uv run pytest
    ```
@@ -113,9 +113,9 @@ compare it **byte-for-byte** with the checked-in `src/vg_agent/`. Consequences:
 - **Tests** (`tests/`, Tier C): `test_vg_agent.py` is the large suite; it injects
   a `FakeClient`/`PipelineClient` and never hits the network. Other suites cover
   the dashboard API, packaging, runtime settings, and OpenRouter provider logic.
-- **Specs** (`specs/`): the behavioral contract. Start at
-  `00_overview.md`, then `01_architecture.md` and `02_tech_stack.md`, then
-  `05_source_of_truth_and_generation.md`.
+- **Specs** (`specs/`): the behavioral contract. Index: [`specs/README.md`](specs/README.md).
+  Start at `00_overview.md`, then `01_architecture.md`, `02_tech_stack.md`,
+  `03_testing.md`, `04_demo_fixture.md`, then `05_source_of_truth_and_generation.md`.
 
 ### Constraints a reviewer should enforce
 - No network in unit tests — use the `FakeClient`/`PipelineClient` pattern.

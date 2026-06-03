@@ -65,8 +65,9 @@ docker compose run --rm vg-agent --task "read data/sample.log, then summarise au
 
 ## Architecture
 
-Full product map: `specs/01_architecture.md`. Technology inventory:
-`specs/02_tech_stack.md`. Oral-exam cheat sheet: `docs/ARCHITECTURE.md`.
+Spec index: `specs/README.md`. Product map: `specs/01_architecture.md`.
+Technology inventory: `specs/02_tech_stack.md`. Testing: `specs/03_testing.md`.
+Oral-exam cheat sheet: `docs/ARCHITECTURE.md`.
 
 One parent agent + typed sub-agents (`Grilling`, `Explorer`, `Coder`,
 `Reviewer`). The agent shell (not model quality) is the VG claim: tool

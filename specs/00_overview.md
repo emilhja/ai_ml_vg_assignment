@@ -1,8 +1,11 @@
 # 00 Overview
 
+Full spec index: [`specs/README.md`](README.md).
+
 Goal: build a Claude Code / Codex competitor demo with one parent agent,
 typed sub-agents (Grilling, Explorer, Coder, Reviewer) including parallel
-fan-out, two context-engineering tricks, cost guards with live monitoring,
+fan-out, three context-engineering mechanisms (see [`01_architecture.md`](01_architecture.md)),
+cost guards with live monitoring,
 JSONL observability, and a fixture repository.
 
 The competitor claim is about the agent shell and architecture: tool execution,
@@ -11,10 +14,13 @@ control. It is not a claim to beat frontier model quality.
 
 Product architecture and technology inventory:
 
+- [`specs/README.md`](README.md) — full index and reading order.
 - `specs/01_architecture.md` — system context, agent topology, context
-  engineering, observability, safety layers, module map, spec reading order.
+  engineering, observability, safety layers, module map.
 - `specs/02_tech_stack.md` — Python dependencies, LLM stack, persistence,
   dashboard stack, Docker, configuration surfaces, codegen toolchain.
+- `specs/03_testing.md`, `specs/04_demo_fixture.md`, `specs/25_security.md` —
+  verification, demo workspace, safety rollup.
 
 Non-goals:
 

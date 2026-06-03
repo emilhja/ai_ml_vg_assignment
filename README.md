@@ -306,9 +306,12 @@ Quick checks:
 | Topic | Path |
 |-------|------|
 | Developer & code-review guide | [`DEVELOPER_README.md`](DEVELOPER_README.md) |
+| Spec index | [`specs/README.md`](specs/README.md) |
 | Source-of-truth specs | [`specs/`](specs/) |
 | Product architecture (spec) | [`specs/01_architecture.md`](specs/01_architecture.md) |
 | Tech stack (spec) | [`specs/02_tech_stack.md`](specs/02_tech_stack.md) |
+| Testing contract (spec) | [`specs/03_testing.md`](specs/03_testing.md) |
+| Demo fixture (spec) | [`specs/04_demo_fixture.md`](specs/04_demo_fixture.md) |
 | Architecture (oral exam) | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
 | Pricing / models | [`docs/PRICE.md`](docs/PRICE.md), [`MODEL_CONFIG.md`](MODEL_CONFIG.md) |
 | Model selection notes | [`specs/model_experience.md`](specs/model_experience.md) |

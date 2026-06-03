@@ -12,7 +12,7 @@ This repository implements a **coding-agent shell**, not a frontier-model
 benchmark. The claim is about:
 
 - Tool execution with workspace sandboxing and deny-by-default `run_bash`
-- Context management (parent-scoped compaction and sub-agent offloading)
+- Context management (tool-result compaction, sub-agent offloading, conversation compaction)
 - Typed sub-agent boundaries with parallel fan-out
 - JSONL (+ SQLite mirror) observability and cost guards
 - Safety layers (approval policy, egress pin, optional Docker boundary)
@@ -107,6 +107,13 @@ The parent exposes: `read_file`, `read_file_range`, `run_bash`, `run_tests`,
 Full type table, Grilling heuristics, Reviewer scope, and parallel budget
 slicing: [`specs/12_subagent_pipeline.md`](12_subagent_pipeline.md).
 
+### Sub-agent documentation
+
+Only **Explorer** has a dedicated per-type spec ([`11_subagent_explorer.md`](11_subagent_explorer.md))
+because the parallel auth summarise demo is Explorer-heavy. **Grilling**, **Coder**,
+and **Reviewer** contracts live entirely in [`12_subagent_pipeline.md`](12_subagent_pipeline.md)
+by design — not an accidental gap.
+
 ## Parent loop lifecycle
 
 ```mermaid
@@ -144,7 +151,7 @@ recorded under the sub-agent `agent_id` but excluded from parent `show_context`.
 
 ## Context engineering
 
-Two mechanisms keep the parent context bounded under heavy tool output.
+Three mechanisms keep the parent context bounded under heavy load.
 
 ### 1. Parent-scoped tool-result compaction
 
@@ -155,9 +162,10 @@ overridable via `VG_K_COMPACT`), the runtime:
 2. Replaces the payload in the parent's next model turn with a compact marker
 3. Retains the full body in JSONL for audit and `read_file_range` recovery
 
-Invariant: `show_context(events, step_idx)` at the final demo step must show
-the compaction marker and **not** full `sample.log` content in parent context
-(see [`specs/40_demo_and_eval.md`](40_demo_and_eval.md)).
+Uses `COMPACTOR_MODEL_ID` for the summary (`agent_type: compactor`). Invariant:
+`show_context(events, step_idx)` at the final demo step must show the compaction
+marker and **not** full `sample.log` content in parent context (see
+[`specs/40_demo_and_eval.md`](40_demo_and_eval.md), [`04_demo_fixture.md`](04_demo_fixture.md)).
 
 ### 2. Sub-agent context offloading
 
@@ -166,8 +174,24 @@ parent model sees only the `subagent_return` summary (≤2 KB; one retry then
 truncate). Explorer/Coder `tool_call` / `tool_result` noise never enters
 parent context.
 
+### 3. Conversation compaction
+
+Folds **older in-memory chat turns** (not individual tool results) when parent
+context exceeds the model window × `AUTO_COMPACT_FRACTION` from
+[`CONTEXT_WINDOWS.md`](../CONTEXT_WINDOWS.md):
+
+- **Auto** — before parent `llm_start` when over threshold; emits
+  `context_compaction{reason:"auto"}`.
+- **Manual** — chat `/compact`; emits `context_compaction{reason:"manual"}`.
+- **Tail preserved** — recent turns stay verbatim (`COMPACT_KEEP_RECENT_TURNS` in
+  [`30_runtime_governance.md`](30_runtime_governance.md)).
+
+Distinct from §1: tool-result compaction shrinks one oversized `tool_result`;
+conversation compaction summarizes multi-turn dialogue history.
+
 Together: small parent prompts, fully auditable JSONL, dashboard can render
-full sub-agent lanes.
+full sub-agent lanes and compaction units ([`60_observability.md`](60_observability.md),
+[`70_dashboard.md`](70_dashboard.md)).
 
 ## Observability architecture
 
@@ -238,21 +262,26 @@ Details: [`specs/05_source_of_truth_and_generation.md`](05_source_of_truth_and_g
 
 ## Spec reading order
 
-For a new contributor:
+See [`README.md`](README.md) for the full index. Short path for a new contributor:
 
 1. [`00_overview.md`](00_overview.md) — goals and success criteria
 2. **This file** — system shape
 3. [`02_tech_stack.md`](02_tech_stack.md) — dependencies and infrastructure
-4. [`05_source_of_truth_and_generation.md`](05_source_of_truth_and_generation.md) — how to change code safely
-5. [`12_subagent_pipeline.md`](12_subagent_pipeline.md) — typed agents and parallelism
-6. [`10_main_agent.md`](10_main_agent.md) — parent tools and approval
-7. [`20_tools.md`](20_tools.md) — tool contracts and bash safety
-8. [`30_runtime_governance.md`](30_runtime_governance.md) — caps and constants
-9. [`16_chat_ui.md`](16_chat_ui.md) + [`17_rich_tui_stack.md`](17_rich_tui_stack.md) — interactive UI
-10. [`60_observability.md`](60_observability.md) — traces and statusline
-11. [`50_packaging.md`](50_packaging.md) — Docker and distribution
-12. [`70_dashboard.md`](70_dashboard.md) — trace dashboard
-13. [`15_cli_contract.md`](15_cli_contract.md), [`40_demo_and_eval.md`](40_demo_and_eval.md), [`70_demo_runbook.md`](70_demo_runbook.md) — CLI and graded demos
+4. [`03_testing.md`](03_testing.md) — how CI verifies the spec
+5. [`04_demo_fixture.md`](04_demo_fixture.md) — demo workspace layout
+6. [`05_source_of_truth_and_generation.md`](05_source_of_truth_and_generation.md) — how to change code safely
+7. [`12_subagent_pipeline.md`](12_subagent_pipeline.md) — typed agents and parallelism
+8. [`10_main_agent.md`](10_main_agent.md) — parent tools, approval, conversation compaction
+9. [`20_tools.md`](20_tools.md) — tool contracts and bash safety
+10. [`30_runtime_governance.md`](30_runtime_governance.md) — caps and constants
+11. [`25_security.md`](25_security.md) — safety rollup
+12. [`16_chat_ui.md`](16_chat_ui.md) + [`17_rich_tui_stack.md`](17_rich_tui_stack.md) — interactive UI
+13. [`60_observability.md`](60_observability.md) — traces, statusline, **event catalog**
+14. [`50_packaging.md`](50_packaging.md) — Docker and distribution
+15. [`70_dashboard.md`](70_dashboard.md) — trace dashboard
+16. [`15_cli_contract.md`](15_cli_contract.md), [`40_demo_and_eval.md`](40_demo_and_eval.md), [`70_demo_runbook.md`](70_demo_runbook.md) — CLI and graded demos
+
+Auxiliary: [`model_experience.md`](model_experience.md), [`41_runtime_quality_eval.md`](41_runtime_quality_eval.md).
 
 Prompts and model IDs: [`PROMPTS.md`](../PROMPTS.md), [`MODEL_CONFIG.md`](../MODEL_CONFIG.md).
 
@@ -290,6 +319,7 @@ Prompts and model IDs: [`PROMPTS.md`](../PROMPTS.md), [`MODEL_CONFIG.md`](../MOD
 
 ## Related documents
 
+- Spec index: [`README.md`](README.md)
 - Oral architecture Q&A: [`docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md)
 - Technology inventory: [`specs/02_tech_stack.md`](02_tech_stack.md)
 - Agent contributor guide: [`DEVELOPER_README.md`](../DEVELOPER_README.md)

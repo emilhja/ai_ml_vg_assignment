@@ -1,8 +1,12 @@
 # 11 Explorer Sub-Agent
 
-Explorer is one of four typed sub-agents. Orchestration (sequential and
-parallel), failure modes, and the full type table live in
-`specs/12_subagent_pipeline.md`. This file specifies only the Explorer type.
+Explorer is one of four typed sub-agents. This is the **only** per-type spec
+file under `specs/`; Grilling, Coder, and Reviewer are documented in
+[`12_subagent_pipeline.md`](12_subagent_pipeline.md) only (see
+[`01_architecture.md`](01_architecture.md) § Sub-agent documentation).
+
+Orchestration (sequential and parallel), failure modes, and the full type table
+live in `12`. This file specifies only the Explorer type.
 
 Contract:
 
