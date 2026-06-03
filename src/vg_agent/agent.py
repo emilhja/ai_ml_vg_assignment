@@ -1142,6 +1142,60 @@ class _ParallelBatchControl:
         return self.abort.is_set()
 
 
+def _finalize_subagent_result(
+    agent_type: str,
+    *,
+    final_summary: str,
+    status: str,
+    failure_reason: str | None,
+    completed: bool,
+    had_tool_error: bool,
+    writes_ok: int,
+    require_impl_read: bool,
+    impl_read_ok: bool,
+    empty_turn_retries: int,
+) -> tuple[str, str, str | None]:
+    """Normalize a sub-agent's accumulated state into its final
+    ``(summary, status, failure_reason)`` after the step loop. Pure: no I/O.
+    """
+    if agent_type == "reviewer" and not _is_reviewer_verdict(final_summary):
+        # Contract: reviewer `subagent_return.payload` must start with
+        # `PASS:` or `FAIL:` so the parent can always surface a readable
+        # verdict (even on budget/timeout/step exhaustion).
+        if status == "timeout":
+            stop_reason = "timed out"
+        elif not completed and status == "ok":
+            stop_reason = "reached the reviewer step limit"
+        else:
+            stop_reason = "stopped before returning a verdict"
+        final_summary = f"FAIL: Reviewer did not return PASS:/FAIL: ({stop_reason})."
+        status = "tool_error"
+        failure_reason = "reviewer_no_verdict"
+        completed = True
+    elif not final_summary:
+        reason_label = failure_reason or ("step_limit" if not completed else "unknown")
+        final_summary = f"{agent_type} exited without summary (reason={reason_label})."
+    if not completed and status == "ok" and had_tool_error:
+        status = "tool_error"
+        if failure_reason is None:
+            failure_reason = "tool_error"
+    if agent_type == "coder" and completed and status == "ok" and writes_ok == 0:
+        status = "tool_error"
+        if empty_turn_retries > 0:
+            failure_reason = failure_reason or "no_terminal_summary"
+            final_summary = f"Coder exited without summary (reason={failure_reason})."
+        else:
+            failure_reason = failure_reason or "no_write"
+            final_summary = f"Coder exited without summary (reason={failure_reason})."
+    if agent_type == "coder" and completed and status == "ok" and require_impl_read and writes_ok > 0 and not impl_read_ok:
+        status = "tool_error"
+        failure_reason = "tests_without_impl_read"
+        final_summary = f"Coder exited without summary (reason={failure_reason})."
+    if status == "tool_error" and failure_reason is None:
+        failure_reason = "tool_error"
+    return final_summary, status, failure_reason
+
+
 def _run_live_subagent(
     root: Path,
     agent_type: str,
@@ -1433,41 +1487,18 @@ def _run_live_subagent(
         if failure_reason in TERMINAL_APPROVAL_FAILURE_REASONS:
             break
 
-    if agent_type == "reviewer" and not _is_reviewer_verdict(final_summary):
-        # Contract: reviewer `subagent_return.payload` must start with
-        # `PASS:` or `FAIL:` so the parent can always surface a readable
-        # verdict (even on budget/timeout/step exhaustion).
-        if status == "timeout":
-            stop_reason = "timed out"
-        elif not completed and status == "ok":
-            stop_reason = "reached the reviewer step limit"
-        else:
-            stop_reason = "stopped before returning a verdict"
-        final_summary = f"FAIL: Reviewer did not return PASS:/FAIL: ({stop_reason})."
-        status = "tool_error"
-        failure_reason = "reviewer_no_verdict"
-        completed = True
-    elif not final_summary:
-        reason_label = failure_reason or ("step_limit" if not completed else "unknown")
-        final_summary = f"{agent_type} exited without summary (reason={reason_label})."
-    if not completed and status == "ok" and had_tool_error:
-        status = "tool_error"
-        if failure_reason is None:
-            failure_reason = "tool_error"
-    if agent_type == "coder" and completed and status == "ok" and writes_ok == 0:
-        status = "tool_error"
-        if empty_turn_retries > 0:
-            failure_reason = failure_reason or "no_terminal_summary"
-            final_summary = f"Coder exited without summary (reason={failure_reason})."
-        else:
-            failure_reason = failure_reason or "no_write"
-            final_summary = f"Coder exited without summary (reason={failure_reason})."
-    if agent_type == "coder" and completed and status == "ok" and require_impl_read and writes_ok > 0 and not impl_read_ok:
-        status = "tool_error"
-        failure_reason = "tests_without_impl_read"
-        final_summary = f"Coder exited without summary (reason={failure_reason})."
-    if status == "tool_error" and failure_reason is None:
-        failure_reason = "tool_error"
+    final_summary, status, failure_reason = _finalize_subagent_result(
+        agent_type,
+        final_summary=final_summary,
+        status=status,
+        failure_reason=failure_reason,
+        completed=completed,
+        had_tool_error=had_tool_error,
+        writes_ok=writes_ok,
+        require_impl_read=require_impl_read,
+        impl_read_ok=impl_read_ok,
+        empty_turn_retries=empty_turn_retries,
+    )
     return final_summary, status, writes_ok, reads_ok, failure_reason
 
 

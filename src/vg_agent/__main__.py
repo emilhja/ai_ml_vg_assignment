@@ -1118,6 +1118,79 @@ def _guard_overrides(args: argparse.Namespace) -> dict[str, object]:
     return overrides
 
 
+def _handle_review_command(prompt: str, recorder: TraceRecorder) -> None:
+    """Render `/review [turn]`; on a bad index, print a hint and return."""
+    parts = prompt.split()
+    turn_index: int | None = None
+    if len(parts) > 1:
+        try:
+            turn_index = int(parts[1])
+        except ValueError:
+            sys.stdout.write(f"Invalid turn index: {parts[1]!r}\n")
+            return
+    review_text = format_turn_review(
+        recorder.events,
+        turn_index=turn_index,
+        trace_path=recorder.path,
+        tool_summary_fn=lambda name, args: _tool_summary({"name": name, "args": args}),
+    )
+    sys.stdout.write(review_text)
+
+
+def _handle_show_context_command(prompt: str, recorder: TraceRecorder) -> None:
+    """Render `/show-context [overview|N]`; on a bad index, print a hint."""
+    parts = prompt.split()
+    if len(parts) == 1 or (len(parts) == 2 and parts[1].lower() == "overview"):
+        sys.stdout.write(format_show_context_overview(recorder.events))
+        return
+    try:
+        step = int(parts[1])
+    except ValueError:
+        sys.stdout.write(f"Invalid step index: {parts[1]!r}\n")
+        return
+    sys.stdout.write(
+        json.dumps(show_context(recorder.events, step), indent=2, ensure_ascii=False) + "\n"
+    )
+
+
+def _handle_compact_command(
+    recorder: TraceRecorder, conversation: list[dict[str, Any]], guard: BudgetGuard
+) -> None:
+    """Run a manual `/compact`, printing a skip warning or compaction banner."""
+    skip_reason = conversation_compact_skip_reason(conversation, config.PARENT_MODEL_ID)
+    if skip_reason is not None:
+        sys.stdout.write(
+            format_manual_compact_skip_warning(skip_reason, conversation, config.PARENT_MODEL_ID)
+            + "\n"
+        )
+        return
+    try:
+        compact_client = LiveModelClient.from_env(recorder=recorder)
+    except MissingOpenRouterKey as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return
+    compact_event = compact_conversation(
+        recorder,
+        conversation,
+        config.PARENT_MODEL_ID,
+        guard,
+        client=compact_client,
+        reason="manual",
+        deterministic=False,
+    )
+    if compact_event is None:
+        sys.stdout.write(
+            format_manual_compact_skip_warning(
+                "no_foldable_head", conversation, config.PARENT_MODEL_ID
+            )
+            + "\n"
+        )
+    else:
+        banner = format_compaction_banner(compact_event)
+        if banner:
+            sys.stdout.write(banner + "\n")
+
+
 def _chat_loop(root: Path, args: argparse.Namespace) -> int:
     guard = BudgetGuard.for_workspace(root, **_guard_overrides(args))
     turn_state: dict[str, Any] = {"turn": 0, "previous_mutation_blocked": False}
@@ -1220,73 +1293,13 @@ def _chat_loop(root: Path, args: argparse.Namespace) -> int:
                 _print_finops(guard, recorder)
                 continue
             if prompt.startswith("/review"):
-                parts = prompt.split()
-                turn_index: int | None = None
-                if len(parts) > 1:
-                    try:
-                        turn_index = int(parts[1])
-                    except ValueError:
-                        sys.stdout.write(f"Invalid turn index: {parts[1]!r}\n")
-                        continue
-                review_text = format_turn_review(
-                    recorder.events,
-                    turn_index=turn_index,
-                    trace_path=recorder.path,
-                    tool_summary_fn=lambda name, args: _tool_summary({"name": name, "args": args}),
-                )
-                sys.stdout.write(review_text)
+                _handle_review_command(prompt, recorder)
                 continue
             if prompt.startswith("/show-context"):
-                parts = prompt.split()
-                if len(parts) == 1 or (len(parts) == 2 and parts[1].lower() == "overview"):
-                    sys.stdout.write(format_show_context_overview(recorder.events))
-                else:
-                    try:
-                        step = int(parts[1])
-                    except ValueError:
-                        sys.stdout.write(f"Invalid step index: {parts[1]!r}\n")
-                        continue
-                    sys.stdout.write(
-                        json.dumps(show_context(recorder.events, step), indent=2, ensure_ascii=False) + "\n"
-                    )
+                _handle_show_context_command(prompt, recorder)
                 continue
             if prompt == "/compact" or prompt.startswith("/compact "):
-                skip_reason = conversation_compact_skip_reason(
-                    conversation, config.PARENT_MODEL_ID
-                )
-                if skip_reason is not None:
-                    sys.stdout.write(
-                        format_manual_compact_skip_warning(
-                            skip_reason, conversation, config.PARENT_MODEL_ID
-                        )
-                        + "\n"
-                    )
-                    continue
-                try:
-                    compact_client = LiveModelClient.from_env(recorder=recorder)
-                except MissingOpenRouterKey as exc:
-                    sys.stderr.write(f"error: {exc}\n")
-                    continue
-                compact_event = compact_conversation(
-                    recorder,
-                    conversation,
-                    config.PARENT_MODEL_ID,
-                    guard,
-                    client=compact_client,
-                    reason="manual",
-                    deterministic=False,
-                )
-                if compact_event is None:
-                    sys.stdout.write(
-                        format_manual_compact_skip_warning(
-                            "no_foldable_head", conversation, config.PARENT_MODEL_ID
-                        )
-                        + "\n"
-                    )
-                else:
-                    banner = format_compaction_banner(compact_event)
-                    if banner:
-                        sys.stdout.write(banner + "\n")
+                _handle_compact_command(recorder, conversation, guard)
                 continue
             if prompt == "/help":
                 sys.stdout.write(SLASH_COMMAND_HELP + "\n")
