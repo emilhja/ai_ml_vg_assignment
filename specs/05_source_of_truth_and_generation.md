@@ -23,7 +23,7 @@ These files are human-/agent-edited sources of truth:
 
 These paths are generated artifacts and must not be hand-edited:
 
-- `src/vg_agent/`
+- `src/vg_agent/` — **except** the three hand-written source files below
 - `fixtures/demo_repo/`
 - generated fixture traces or seeded demo files under `workspace/`
 
@@ -33,6 +33,16 @@ then regenerate:
 ```powershell
 python scripts/generate_project.py --clean
 ```
+
+### Hand-written files inside `src/vg_agent/`
+
+`sqlite_store.py`, `chat_ui.py`, and `workspace_paths.py` are **not** produced
+from template strings. They are listed in `EXTRA_SOURCE_GENERATED_FILES` in
+`scripts/generate_project.py`; the generator reads them from `src/vg_agent/`
+(before `--clean` removes the directory), applies placeholder substitution, and
+writes them back. They are their own source of truth and **are** edited
+directly. (Because substitution still runs, avoid literal `__NAME__` tokens.)
+A reviewer-facing map of all three tiers lives in `DEVELOPER_README.md`.
 
 The generator computes a `SPEC_DIGEST` over the markdown prompt/config/spec
 inputs and embeds it into generated runtime files. Provenance tests regenerate

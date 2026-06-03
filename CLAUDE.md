@@ -26,6 +26,17 @@ runtime behavior:
 2. Run `python scripts/generate_project.py --clean`.
 3. Run `uv run pytest`.
 
+**Exception — three hand-written files live inside the generated dir.**
+`src/vg_agent/sqlite_store.py`, `src/vg_agent/chat_ui.py`, and
+`src/vg_agent/workspace_paths.py` are **not** built from template strings.
+They are listed in `EXTRA_SOURCE_GENERATED_FILES`
+(`scripts/generate_project.py`), read from disk *before* `--clean` wipes the
+directory, run through placeholder substitution, and written back. They **are**
+their own source of truth — edit them directly, then regenerate. (Placeholder
+substitution still runs, so avoid literal `__NAME__` tokens in them.) See
+[`DEVELOPER_README.md`](DEVELOPER_README.md) for the full generated-vs-hand-written
+map a reviewer should read first.
+
 ## Common commands
 
 ```powershell
