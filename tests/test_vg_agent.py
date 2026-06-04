@@ -1321,6 +1321,219 @@ def test_coder_subagent_recovers_after_tool_error(tmp_path: Path) -> None:
     assert coder_return["status"] == "ok"
 
 
+def test_parent_skips_redundant_greenfield_explorer_readback(tmp_path: Path) -> None:
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Create the game via Coder.",
+                [
+                    ToolCall(
+                        "spawn-coder",
+                        "spawn_subagent",
+                        {
+                            "type": "coder",
+                            "question": "create number_guessing/game.py and number_guessing/README.md, then py_compile game.py",
+                        },
+                    )
+                ],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn(
+                "Take a quick look at what was created.",
+                [
+                    ToolCall(
+                        "spawn-readback",
+                        "spawn_subagents",
+                        {
+                            "requests": [
+                                {
+                                    "type": "explorer",
+                                    "question": "Read and return the full contents of `number_guessing/game.py`.",
+                                },
+                                {
+                                    "type": "explorer",
+                                    "question": "Read and return the full contents of `number_guessing/README.md`.",
+                                },
+                            ]
+                        },
+                    )
+                ],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("Done.", input_tokens=100, output_tokens=20),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn(
+                    "Write game.",
+                    [
+                        ToolCall(
+                            "write-game",
+                            "write_file",
+                            {
+                                "path": "number_guessing/game.py",
+                                "content": "def main():\n    print('guess')\n\nif __name__ == '__main__':\n    main()\n",
+                            },
+                        )
+                    ],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn(
+                    "Write README.",
+                    [
+                        ToolCall(
+                            "write-readme",
+                            "write_file",
+                            {"path": "number_guessing/README.md", "content": "# Number Guessing\n"},
+                        )
+                    ],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn(
+                    "Compile.",
+                    [
+                        ToolCall(
+                            "compile",
+                            "run_bash",
+                            {"command": "python3 -m py_compile number_guessing/game.py"},
+                        )
+                    ],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn(
+                    "number_guessing/game.py and README.md: created; py_compile passed",
+                    input_tokens=40,
+                    output_tokens=10,
+                ),
+            ],
+        },
+    )
+    recorder = TraceRecorder(tmp_path)
+    run_live_task(tmp_path, "write a simple game in python in a new subfolder", recorder, client=client)
+    events = read_events(recorder.path)
+
+    explorer_spawns = [
+        event
+        for event in events
+        if event.get("kind") == "subagent_spawn" and event.get("agent_type") == "explorer"
+    ]
+    assert explorer_spawns == []
+    skipped = [
+        event
+        for event in events
+        if event.get("kind") == "budget_event"
+        and event.get("budget_reason") == "redundant_greenfield_readback_skipped"
+    ]
+    assert skipped
+    readback_result = next(
+        event
+        for event in events
+        if event.get("kind") == "tool_result" and event.get("tool") == "spawn_subagents"
+    )
+    assert readback_result["status"] == "ok"
+    assert "skipped redundant greenfield readback" in str(readback_result["result_full"])
+
+
+def test_followup_read_after_greenfield_creation_still_runs_explorer(tmp_path: Path) -> None:
+    recorder = TraceRecorder(tmp_path)
+    create_client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Create the file via Coder.",
+                [
+                    ToolCall(
+                        "spawn-coder",
+                        "spawn_subagent",
+                        {
+                            "type": "coder",
+                            "question": "create number_guessing/game.py, then py_compile it",
+                        },
+                    )
+                ],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("Done.", input_tokens=100, output_tokens=20),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn(
+                    "Write game.",
+                    [
+                        ToolCall(
+                            "write-game",
+                            "write_file",
+                            {
+                                "path": "number_guessing/game.py",
+                                "content": "print('guess')\n",
+                            },
+                        )
+                    ],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn(
+                    "Compile.",
+                    [
+                        ToolCall(
+                            "compile",
+                            "run_bash",
+                            {"command": "python3 -m py_compile number_guessing/game.py"},
+                        )
+                    ],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn("number_guessing/game.py: created; py_compile passed", input_tokens=40, output_tokens=10),
+            ],
+        },
+    )
+    run_live_task(tmp_path, "write a simple game in python in a new subfolder", recorder, client=create_client)
+
+    read_client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "Read it back for the user.",
+                [
+                    ToolCall(
+                        "spawn-read",
+                        "spawn_subagent",
+                        {
+                            "type": "explorer",
+                            "question": "Read and return the full contents of `number_guessing/game.py`.",
+                        },
+                    )
+                ],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("Shown.", input_tokens=100, output_tokens=20),
+        ],
+    )
+    run_live_task(tmp_path, "show number_guessing/game.py", recorder, client=read_client)
+    events = read_events(recorder.path)
+    explorer_spawns = [
+        event
+        for event in events
+        if event.get("kind") == "subagent_spawn" and event.get("agent_type") == "explorer"
+    ]
+    assert len(explorer_spawns) == 1
+
+
 def test_parent_retries_after_subagent_tool_error(tmp_path: Path) -> None:
     fail_turns = [
         ModelTurn(

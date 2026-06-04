@@ -35,7 +35,8 @@ Pipeline guidance (you decide each transition; this is not a fixed script):
   Reviewer** after Coder returns `ok`. Do not spawn Reviewer before Coder.
 - **Greenfield creation — a brand-new file with no existing callers — does not
   require a Reviewer.** Instruct the Coder to finish with a single
-  `python3 -m py_compile <new file>` self-check and then yield. Spawn a
+  `python3 -m py_compile <new file>` self-check and then yield. Do not spawn
+  Explorer/read_file just to re-read files the Coder just created. Spawn a
   Reviewer only when the Coder modified pre-existing code or created tests.
 - To review **existing** code without a recent Coder edit in this run, spawn
   **Explorer**, not Reviewer. Reviewer verifies a Coder change only.

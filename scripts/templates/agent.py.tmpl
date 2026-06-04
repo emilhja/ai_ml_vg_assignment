@@ -1103,6 +1103,128 @@ def _is_impl_file_path(path: str) -> bool:
     return name.endswith(".py") and not name.startswith("test_")
 
 
+def _normalise_relative_path_text(path: object) -> str:
+    text = str(path or "").strip().strip("`\"'")
+    text = text.replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def _paths_mentioned_for_readback(question: object) -> set[str]:
+    text = str(question or "")
+    paths: set[str] = set()
+    for value in re.findall(r"`([^`]+)`", text):
+        path = _normalise_relative_path_text(value)
+        if path:
+            paths.add(path)
+    for value in re.findall(r"(?<![\w./-])([\w./-]+\.(?:py|md|txt|json|toml|ya?ml))(?![\w./-])", text):
+        path = _normalise_relative_path_text(value)
+        if path:
+            paths.add(path)
+    return paths
+
+
+def _latest_greenfield_coder_paths_with_compile(recorder: TraceRecorder) -> set[str]:
+    current_turn_index: object = None
+    for event in reversed(recorder.events):
+        if event.get("kind") == "user_prompt":
+            current_turn_index = event.get("turn_index")
+            break
+
+    latest_coder_id: str | None = None
+    for event in reversed(recorder.events):
+        if (
+            event.get("kind") == "subagent_return"
+            and event.get("agent_type") == "coder"
+            and event.get("status") == "ok"
+            and int(event.get("writes_ok") or 0) > 0
+            and event.get("turn_index") == current_turn_index
+        ):
+            latest_coder_id = str(event.get("child_agent_id") or event.get("agent_id") or "")
+            break
+    if not latest_coder_id:
+        return set()
+
+    write_paths: set[str] = set()
+    successful_tool_ids: set[str] = set()
+    saw_edit = False
+    saw_compile = False
+    for event in recorder.events:
+        if str(event.get("agent_id") or "") != latest_coder_id:
+            continue
+        if event.get("kind") != "tool_result" or event.get("status") != "ok":
+            continue
+        successful_tool_ids.add(str(event.get("tool_use_id") or ""))
+        tool = str(event.get("tool") or "")
+        if tool == "edit_file":
+            saw_edit = True
+    for event in recorder.events:
+        if str(event.get("agent_id") or "") != latest_coder_id:
+            continue
+        if event.get("kind") != "tool_call":
+            continue
+        if str(event.get("tool_use_id") or "") in successful_tool_ids:
+            args = event.get("args")
+            tool = str(event.get("tool") or "")
+            if tool == "write_file":
+                path = _normalise_relative_path_text(_tool_path(args if isinstance(args, dict) else {}))
+                if path:
+                    write_paths.add(path)
+            elif tool == "edit_file":
+                saw_edit = True
+            elif tool == "run_bash":
+                command = str(args.get("command") if isinstance(args, dict) else "")
+                if "python3 -m py_compile" in command or "python -m py_compile" in command:
+                    saw_compile = True
+
+    if not write_paths or saw_edit or not saw_compile:
+        return set()
+    if any(_is_test_file_path(path) for path in write_paths):
+        return set()
+    return write_paths
+
+
+def _redundant_greenfield_readback_reason(call: ToolCall, recorder: TraceRecorder) -> str | None:
+    if call.name not in {"spawn_subagent", "spawn_subagents"}:
+        return None
+
+    if call.name == "spawn_subagent":
+        requests = [call.args]
+    else:
+        raw_requests = call.args.get("requests")
+        if not isinstance(raw_requests, list):
+            return None
+        requests = [item for item in raw_requests if isinstance(item, dict)]
+
+    if not requests:
+        return None
+    if any(_normalise_agent_type(request.get("type")) != "explorer" for request in requests):
+        return None
+
+    written_paths = _latest_greenfield_coder_paths_with_compile(recorder)
+    if not written_paths:
+        return None
+
+    requested_paths: set[str] = set()
+    for request in requests:
+        question = str(request.get("question") or "")
+        if not re.search(r"\b(read|show|return|inspect)\b", question, re.IGNORECASE):
+            return None
+        paths = _paths_mentioned_for_readback(question)
+        if not paths:
+            return None
+        requested_paths.update(paths)
+
+    if requested_paths and requested_paths <= written_paths:
+        joined = ", ".join(sorted(requested_paths))
+        return (
+            "skipped redundant greenfield readback: latest Coder already wrote "
+            f"{joined} and ran py_compile"
+        )
+    return None
+
+
 def _subagent_error_reason_from_tool_result(tool_name: str, result_text: str) -> str:
     text = str(result_text or "").lower()
     if text.startswith("approval denied:"):
@@ -2022,17 +2144,33 @@ def run_live_task(
         tool_blocks: list[dict[str, Any]] = []
         for call in turn.tool_calls:
             terminal_coder_approval_failure = False
-            result = _execute_live_tool(
-                root=root,
-                call=call,
-                recorder=recorder,
-                client=client,
-                guard=guard,
-                allowed_tools=PARENT_TOOL_NAMES,
-                started=started,
-                policy=policy,
-                agent_type="parent",
-            )
+            redundant_readback_reason = _redundant_greenfield_readback_reason(call, recorder)
+            if redundant_readback_reason:
+                _emit_tool_call(recorder, call, agent_type="parent")
+                recorder.emit(
+                    "budget_event",
+                    budget_reason="redundant_greenfield_readback_skipped",
+                    details={"tool": call.name, "reason": redundant_readback_reason},
+                )
+                result = _result(
+                    call.tool_use_id,
+                    call.name,
+                    redundant_readback_reason,
+                    "ok",
+                    time.perf_counter(),
+                )
+            else:
+                result = _execute_live_tool(
+                    root=root,
+                    call=call,
+                    recorder=recorder,
+                    client=client,
+                    guard=guard,
+                    allowed_tools=PARENT_TOOL_NAMES,
+                    started=started,
+                    policy=policy,
+                    agent_type="parent",
+                )
             if call.name == "spawn_subagents" and result.get("status") == "ok":
                 try:
                     batch = json.loads(str(result.get("result_full") or "[]"))
