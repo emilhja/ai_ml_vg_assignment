@@ -306,6 +306,47 @@ def test_compact_conversation_deterministic(tmp_path: Path) -> None:
     assert "CONVERSATION COMPACTED" in str(messages[0]["content"])
 
 
+def test_chat_ctx_gauge_drops_after_context_compaction() -> None:
+    """The terminal ctx gauge must fall after a /compact, not re-count the folded head."""
+    from vg_agent.chat_ui import estimate_parent_ctx_tokens
+    from vg_agent.trace import show_context
+
+    big = "word " * 800
+    events: list[dict[str, object]] = []
+    for index in range(4):
+        events.append({"kind": "user_prompt", "agent_id": "parent", "prompt": f"q{index} {big}"})
+        events.append(
+            {
+                "kind": "assistant_step",
+                "agent_id": "parent",
+                "step_idx": index,
+                "assistant_text": f"a{index} {big}",
+                "tool_calls": [],
+            }
+        )
+    before = estimate_parent_ctx_tokens(events)
+    events.append(
+        {
+            "kind": "context_compaction",
+            "agent_id": "parent",
+            "before_tokens": 16500,
+            "after_tokens": 7500,
+            "percent_reduced": 54.5,
+            "kept_user_turns": 1,
+            "reason": "manual",
+            "summary": "folded summary of older turns",
+        }
+    )
+    after = estimate_parent_ctx_tokens(events)
+    assert after < before
+
+    # show_context folds the head: only the kept tail turn plus the marker remain.
+    context = show_context(events, 3)
+    assert sum(1 for item in context if item.get("role") == "user") == 1
+    assert any(item.get("kind") == "context_compaction" for item in context)
+    assert not any("q0" in str(item.get("content", "")) for item in context)
+
+
 def test_auto_context_compaction_before_parent_llm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(config.CONTEXT_WINDOW_TOKENS, config.PARENT_MODEL_ID, 200)
     monkeypatch.setitem(config.AUTO_COMPACT_FRACTION, config.PARENT_MODEL_ID, 0.5)

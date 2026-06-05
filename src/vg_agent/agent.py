@@ -605,11 +605,20 @@ def compact_conversation(
         percent_reduced = round(100.0 - (after / before) * 100.0, 1)
     window = _context_window_for_model(parent_model_id)
     threshold = int(window * _compact_fraction_for_model(parent_model_id))
+    # Genuine user prompts kept verbatim in the tail (tool-result messages also
+    # carry role="user" but hold a list of blocks). `show_context` replays this
+    # count so the reconstructed parent context — and the chat ctx gauge derived
+    # from it — folds the head and tracks the live post-compaction size.
+    kept_user_turns = sum(
+        1 for message in tail
+        if message.get("role") == "user" and isinstance(message.get("content"), str)
+    )
     return recorder.emit(
         "context_compaction",
         before_tokens=before,
         after_tokens=after,
         percent_reduced=percent_reduced,
+        kept_user_turns=kept_user_turns,
         model=parent_model_id,
         window=window,
         threshold=threshold,

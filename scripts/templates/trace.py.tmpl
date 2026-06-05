@@ -245,7 +245,7 @@ def show_context(events: list[dict[str, object]], step_idx: int) -> list[dict[st
                 context[pos]["content"] = compacted_marker(event)
                 context[pos]["compacted"] = True
         elif kind == "context_compaction":
-            context.append({
+            marker = {
                 "role": "meta",
                 "kind": "context_compaction",
                 "content": (
@@ -254,7 +254,30 @@ def show_context(events: list[dict[str, object]], step_idx: int) -> list[dict[st
                     f"{event.get('summary')}"
                 ),
                 "trace_pointer": event.get("trace_pointer"),
-            })
+            }
+            raw_keep = event.get("kept_user_turns")
+            if raw_keep is None:
+                # Legacy trace without fold metadata: keep prior append-only behaviour.
+                context.append(marker)
+            else:
+                # Mirror runtime `messages[:] = [folded, *tail]`: replace the folded
+                # head with the summary marker, keep the most recent `kept_user_turns`
+                # user turns verbatim. This is what lets the chat ctx gauge drop after
+                # a `/compact` instead of re-counting the whole pre-compaction history.
+                kept_user_turns = int(raw_keep or 0)
+                user_positions = [
+                    index for index, item in enumerate(context) if item.get("role") == "user"
+                ]
+                if kept_user_turns > 0 and len(user_positions) >= kept_user_turns:
+                    tail_start = user_positions[-kept_user_turns]
+                else:
+                    tail_start = len(context)
+                context = [marker, *context[tail_start:]]
+                tool_result_positions = {
+                    str(item["tool_use_id"]): index
+                    for index, item in enumerate(context)
+                    if item.get("role") == "tool"
+                }
         elif kind == "approval":
             context.append({
                 "role": "meta",
