@@ -9,6 +9,8 @@
   - [Hur väl fungerar det?](#hur-väl-fungerar-det)
   - [Sammanfattning](#sammanfattning)
 - [Är "diffen" vid filredigering `git diff` eller ett eget verktyg?](#är-diffen-vid-filredigering-git-diff-eller-ett-eget-verktyg)
+- [Vad händer om agenten eller jag gör `ssh`?](#vad-händer-om-agenten-eller-jag-gör-ssh)
+- [Kan agenten nå resurser på nätverket?](#kan-agenten-nå-resurser-på-nätverket)
 
 ## VG-krav i korthet
 
@@ -174,3 +176,110 @@ repo:t. Inga git-kommandon, ingen arbetskatalog-status, inget index läses.
 **Sammanfattning:** git-stil-*utseende*, stdlib-*motor*. Det är ett medvetet
 val i linje med repos filosofi — litet, granskningsbart, inget externt
 beroende och ingen koppling till repo-tillstånd.
+
+## Vad händer om agenten eller jag gör `ssh`?
+
+**Kort svar:** Agenten kan **inte** köra `ssh` — det blockeras alltid, före
+exekvering. Om **du själv** kör `ssh` i din egen terminal gör den här koden
+ingenting åt det; då är det bara din vanliga host-shell.
+
+### Om agenten försöker köra `ssh`
+
+`run_bash` är deny-by-default. Vid t.ex. `ssh user@host ls` slår två oberoende
+spärrar till i `validate_shell_command` (`src/vg_agent/tools.py`):
+
+1. **Inte i allowlistan** (`tools.py:273`) — `ssh` finns inte i `SAFE_COMMANDS`
+   (bara `grep`, `rg`, `find`, `ls`, `pwd`, `cat`, `head`, `tail`, `wc`).
+   Returnerar `command 'ssh' is not in the read-only allowlist`.
+2. **Destruktiv token** (`tools.py:23`, `:276`) — `ssh` står även explicit i
+   `DESTRUCTIVE_TOKENS` tillsammans med `scp`, `rsync`, `nc`, `ncat`, `netcat`,
+   `ftp`, `git`. Två oberoende grindar = ingen enskild lista att glömma.
+
+Anropet når **aldrig** skalet. `run_bash` returnerar bara
+`run_bash blocked: ...` (`tools.py:409`) som ett tool-error, och loopen
+fortsätter. Testet `tests/test_vg_agent.py:669` låser fast detta:
+`assert validate_shell_command("ssh user@host ls") is not None`.
+
+Dessutom: även om ett kommando vore tillåtet kan agenten inte läsa SSH-nycklar
+— alla `.ssh/`-sökvägar, `id_rsa`/`id_ed25519`, `.pem`, `.key` är blockerade som
+sensitive paths (`tools.py:35–51`, regressionstest `tests/test_vg_agent.py:5400`).
+
+### Om *du* kör `ssh`
+
+Då går du utanför agenten. `validate_shell_command` gäller bara kommandon som
+agenten skickar genom `run_bash`-verktyget — den hookar **inte** din interaktiva
+terminal. Din `ssh` körs som vanligt med dina rättigheter.
+
+Två nyanser värda att nämna:
+
+- Kör du agenten i **Docker** (`docker compose run`) är containern ett yttre
+  lager: utgående `ssh` därifrån begränsas av containerns nätverk/nycklar, inte
+  av host-skalet. CLAUDE.md kallar Docker "an outer safety layer, not the only
+  one" — den in-process-grinden är obligatorisk oavsett container.
+- Vill du köra agenten *via* `ssh` till en annan maskin är det helt ok — det är
+  transporten dit, inte något agenten gör.
+
+**Sammanfattning:** Agentens egen `ssh` blockeras dubbelt (allowlist +
+destruktiv-token-lista) och fångas av enhetstest. Din egen `ssh` är opåverkad —
+grinden gäller bara verktygsanrop, inte din shell.
+
+## Kan agenten nå resurser på nätverket?
+
+**Kort svar:** Nej — agentens *verktyg* kan inte nå nätverket. All utgående
+nätverkstrafik via `run_bash` blockeras före exekvering. Den **enda** nätverks-
+trafik agenten gör är LLM-anropen själva (LiteLLM → OpenRouter), och det är
+medvetet och oundvikligt — det är så modellerna körs.
+
+### Verktygen kan inte nå nätet
+
+Det finns inget nätverksverktyg i agentens verktygslåda. `read_file`,
+`read_file_range`, `write_file`, `edit_file` rör **bara** filer under workspace-
+roten (absoluta sökvägar och `..` avvisas). Det finns ingen `fetch_url`, ingen
+`http`-klient, inget verktyg som tar en URL. Det enda sättet en agent ens skulle
+kunna *försöka* nå nätet är via `run_bash`, och där slår tre oberoende grindar
+till i `validate_shell_command` (`src/vg_agent/tools.py`):
+
+1. **Allowlistan** (`tools.py:273`) — `run_bash` är deny-by-default. Bara lokala,
+   read-only kommandon är tillåtna (`grep`, `rg`, `find`, `ls`, `pwd`, `cat`,
+   `head`, `tail`, `wc`; plus `rm`/`mkdir` via approval-grinden). Inget av dem
+   talar med nätet. Ett `curl https://…` returnerar
+   `command 'curl' is not in the read-only allowlist`.
+2. **Destruktiv-token-listan** (`tools.py:18`, `:276`) — `DESTRUCTIVE_TOKENS`
+   innehåller dessutom explicit varenda vanlig nätverks-binär:
+   `curl`, `wget`, `ssh`, `scp`, `sftp`, `rsync`, `ftp`, `telnet`, `nc`, `ncat`,
+   `netcat`, `socat` (och `git`, `pip`, `npm`, `uv` m.fl. som annars kunde dra
+   hem paket). Två oberoende listor = ingen enskild lista att glömma.
+3. **Shell-control-grinden** (`tools.py:30`) — `;`, `&&`, `||`, `|`, `>`, `<`,
+   backtick och `$(` avvisas alla. Det stänger kringgåenden som
+   `cat > /dev/tcp/host/port` (bash:s inbyggda socket-trick) eller att kedja på
+   ett dolt andra-kommando.
+
+Anropet når **aldrig** skalet — `run_bash` returnerar bara
+`run_bash blocked: …` som ett tool-error och loopen fortsätter.
+
+### Den nätverkstrafik som *finns* (by design)
+
+Agenten är inte offline. Varje modell-tur går via `live_model_client.py`
+(LiteLLM-adapter) ut till **OpenRouter** — det är hela exekveringsvägen
+(`run_live_task` är den enda runtime-vägen, och `--task` exit:ar `2` utan
+`OPENROUTER_API_KEY`). Det är alltså rätt att säga: *agenten själv* pratar med
+nätet, men bara med LLM-endpointen, aldrig med godtyckliga resurser som modellen
+ber om. Nyckeln läses från env (`OPENROUTER_API_KEY`), aldrig committad.
+
+### Docker som yttre lager
+
+Kör du demon i Docker (`docker compose run`) är containern ett extra lager:
+utgående trafik därifrån begränsas av containerns nätverk, inte av host-skalet.
+CLAUDE.md kallar Docker "an outer safety layer, not the only one" — den
+in-process-grinden ovan är obligatorisk oavsett container.
+
+### Om *du* kör nätverkskommandon
+
+Som med `ssh`: `validate_shell_command` hookar bara kommandon som agenten
+skickar genom `run_bash`. Din egen interaktiva terminal är opåverkad — kör du
+`curl`/`ssh` själv går det som vanligt med dina rättigheter.
+
+**Sammanfattning:** Agentens verktyg är nät-isolerade — tre oberoende grindar
+(allowlist, destruktiv-token-lista, shell-control) hindrar varje utgående
+anrop, och det finns inget URL-verktyg överhuvudtaget. Den enda nätverkstrafik
+agenten gör är LLM-anropen till OpenRouter via LiteLLM.
