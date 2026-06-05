@@ -36,28 +36,31 @@ For a given user turn the parent decides per step which type to spawn:
    Coder must call `write_file` or `edit_file` successfully at least once
    before returning; a read-only exit is reported as
    `subagent_return{status:"tool_error"}`.
-4. **Reviewer** — invoked **after every successful Coder** on fix/review tasks
-   (not before Coder; Reviewer verifies Coder output, not pre-fix exploration).
-   Optional only for trivial single-line edits the parent is confident about.
+4. **Reviewer** — invoked **after every successful Coder** that wrote a file
+   (`writes_ok > 0`), greenfield creation included (not before Coder; Reviewer
+   verifies Coder output, not pre-fix exploration). The only skip is when the
+   parent is on its last reserved step (the step-cap rule), where it must
+   summarize and yield without spawning.
 
-**Reviewer is a regression / integration guard, not a general code-quality
-auditor.** Its mandate follows from its wiring: it is read-only and receives
-only the JSONL slice of the Coder run (see below), so it answers *"did this
-edit break or correctly integrate with pre-existing code?"* — not *"is this new
-code well written?"*. Two consequences:
+**Reviewer guards both integration and new-code quality.** It is read-only and
+receives only the JSONL slice of the Coder run (see below). For an edit to
+pre-existing code it answers *"did this edit break or correctly integrate with
+that code?"*; for a brand-new file it answers *"does this new code do what was
+asked and parse/compile cleanly?"*. Two consequences:
 
-- **Greenfield creation — a brand-new file with no existing callers — does not
-  require a Reviewer.** There is nothing to regress against, and every spawn
-  costs tokens/$, so on this (common) case the parent instructs the Coder to
-  finish with a single `python3 -m py_compile <new file>` self-check and yield.
-  This is a deliberate cost/scope tradeoff, not a missing step: greenfield
-  *correctness* is the Coder's own responsibility, covered by that self-check.
+- **Greenfield creation — a brand-new file with no existing callers — also
+  requires a Reviewer.** The Coder still finishes with a single
+  `python3 -m py_compile <new file>` self-check and yields; the parent then
+  spawns a Reviewer on that Coder run before answering the user. The Reviewer
+  reads the created file from its Coder slice — the parent does not spawn
+  Explorer/`read_file` to re-read it (see the redundant-greenfield-readback
+  skip). This trades ~1 extra model call per creation for a real PASS/FAIL
+  verdict on every produced file.
 - **`py_compile` is a syntax gate, not a behavior gate.** It confirms the file
-  parses; it cannot catch logic bugs. Greenfield logic errors therefore have no
-  Reviewer safety net by design. If behavior-level coverage is wanted on new
-  code, the right mechanism is a Coder-authored smoke/`test_*.py` (which *does*
-  trigger a Reviewer, since tests count as a reviewable artifact) — not
-  widening Reviewer's mandate to greenfield.
+  parses; it cannot catch logic bugs. The Reviewer is the behavior/quality net
+  on top of that gate. When behavior-level coverage is wanted, the Coder also
+  authors a smoke/`test_*.py`, which the same Reviewer step verifies before any
+  `run_tests` call.
 
 The parent decides each transition autonomously (VG.9). The pipeline is a
 guideline encoded in the parent system prompt, not a fixed Python switch.

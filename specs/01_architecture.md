@@ -296,8 +296,9 @@ Prompts and model IDs: [`PROMPTS.md`](../PROMPTS.md), [`MODEL_CONFIG.md`](../MOD
    parent may skip or over-use Grilling on borderline tasks (cost vs clarity
    tradeoff). See [`docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md) § Weakest part.
 
-3. **Reviewer scope** — integration/regression guard on Coder output, not
-   general code-quality audit; greenfield files may skip Reviewer by design
+3. **Reviewer scope** — runs after every Coder that wrote a file
+   (`writes_ok > 0`), greenfield creation included; guards both integration and
+   new-code quality. Only skipped on the parent's last reserved step
    (`12_subagent_pipeline.md`).
 
 4. **Docker stale UI** — `src/` is baked at image build; Rich/chat changes need

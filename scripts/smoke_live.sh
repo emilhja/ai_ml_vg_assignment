@@ -278,18 +278,22 @@ should_run F9 && f9
 # --- post-suite: secret scan over this run's traces ------------------------
 step "Secret scan (redaction regression check)"
 SECRET_RX='sk-or-v1|OPENROUTER_API_KEY=.+|Bearer [A-Za-z0-9._-]+|AKIA[0-9A-Z]{16}|BEGIN (RSA|OPENSSH|PRIVATE) KEY'
-leak_hits=0; first_leak=""
+leak_hits=0; first_leak=""; scanned_ids=()
 for id in $(printf '%s\n' "${NEW_TRACE_IDS[@]:-}" | sort -u); do
     [ -z "$id" ] && continue
     p="$TRACES_DIR/$id.jsonl"
     [ -f "$p" ] || continue
+    scanned_ids+=("$id")
     m="$(grep -nE "$SECRET_RX" "$p" | head -n1)"
     if [ -n "$m" ]; then leak_hits=$((leak_hits+1)); [ -z "$first_leak" ] && first_leak="$p: $m"; fi
 done
 sec_pass=0; [ "$leak_hits" -eq 0 ] && sec_pass=1
 if [ "$sec_pass" -eq 1 ]; then printf '  %sPASS%s  0 leak hit(s)\n' "$GREEN" "$RST"; else printf '  %sFAIL%s  %s leak hit(s)\n' "$RED" "$RST" "$leak_hits"; fi
-sec_ev="no key-shaped strings in ${#NEW_TRACE_IDS[@]} traces"; [ "$sec_pass" -eq 0 ] && sec_ev="LEAK: $first_leak"
-RES_LABEL+=("SEC"); RES_VG+=("VG.8 no secret leak in traces"); RES_PASS+=("$sec_pass"); RES_EV+=("$(trunc "$sec_ev")"); RES_RUNID+=("-"); RES_TRACE+=("")
+sec_ev="no key-shaped strings in ${#scanned_ids[@]} traces"; [ "$sec_pass" -eq 0 ] && sec_ev="LEAK: $first_leak"
+# Run id column lists the traces this scan actually covered (it derives from the
+# earlier live runs rather than a run of its own); fall back to "-" if none.
+sec_runid="$(IFS=,; printf '%s' "${scanned_ids[*]:-}")"; [ -z "$sec_runid" ] && sec_runid="-"
+RES_LABEL+=("SEC"); RES_VG+=("VG.8 no secret leak in traces"); RES_PASS+=("$sec_pass"); RES_EV+=("$(trunc "$sec_ev")"); RES_RUNID+=("$sec_runid"); RES_TRACE+=("")
 
 # --- config / packaging presence (no live call) ----------------------------
 cfg_pass=0; { [ -f "$PROJECT_ROOT/config.example.toml" ] && [ -f "$PROJECT_ROOT/.env.example" ]; } && cfg_pass=1

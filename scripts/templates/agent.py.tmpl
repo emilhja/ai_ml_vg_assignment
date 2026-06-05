@@ -533,14 +533,30 @@ def _compact_fraction_for_model(model_id: str) -> float:
     return float(config.AUTO_COMPACT_FRACTION.get(model_id, config.DEFAULT_COMPACT_FRACTION))
 
 
-def _split_messages_for_conversation_compaction(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+def _split_messages_for_conversation_compaction(
+    messages: list[dict[str, Any]],
+    keep_recent: int | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    keep = config.COMPACT_KEEP_RECENT_TURNS if keep_recent is None else keep_recent
     user_indices = [index for index, message in enumerate(messages) if message.get("role") == "user"]
-    if len(user_indices) <= config.COMPACT_KEEP_RECENT_TURNS:
+    if len(user_indices) <= keep:
         return None
-    split_at = user_indices[-config.COMPACT_KEEP_RECENT_TURNS]
+    split_at = user_indices[-keep]
     if split_at <= 0:
         return None
     return messages[:split_at], messages[split_at:]
+
+
+def _manual_compact_keep_recent(messages: list[dict[str, Any]]) -> int:
+    """Verbatim recent-turn window for an explicit `/compact`.
+
+    Manual compaction is an on-demand request, so it adapts the verbatim window
+    down to as few as one turn — letting the user fold before the conversation
+    grows past ``COMPACT_KEEP_RECENT_TURNS`` — while still keeping up to that many
+    turns verbatim once enough history exists. Folding needs at least one older
+    turn to summarise, hence ``user_turns - 1``."""
+    user_turns = sum(1 for message in messages if message.get("role") == "user")
+    return max(1, min(config.COMPACT_KEEP_RECENT_TURNS, user_turns - 1))
 
 
 def compact_conversation(
@@ -552,8 +568,11 @@ def compact_conversation(
     client: Any,
     reason: str,
     deterministic: bool = False,
+    keep_recent: int | None = None,
 ) -> dict[str, object] | None:
-    split = _split_messages_for_conversation_compaction(messages)
+    if keep_recent is None and reason == "manual":
+        keep_recent = _manual_compact_keep_recent(messages)
+    split = _split_messages_for_conversation_compaction(messages, keep_recent)
     if split is None:
         return None
     head, tail = split
@@ -605,20 +624,17 @@ def conversation_compact_skip_reason(
     messages: list[dict[str, Any]],
     parent_model_id: str,
 ) -> str | None:
-    """Return a skip reason when manual compact is unnecessary; None if folding may proceed."""
+    """Return a skip reason when a manual `/compact` has nothing to fold; None if it may proceed.
+
+    Manual `/compact` is an explicit request, so — unlike automatic compaction — it
+    is **not** gated on the auto-fold token threshold. It proceeds whenever at least
+    one older turn can be folded (i.e. >= 2 user turns), using the adaptive verbatim
+    window from `_manual_compact_keep_recent`."""
     if not messages:
         return "no_history"
-    user_turns = sum(1 for message in messages if message.get("role") == "user")
-    split = _split_messages_for_conversation_compaction(messages)
-    if split is None:
-        if user_turns <= config.COMPACT_KEEP_RECENT_TURNS:
-            return "too_few_user_turns"
-        return "no_foldable_head"
-    before = _estimate_message_tokens(PARENT_SYSTEM_PROMPT, messages)
-    window = _context_window_for_model(parent_model_id)
-    threshold = int(window * _compact_fraction_for_model(parent_model_id))
-    if before <= threshold:
-        return "below_auto_threshold"
+    keep = _manual_compact_keep_recent(messages)
+    if _split_messages_for_conversation_compaction(messages, keep) is None:
+        return "too_few_user_turns"
     return None
 
 
@@ -635,7 +651,8 @@ def format_manual_compact_skip_warning(
         user_turns = sum(1 for message in messages if message.get("role") == "user")
         return (
             f"[context] /compact skipped: only {user_turns} user turn(s) in chat memory; "
-            f"need more than {keep} to fold older turns while keeping the last {keep} verbatim. "
+            f"need at least 2 to fold an older turn while keeping the most recent verbatim "
+            f"(up to {keep} stay verbatim once enough history exists). "
             "Large tool results are still compacted automatically (see /review)."
         )
     if reason == "no_foldable_head":
@@ -818,7 +835,9 @@ def _offer_step_extend_if_needed(
     details: dict[str, object] = {"step_count": guard.parent_step_count, "max_steps": guard.max_steps}
     decision = BudgetDecision(False, "step_extend", details)
     summary = _budget_cap_summary(decision)
+    _prompt_started = time.perf_counter()
     outcome = policy.check_budget_cap("step_extend", details, summary)
+    guard.credit_wait(time.perf_counter() - _prompt_started)
     _emit_budget_approval(recorder, decision, outcome)
     guard.mark_step_extend_prompted()
     if outcome.decision in {"approved", "approved_scoped", "approved_always", "auto"}:
@@ -854,7 +873,9 @@ def _handle_budget_cap(
     if reason.startswith("warn_"):
         return False
     summary = _budget_cap_summary(decision)
+    _prompt_started = time.perf_counter()
     outcome = policy.check_budget_cap(reason, dict(getattr(decision, "details", None) or {}), summary)
+    guard.credit_wait(time.perf_counter() - _prompt_started)
     _emit_budget_approval(recorder, decision, outcome)
     if outcome.decision in {"approved", "approved_scoped", "approved_always", "auto"}:
         once = outcome.decision in {"approved", "auto"}
@@ -952,7 +973,9 @@ def _execute_live_tool(
             return _result(call.tool_use_id, "run_bash", f"run_bash blocked: {safety_error}", "error", tool_started)
 
     if tool_name in policy.gated_tools():
+        _approval_started = time.perf_counter()
         outcome = policy.check(_request_for(call))
+        guard.credit_wait(time.perf_counter() - _approval_started)
         _emit_approval(recorder, call, outcome)
         if outcome.decision == "denied":
             return _result(call.tool_use_id, tool_name, f"approval denied: {outcome.reason}", "error", tool_started)
@@ -1388,7 +1411,7 @@ def _run_live_subagent(
             )
             break
         if _wall_clock_exceeded(started, guard):
-            timeout = type("Decision", (), {"budget_reason": "timeout", "details": {"timeout_s": config.WALL_CLOCK_TIMEOUT}})()
+            timeout = BudgetDecision(False, "timeout", {"timeout_s": config.WALL_CLOCK_TIMEOUT})
             if not _handle_budget_cap(
                 policy=policy,
                 recorder=recorder,
@@ -1400,6 +1423,7 @@ def _run_live_subagent(
                 agent_type=agent_type,
             ):
                 status = "timeout"
+                failure_reason = "timeout"
                 break
             continue
         expected_in = _estimate_message_tokens(system_prompt, messages)
@@ -2038,7 +2062,7 @@ def run_live_task(
 
     while True:
         if _wall_clock_exceeded(started, guard):
-            timeout = type("Decision", (), {"budget_reason": "timeout", "details": {"timeout_s": config.WALL_CLOCK_TIMEOUT}})()
+            timeout = BudgetDecision(False, "timeout", {"timeout_s": config.WALL_CLOCK_TIMEOUT})
             if not _handle_budget_cap(policy=policy, recorder=recorder, guard=guard, decision=timeout, started=started):
                 return recorder
             continue

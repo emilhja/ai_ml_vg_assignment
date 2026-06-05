@@ -3,7 +3,7 @@ from auth.session import load_session
 from utils import render_response
 
 
-def bar(user_id: str) -> str:
+def foo(user_id: str) -> str:
     session = load_session(user_id)
     return render_response("foo", session["user_id"])
 
@@ -14,4 +14,4 @@ def protected_dashboard(request):
 
 
 if __name__ == "__main__":
-    print(bar("demo-user"))
+    print(foo("demo-user"))

@@ -6,7 +6,8 @@
       "Bash(uv run *)",
       "WebSearch",
       "Bash(python -c ' *)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(git stash *)"
     ]
   }
 }

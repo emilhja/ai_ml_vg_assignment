@@ -268,6 +268,16 @@ class BudgetGuard:
                 self.daily_remaining_usd = float(daily_remaining_usd)
         return None
 
+    def credit_wait(self, seconds: float) -> None:
+        """Exclude wall-clock time spent blocked on a human prompt from the
+        timeout budget. An approval / extend prompt can pause a run for
+        minutes; that idle time must not count toward ``WALL_CLOCK_TIMEOUT``
+        and silently exhaust a sub-agent before its first model call."""
+        if seconds <= 0:
+            return
+        with self.lock:
+            self.wall_clock_extra_s += seconds
+
     def extend_cap(self, reason: str, *, once: bool) -> None:
         """Raise a hard cap after interactive approval."""
         with self.lock:

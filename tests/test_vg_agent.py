@@ -375,18 +375,28 @@ def test_compactor_budget_recorded(tmp_path: Path) -> None:
     )
 
 
-def test_manual_compact_skip_warning_below_threshold() -> None:
-    from vg_agent.agent import conversation_compact_skip_reason, format_manual_compact_skip_warning
+def test_manual_compact_proceeds_below_threshold() -> None:
+    from vg_agent.agent import conversation_compact_skip_reason
 
+    # Manual /compact is an explicit request: it folds on demand even when the
+    # context is far below the auto-fold token threshold.
     messages: list[dict[str, object]] = []
     for index in range(6):
         messages.append({"role": "user", "content": f"question {index}"})
         messages.append({"role": "assistant", "content": f"answer {index}"})
-    reason = conversation_compact_skip_reason(messages, config.PARENT_MODEL_ID)
-    assert reason == "below_auto_threshold"
-    warning = format_manual_compact_skip_warning(reason, messages, config.PARENT_MODEL_ID)
-    assert "/compact skipped" in warning
-    assert "auto-fold threshold" in warning
+    assert conversation_compact_skip_reason(messages, config.PARENT_MODEL_ID) is None
+
+
+def test_manual_compact_proceeds_with_two_user_turns() -> None:
+    from vg_agent.agent import conversation_compact_skip_reason
+
+    # Two user turns is enough to fold one older turn while keeping the latest verbatim.
+    messages: list[dict[str, object]] = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "ack first"},
+        {"role": "user", "content": "second"},
+    ]
+    assert conversation_compact_skip_reason(messages, config.PARENT_MODEL_ID) is None
 
 
 def test_manual_compact_skip_warning_too_few_turns() -> None:
@@ -397,6 +407,7 @@ def test_manual_compact_skip_warning_too_few_turns() -> None:
     assert reason == "too_few_user_turns"
     warning = format_manual_compact_skip_warning(reason, messages, config.PARENT_MODEL_ID)
     assert "only 1 user turn" in warning
+    assert "at least 2" in warning
 
 
 def test_chat_slash_compact_warns_when_unnecessary(
@@ -1280,6 +1291,16 @@ def test_parent_has_no_write_tools_and_coder_is_sole_mutation_path(tmp_path: Pat
     edit_results = [e for e in events if e["kind"] == "tool_result" and e["tool"] == "edit_file"]
     assert edit_results and edit_results[0]["agent_id"] == coder_spawn["child_agent_id"]
     assert events[-1]["final_status"] == "ok"
+
+
+def test_parent_prompt_requires_reviewer_after_every_coder_write() -> None:
+    # Reviewer now runs after every Coder that wrote a file, greenfield
+    # creation included (no longer exempt). Guard the prompt intent so the
+    # behavior cannot silently regress to "greenfield skips Reviewer".
+    pipeline = PARENT_SYSTEM_PROMPT.split("Pipeline guidance", 1)[-1]
+    assert "writes_ok > 0" in pipeline
+    assert "greenfield creation included" in pipeline
+    assert "does not require a Reviewer" not in pipeline.replace("\n", " ")
 
 
 def test_coder_subagent_recovers_after_tool_error(tmp_path: Path) -> None:
@@ -4702,6 +4723,118 @@ def test_coder_truncated_turn_retries_then_writes_successfully(tmp_path: Path) -
         e for e in events if e.get("kind") == "budget_event" and e.get("budget_reason") == "subagent_empty_turn_retry"
     ]
     assert retry_events
+
+
+def test_subagent_wall_clock_timeout_reports_timeout_not_silent_step_limit(tmp_path: Path) -> None:
+    # Regression: when a sub-agent is entered after the run's wall-clock budget
+    # is already spent (e.g. the user lingered at the spawn approval prompt for
+    # minutes), it must surface a real timeout and never reach a model call -
+    # not spin through all MAX_SUBAGENT_STEPS doing nothing and return a
+    # misleading status="ok" / reason=step_limit with 0 writes.
+    recorder = TraceRecorder(tmp_path)
+    client = FakeClient([])  # any model call would raise: none should happen
+    guard = BudgetGuard(max_steps=20, max_tokens=1_000_000, max_usd=10.0, daily_remaining_usd=10.0)
+    policy = ApprovalPolicy()  # no interactive prompt -> timeout extension denied
+
+    summary, status, writes_ok, _reads_ok, failure_reason = _run_live_subagent(
+        tmp_path,
+        "coder",
+        "Create calc_timeout/calculator.py",
+        recorder,
+        client,
+        guard,
+        child_id="coder-1",
+        started=time.perf_counter() - (config.WALL_CLOCK_TIMEOUT + 100),
+        policy=policy,
+    )
+
+    assert status == "timeout"
+    assert failure_reason == "timeout"
+    assert writes_ok == 0
+    assert client.calls == []  # never reached the model
+    assert "step_limit" not in summary
+    events = read_events(recorder.path)
+    assert any(
+        e.get("kind") == "budget_event" and e.get("budget_reason") == "timeout"
+        for e in events
+    )
+
+
+def test_long_approval_pause_is_credited_so_spawned_coder_still_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: time the user spends blocked at an approval prompt must not
+    # count toward the wall-clock timeout. A human who deliberates past
+    # WALL_CLOCK_TIMEOUT before approving a spawn should still get a working
+    # sub-agent run, not a coder that silently times out on its first step.
+    from vg_agent import agent as agent_module
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(agent_module.time, "perf_counter", lambda: clock["t"])
+
+    def slow_approve(request: ApprovalRequest) -> ApprovalOutcome:
+        if request.tool == "spawn_subagent":
+            # Human sits at the prompt well past the wall-clock timeout.
+            clock["t"] += config.WALL_CLOCK_TIMEOUT + 60
+            return ApprovalOutcome(decision="approved", reason="test approve spawn")
+        return ApprovalOutcome(decision="approved", reason="test approve")
+
+    client = PipelineClient(
+        parent_turns=[
+            ModelTurn(
+                "spawn coder",
+                [
+                    ToolCall(
+                        "spawn-1",
+                        "spawn_subagent",
+                        {"type": "coder", "question": "Create calc_pause/calculator.py"},
+                    )
+                ],
+                stop_reason="tool_use",
+                input_tokens=100,
+                output_tokens=30,
+            ),
+            ModelTurn("done", input_tokens=20, output_tokens=10),
+        ],
+        by_type={
+            "coder": [
+                ModelTurn(
+                    "",
+                    [
+                        ToolCall(
+                            "write-1",
+                            "write_file",
+                            {"path": "calc_pause/calculator.py", "content": "print('ok')\n"},
+                        )
+                    ],
+                    stop_reason="tool_use",
+                    input_tokens=60,
+                    output_tokens=20,
+                ),
+                ModelTurn(
+                    "calc_pause/calculator.py: created file; replaced 0 occurrence(s)",
+                    input_tokens=15,
+                    output_tokens=10,
+                ),
+            ]
+        },
+    )
+    recorder = TraceRecorder(tmp_path)
+    guard = BudgetGuard(max_steps=20, max_tokens=1_000_000, max_usd=10.0, daily_remaining_usd=10.0)
+    policy = ApprovalPolicy(mode="writes", prompt=slow_approve)
+
+    run_live_task(tmp_path, "create calc_pause", recorder, client=client, guard=guard, policy=policy)
+
+    # The approval pause was credited, so the coder ran and wrote the file.
+    assert (tmp_path / "calc_pause" / "calculator.py").exists()
+    assert guard.wall_clock_extra_s >= config.WALL_CLOCK_TIMEOUT
+    events = read_events(recorder.path)
+    coder_return = next(
+        e for e in events if e.get("kind") == "subagent_return" and e.get("agent_type") == "coder"
+    )
+    assert coder_return["status"] == "ok"
+    assert coder_return["writes_ok"] == 1
+    assert "step_limit" not in str(coder_return["summary"])
 
 
 def test_coder_empty_turn_retries_exhausted_is_tool_error(tmp_path: Path) -> None:

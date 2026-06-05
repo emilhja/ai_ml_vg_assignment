@@ -88,7 +88,11 @@ Parent loop (the only runtime path):
   `CONTEXT_WINDOW_TOKENS[parent_model] * AUTO_COMPACT_FRACTION[parent_model]`
   before a parent model call, or when the user runs `/compact` in chat. The
   compactor summarises folded head turns; the last `COMPACT_KEEP_RECENT_TURNS`
-  user turns stay verbatim. A `context_compaction` event records before/after
+  user turns stay verbatim. Manual `/compact` is **not** gated on the token
+  threshold and adapts the verbatim window down to as few as one turn
+  (`max(1, min(COMPACT_KEEP_RECENT_TURNS, user_turns - 1))`), so it folds on
+  demand whenever there are at least two user turns; automatic compaction keeps
+  the full `COMPACT_KEEP_RECENT_TURNS` window. A `context_compaction` event records before/after
   tokens, `reason` (`auto` | `manual`), and a trace pointer; JSONL retains all
   original events.
 - The parent emits a `statusline` event and rewrites the stderr statusline
